@@ -66,7 +66,7 @@ T-01 ─┬─→ T-02 ──────────────┐
 
 ## Engine — pure logic (Track 2, parallel)
 
-- [ ] **T-05 · `lib/diff.ts` + tests + fixtures** → CP2
+- [x] **T-05 · `lib/diff.ts` + tests + fixtures** → CP2
   - Acceptance: `diffImages()` returns `{ changedPixels, totalPixels, ratio, dimensionDelta,
     regions }`; identical input → `ratio === 0`; known-delta fixture → expected ratio and
     `dimensionDelta`; mismatched dimensions handled (no throw, delta reported); undecodable
