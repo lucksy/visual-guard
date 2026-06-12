@@ -81,7 +81,7 @@ T-01 ─┬─→ T-02 ──────────────┐
 
 ## Engine — capture (Track 1)
 
-- [ ] **T-04 · `lib/config.ts` + tests**
+- [x] **T-04 · `lib/config.ts` + tests**
   - Acceptance: loads + validates `visual.config.json`; applies defaults; missing/invalid
     fields throw an actionable error naming the field; exported `Config` type matches SPEC.
   - Verify: `npm test -- config`
