@@ -52,7 +52,7 @@ T-01 ─┬─→ T-02 ──────────────┐
   - Files: `.claude-plugin/plugin.json`, `config/visual.config.json`, skeleton `.gitkeep`s
   - Depends on: T-01
 
-- [ ] **T-03 · Dep bootstrap + SessionStart hook** (Track 3) → CP1
+- [x] **T-03 · Dep bootstrap + SessionStart hook** (Track 3) → CP1
   - Acceptance: `install-deps.mjs` installs engine deps + Chromium into `${CLAUDE_PLUGIN_DATA}`
     using the docs' diff-`package.json` idempotency pattern, with
     `PLAYWRIGHT_BROWSERS_PATH=${CLAUDE_PLUGIN_DATA}/browsers`; a failed install leaves no
