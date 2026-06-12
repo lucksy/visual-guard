@@ -43,7 +43,7 @@ T-01 ─┬─→ T-02 ──────────────┐
   - Verify: `npm run typecheck && npm run lint`
   - Files: `package.json`, `tsconfig.json`, `.eslintrc.cjs`, `.prettierrc`, `.gitignore`
 
-- [ ] **T-02 · Plugin manifest + directory skeleton + default config** → CP1
+- [x] **T-02 · Plugin manifest + directory skeleton + default config** → CP1
   - Acceptance: `.claude-plugin/plugin.json` declares `name: visual-guard`, version,
     component paths; component dirs exist (`commands/`, `agents/`, `scripts/lib/`, `config/`,
     `tests/fixtures/` with `.gitkeep`); `config/visual.config.json` matches the SPEC schema;

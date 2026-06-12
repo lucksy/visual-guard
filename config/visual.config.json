@@ -1,0 +1,14 @@
+{
+  "detect": "auto",
+  "targets": [
+    { "type": "storybook", "url": "http://localhost:6006" },
+    { "type": "app", "url": "http://localhost:3000", "routes": ["/login", "/checkout"] }
+  ],
+  "viewports": [375, 768, 1280],
+  "states": ["default", "hover", "disabled"],
+  "threshold": 0.1,
+  "maxDiffRatio": 0.01,
+  "baselineDir": ".visual-baselines",
+  "uiGlobs": ["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss}"],
+  "tokens": { "source": "src/styles/tokens.css" }
+}
