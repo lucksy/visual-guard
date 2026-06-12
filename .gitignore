@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+.visual-guard/
+dist/
+*.log
+.DS_Store
+.claude/settings.local.json

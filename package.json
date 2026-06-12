@@ -1,0 +1,37 @@
+{
+  "name": "visual-guard",
+  "version": "0.0.0",
+  "description": "AI visual regression reviewer — a Claude Code plugin.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "lint": "eslint . --ext .ts,.tsx --no-error-on-unmatched-pattern",
+    "lint:fix": "eslint . --ext .ts,.tsx --no-error-on-unmatched-pattern --fix",
+    "format": "prettier --write .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pixelmatch": "5.3.0",
+    "playwright": "1.49.1",
+    "pngjs": "7.0.0",
+    "sharp": "0.33.5"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "@types/pixelmatch": "5.2.6",
+    "@types/pngjs": "6.0.5",
+    "@typescript-eslint/eslint-plugin": "7.18.0",
+    "@typescript-eslint/parser": "7.18.0",
+    "@vitest/coverage-v8": "2.1.8",
+    "eslint": "8.57.1",
+    "prettier": "3.4.2",
+    "tsx": "4.19.2",
+    "typescript": "5.7.3",
+    "vitest": "2.1.8"
+  }
+}

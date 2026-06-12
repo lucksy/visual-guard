@@ -1,0 +1,9 @@
+node_modules/
+coverage/
+.visual-guard/
+dist/
+package-lock.json
+# Planning artifacts are hand-formatted — leave them untouched.
+SPEC.md
+PLAN.md
+TASKS.md
