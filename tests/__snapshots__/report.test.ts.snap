@@ -1,0 +1,138 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`buildManifest > matches the locked golden manifest shape (R6 — contract can't drift) 1`] = `
+{
+  "changedFiles": [
+    "src/components/Button.tsx",
+    "src/components/button.css",
+    "src/Card.tsx",
+  ],
+  "gates": {
+    "maxDiffRatio": 0.01,
+    "threshold": 0.1,
+  },
+  "generatedAt": "2026-06-13T00:00:00.000Z",
+  "runDir": ".visual-guard/runs/RUN1",
+  "runId": "RUN1",
+  "summary": {
+    "error": 1,
+    "fail": 1,
+    "images": 5,
+    "new": 1,
+    "pass": 2,
+    "targets": 4,
+  },
+  "targets": [
+    {
+      "changedFiles": [
+        "src/components/Button.tsx",
+        "src/components/button.css",
+      ],
+      "images": [
+        {
+          "baselinePath": ".visual-baselines/components/Button/default@1280.png",
+          "currentPath": ".visual-guard/runs/RUN1/current/components/Button/default@1280.png",
+          "diffPath": ".visual-guard/runs/RUN1/diff/components/Button/default@1280.png",
+          "dimensionDelta": null,
+          "error": null,
+          "ratio": 0,
+          "regions": [],
+          "state": "default",
+          "status": "pass",
+          "verdict": null,
+          "viewport": 1280,
+        },
+        {
+          "baselinePath": ".visual-baselines/components/Button/hover@1280.png",
+          "currentPath": ".visual-guard/runs/RUN1/current/components/Button/hover@1280.png",
+          "diffPath": ".visual-guard/runs/RUN1/diff/components/Button/hover@1280.png",
+          "dimensionDelta": null,
+          "error": null,
+          "ratio": 0.04,
+          "regions": [
+            {
+              "height": 2,
+              "width": 2,
+              "x": 0,
+              "y": 0,
+            },
+          ],
+          "state": "hover",
+          "status": "fail",
+          "verdict": null,
+          "viewport": 1280,
+        },
+      ],
+      "instance": "components",
+      "status": "fail",
+      "target": "Button",
+    },
+    {
+      "changedFiles": [
+        "src/Card.tsx",
+      ],
+      "images": [
+        {
+          "baselinePath": null,
+          "currentPath": ".visual-guard/runs/RUN1/current/components/Card/default@1280.png",
+          "diffPath": null,
+          "dimensionDelta": null,
+          "error": null,
+          "ratio": null,
+          "regions": [],
+          "state": "default",
+          "status": "new",
+          "verdict": null,
+          "viewport": 1280,
+        },
+      ],
+      "instance": "components",
+      "status": "new",
+      "target": "Card",
+    },
+    {
+      "changedFiles": [],
+      "images": [
+        {
+          "baselinePath": ".visual-baselines/icons/Star/default@1280.png",
+          "currentPath": ".visual-guard/runs/RUN1/current/icons/Star/default@1280.png",
+          "diffPath": null,
+          "dimensionDelta": null,
+          "error": "could not decode image",
+          "ratio": null,
+          "regions": [],
+          "state": "default",
+          "status": "error",
+          "verdict": null,
+          "viewport": 1280,
+        },
+      ],
+      "instance": "icons",
+      "status": "error",
+      "target": "Star",
+    },
+    {
+      "changedFiles": [],
+      "images": [
+        {
+          "baselinePath": ".visual-baselines/web/login/default@375.png",
+          "currentPath": ".visual-guard/runs/RUN1/current/web/login/default@375.png",
+          "diffPath": ".visual-guard/runs/RUN1/diff/web/login/default@375.png",
+          "dimensionDelta": null,
+          "error": null,
+          "ratio": 0,
+          "regions": [],
+          "state": "default",
+          "status": "pass",
+          "verdict": null,
+          "viewport": 375,
+        },
+      ],
+      "instance": "web",
+      "status": "pass",
+      "target": "login",
+    },
+  ],
+  "version": 1,
+}
+`;

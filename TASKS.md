@@ -162,13 +162,30 @@ T-01 ─┬─→ T-02 ──────────────┐
     - **Deferred (documented):** orphan-baseline detection (a baseline with no current render
       is not reported — compare only walks `current/`); a max-image-size cap (Phase 2 hardening).
 
-- [ ] **T-09 · `scripts/report.ts` + golden test** → CP4, R6
+- [x] **T-09 · `scripts/report.ts` + golden test** → CP4, R6
   - Acceptance: assembles `manifest.json` = the subagent input contract (per-target: baseline
     / current / diff paths, `ratio`, `dimensionDelta`, `regions`, changed git files, verdict
     placeholder); snapshot/golden-tested so the contract can't drift silently.
-  - Verify: `npm test -- report`
+  - Verify: `npm test -- report` — pure `buildManifest` field assertions + a committed golden
+    snapshot (`tests/__snapshots__/report.test.ts.snap`); git gathering injected for determinism. ✅
   - Files: `scripts/report.ts`, `tests/report.test.ts`
   - Depends on: T-08
+  - Decisions made here: per-image results grouped by `<instance>/<target>` into `images[]`;
+    target rolls up to its **worst status** (fail > error > new > pass); per-image `verdict`
+    placeholder (subagent fills it in Phase 1); run-level `changedFiles` from git filtered by
+    `uiGlobs` (minimal in-repo glob matcher, no new dep); per-target `changedFiles` by name
+    heuristic; `version: 1` (R6). **CP4 complete** (compare flags altered + manifest golden).
+  - Hardening (from the T-09 adversarial review):
+    - **Single path anchor:** all `*Path` fields are project-root-relative (current/diff
+      rebased onto `runDir`, baseline already root-relative) + a documented `runDir` field —
+      so the subagent has one anchor to resolve every path. No mixed/ambiguous anchors.
+    - **`verdict: Verdict | null`** (typed to the SPEC reviewer JSON, not the `null` literal)
+      so Phase 1 can populate it without a contract break; value stays null in v1.
+    - Per-target `changedFiles` uses **whole-token** matching (`Card` ≠ `Dashcard`); grouping
+      uses a struct map (no fragile delimiter split).
+    - **Deferred to Phase 1 (manifest v2, versioned-contract evolution):** per-image
+      `renderTarget` (url/kind/storyId for live re-render) + `currentDimensions` — both need
+      capture to persist the `RenderTarget` list. Documented inline in `ManifestImage`.
   - Contract decisions to make here (surfaced by the T-08 review):
     - **Grouping:** `compare.json` is per-image (`<instance>/<target>/<state>@<viewport>`); the
       manifest is per-target, so group by the key's `<instance>/<target>` prefix with an
