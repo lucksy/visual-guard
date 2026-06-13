@@ -1,0 +1,46 @@
+/*
+ * Sample Button component for the Visual Guard canonical-flow demo (T-12 / CP5).
+ *
+ * Spacing comes from a design token (`--vg-space-pad`). The documented "deliberate change" in
+ * the README — and the canonical-flow e2e — replaces the `padding: var(--vg-space-pad)` rule
+ * with a hardcoded, larger value (the SPEC's canonical "padding token → hardcoded" regression).
+ * That grows the button's height, which Visual Guard surfaces as a visual regression on the
+ * `button` target. (Note: the engine diffs on normalized luminance, so a geometry/spacing
+ * change is detected; a luminance-preserving recolor by design is not.)
+ */
+:root {
+  --vg-brand: #2563eb;
+  --vg-brand-text: #ffffff;
+  --vg-space-pad: 24px 40px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  background: #ffffff;
+}
+
+.vg-stage {
+  display: flex;
+  min-height: 100vh;
+  align-items: center;
+  justify-content: center;
+}
+
+.vg-button {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 20px;
+  line-height: 1.2;
+  font-weight: 600;
+  color: var(--vg-brand-text);
+  background: var(--vg-brand);
+  border: none;
+  border-radius: 10px;
+  padding: var(--vg-space-pad);
+  min-width: 240px;
+}

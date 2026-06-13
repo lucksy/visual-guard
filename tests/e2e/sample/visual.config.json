@@ -1,0 +1,11 @@
+{
+  "detect": "auto",
+  "targets": [{ "type": "app", "name": "sample", "url": "http://localhost:4173", "routes": ["/button"] }],
+  "viewports": [400],
+  "states": ["default"],
+  "threshold": 0.1,
+  "maxDiffRatio": 0.01,
+  "baselineDir": ".visual-baselines",
+  "uiGlobs": ["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss}"],
+  "tokens": { "source": "src/Button.css" }
+}

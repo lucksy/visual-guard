@@ -213,10 +213,11 @@ T-01 ─┬─→ T-02 ──────────────┐
       `pending.json`), so "defaults to pending changes" is realized as **capture all configured
       targets**; the report tags each target with the related changed files, so a regression is
       never skipped by a target-name guess.
-    - **Engine-invocation bridge deferred to T-12** (user decision): the bundled `.ts` engine's
-      deps live in `${CLAUDE_PLUGIN_DATA}` and `tsx` isn't yet an engine dep, so the documented
-      runner isn't runnable until T-12 wires the bridge (add `tsx` to `ENGINE_DEPS` +
-      resolve `node_modules`). The command's **preflight stops actionably** until then.
+    - **Engine-invocation bridge — resolved in T-12:** `tsx` is now in `ENGINE_DEPS` and
+      `install-deps.mjs` symlinks `${CLAUDE_PLUGIN_ROOT}/node_modules` → the data-dir deps, so
+      the command's documented runner (`${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx`) resolves
+      and the engine scripts resolve their bare imports. The preflight check now passes once the
+      `SessionStart` bootstrap completes.
     - Encodes SPEC boundaries: read-only on source, never auto-approve a baseline, evidence
       before verdict, nothing sent to an external service.
 
@@ -249,13 +250,40 @@ T-01 ─┬─→ T-02 ──────────────┐
 
 ## End-to-end
 
-- [ ] **T-12 · CP5 — canonical flow verification**
+- [x] **T-12 · CP5 — canonical flow verification**
   - Acceptance: on a bundled sample project, `/visual-check` on unchanged code → 0 regressions;
     make a real change → regression surfaced with file:line; `/visual-baseline` → re-run →
     clean. README documents the flow.
-  - Verify: run the CP5 sequence end-to-end; `npm test` green; `claude plugin validate . --strict`
-  - Files: `tests/e2e/` sample harness, `README.md`
+  - Verify: run the CP5 sequence end-to-end; `npm test` green; `claude plugin validate . --strict` ✅
+  - Files: `tests/e2e/sample/` (sample project), `tests/e2e/canonical-flow.e2e.test.ts`,
+    `tests/install-deps.test.ts`, `README.md`; `scripts/install-deps.mjs` (engine bridge).
   - Depends on: T-10, T-11
+  - Decisions / what landed:
+    - **Engine-invocation bridge** (the T-10/T-11 deferral): `install-deps.mjs` now adds `tsx`
+      to `ENGINE_DEPS` and, after the deps land in `${CLAUDE_PLUGIN_DATA}`, symlinks
+      `${CLAUDE_PLUGIN_ROOT}/node_modules` → the data-dir `node_modules` so the commands'
+      `${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx` runner resolves **and** the engine scripts
+      resolve their bare ESM imports. Empirically proven: `NODE_PATH` does **not** apply to ESM
+      bare specifiers (so the symlink — a `node_modules` adjacent to `scripts/` — is the only
+      mechanism that works); a real dev `node_modules` is left untouched; a broken link is
+      repaired. The script is now import-safe (guarded `main()`) so the bridge is unit-tested.
+    - **CP5 proven via the real engine, not just the commands' prose:** the gated
+      `canonical-flow.e2e.test.ts` (real Chromium, `VG_E2E=1`) copies the bundled sample into a
+      temp git repo, serves it, and drives `captureAll → compareRun → report → runBaseline`
+      through the full lifecycle: no-baseline → `new`; approve → unchanged re-run → **0
+      regressions**; a deliberate spacing-token → hardcoded-padding change → **`fail`** tied to
+      `src/Button.css` (via the manifest's git-derived `changedFiles`); approve → re-run → clean.
+    - **Sample regression is a spacing/geometry change, not a recolor** — the engine
+      grayscale/luminance-normalizes before `pixelmatch` (cross-machine AA/subpixel noise
+      suppression), so a luminance-preserving recolor is invisible by design; the SPEC's
+      canonical "padding token → hardcoded value" change grows the button (~3.2% ratio, 3× the
+      gate) and is robustly detected. Documented in the README determinism note.
+  - Hardening (from the T-12 review):
+    - The e2e static server sends `cache-control: no-store` (the stylesheet URL is stable
+      across runs) and contains served paths to the sample dir.
+    - The bridge unit test uses a runtime-variable import specifier so `tsc` doesn't try to type
+      the un-typed `.mjs` (keeps `npm run typecheck` green); a separate test runs real `tsx`
+      through a freshly-created bridge link to prove bare-import resolution end-to-end.
 
 ---
 
