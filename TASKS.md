@@ -12,6 +12,13 @@
   version · `deviceScaleFactor: 1` · `reducedMotion: "reduce"` · animations/transitions/caret
   disabled · `sharp` grayscale-normalize before diff · `pixelmatch({ includeAA: false })` ·
   `threshold: 0.1`, `maxDiffRatio: 0.01`. Revisit at CP3 if the determinism gate fails.
+- **Q#2 — interaction states (resolved in T-06):** a **Storybook story variant name is the
+  state** — discovered/listed stories expand **× viewports only** (the story name supplies
+  the state); app `routes` expand **× viewports × config `states`** (states realized via
+  Playwright actions in `capture.ts`). `RenderTarget.kind` tells capture which mechanism to
+  use. **Assumes one Storybook/app instance per kind with unique component names** — the
+  capture path `<target>/<state>@<viewport>.png` is keyed on `(name, state, viewport)`, so
+  multi-instance disambiguation (collision-safe paths) is deferred to **T-07 / Phase 1**.
 - **Q#4 — token source:** defaults to CSS custom properties; only matters in Phase 1
   (`token-auditor`), so deferred.
 
@@ -88,11 +95,12 @@ T-01 ─┬─→ T-02 ──────────────┐
   - Files: `scripts/lib/config.ts`, `tests/config.test.ts`
   - Depends on: T-02
 
-- [ ] **T-06 · `lib/targets.ts` + tests** → R3
+- [x] **T-06 · `lib/targets.ts` + tests** → R3
   - Acceptance: `detect: auto` discovers Storybook stories via `/index.json` (fallback
     `/stories.json`); expands stories → iframe URLs; app `routes` → URLs × `viewports` ×
     `states`; an explicit story/route list bypasses discovery; Storybook < 7 documented
-    unsupported with a clear error.
+    unsupported with a clear error. (Q#2 resolution + single-instance assumption recorded
+    in "Decisions taken to proceed" above.)
   - Verify: `npm test -- targets` (fetch mocked)
   - Files: `scripts/lib/targets.ts`, `tests/targets.test.ts`
   - Depends on: T-04
