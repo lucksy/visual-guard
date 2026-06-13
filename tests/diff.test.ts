@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import sharp from "sharp";
 import { diffImages } from "../scripts/lib/diff";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -53,5 +54,13 @@ describe("diffImages", () => {
     await expect(
       diffImages(Buffer.from("definitely not a png"), read("solid-10x10.png"), 0.1),
     ).rejects.toThrow();
+  });
+
+  it("returns a decodable PNG diff image sized to the compared region", async () => {
+    const result = await diffImages(read("solid-10x10.png"), read("patch-2x2.png"), 0.1);
+    const meta = await sharp(result.diffImage).metadata();
+    expect(meta.format).toBe("png");
+    expect(meta.width).toBe(10);
+    expect(meta.height).toBe(10);
   });
 });

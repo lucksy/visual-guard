@@ -140,14 +140,27 @@ T-01 ─┬─→ T-02 ──────────────┐
 
 ## Engine — diff orchestration + report
 
-- [ ] **T-08 · `scripts/compare.ts`** → CP4
-  - Acceptance: diffs a run's `current/` against `baselineDir`; writes `diff/<...>.png` per
-    image and per-image results; a target with **no baseline** is reported as `new` (not an
-    error); flags any image above `maxDiffRatio`.
-  - Verify: run against a fixture run dir; a deliberately altered fixture is flagged, an
-    unchanged one is not
-  - Files: `scripts/compare.ts`
+- [x] **T-08 · `scripts/compare.ts`** → CP4
+  - Acceptance: diffs a run's `current/` against `baselineDir` (keyed by the instance-nested
+    `renderRelPath`); writes `diff/<key>.png` per image + per-image results (`compare.json`);
+    a render with **no baseline** is reported as `new` (not an error); flags any image above
+    `maxDiffRatio` **or with a dimension change** as `fail`.
+  - Verify: `npm test -- compare` — real PNG fixtures in a temp dir: unchanged → `pass`,
+    altered → `fail`, resized → `fail`, missing baseline → `new`; diff PNGs written. ✅
+  - Files: `scripts/compare.ts`, `tests/compare.test.ts`; `lib/diff.ts` extended with a PNG
+    `diffImage` in `DiffResult` (so compare can write `diff/<key>.png`).
   - Depends on: T-05, T-07
+  - Note: CP4 = T-08 (compare flags altered fixtures) **+** T-09 (manifest golden). `compare.json`
+    (the per-image `CompareResult`) is the basis `report.ts` will assemble the manifest from.
+  - Hardening (from the T-08 adversarial review):
+    - `walkPngFiles` uses `lstat` + skips symlinks → no broken-link crash, no symlink-cycle
+      recursion, and keys can't escape the dir; plus an `isSafeKey` guard before any path-join.
+    - `current/` is type-checked (a file, not a dir, fails actionably); an undecodable render
+      is reported as `status: "error"` (with the message) and the run continues + still writes
+      `compare.json` (never a silent abort).
+    - Recorded paths are **relative/portable** (`current/<key>`, `diff/<key>`), not absolute.
+    - **Deferred (documented):** orphan-baseline detection (a baseline with no current render
+      is not reported — compare only walks `current/`); a max-image-size cap (Phase 2 hardening).
 
 - [ ] **T-09 · `scripts/report.ts` + golden test** → CP4, R6
   - Acceptance: assembles `manifest.json` = the subagent input contract (per-target: baseline
@@ -156,6 +169,14 @@ T-01 ─┬─→ T-02 ──────────────┐
   - Verify: `npm test -- report`
   - Files: `scripts/report.ts`, `tests/report.test.ts`
   - Depends on: T-08
+  - Contract decisions to make here (surfaced by the T-08 review):
+    - **Grouping:** `compare.json` is per-image (`<instance>/<target>/<state>@<viewport>`); the
+      manifest is per-target, so group by the key's `<instance>/<target>` prefix with an
+      `images: [{ state, viewport, ratio, dimensionDelta, regions, diffPath, ... }]` array.
+    - **`new`/`error` renders:** decide whether they appear in the reviewer-facing manifest
+      (recommend: list `new` separately as audit-only; surface `error` so a corrupt render
+      isn't silently dropped). Paths in `compare.json` are already relative/portable.
+    - Lock the `manifest.json` shape with the golden test so downstream (T-10/T-11) can't drift.
 
 ---
 

@@ -12,12 +12,14 @@ export interface BoundingBox {
 export interface DiffResult {
   changedPixels: number;
   totalPixels: number;
-  /** 0..1 — gate against config.threshold / maxDiffRatio. */
+  /** 0..1 changed-pixel fraction. `threshold` tunes pixelmatch sensitivity; compare.ts gates this against config.maxDiffRatio. */
   ratio: number;
   /** current minus baseline, or null when dimensions match. */
   dimensionDelta: { width: number; height: number } | null;
   /** Clustered changed areas (connected components, 8-connectivity). */
   regions: BoundingBox[];
+  /** PNG of the compared region with changed pixels marked red — written to diff/ by compare.ts. */
+  diffImage: Buffer;
 }
 
 interface GrayImage {
@@ -149,7 +151,13 @@ export async function diffImages(
   const totalPixels = cmpWidth * cmpHeight;
 
   if (totalPixels === 0) {
-    return { changedPixels: 0, totalPixels: 0, ratio: 0, dimensionDelta, regions: [] };
+    // Degenerate (a zero-area image): no region to visualize — emit a 1x1 transparent PNG.
+    const diffImage = await sharp({
+      create: { width: 1, height: 1, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    })
+      .png()
+      .toBuffer();
+    return { changedPixels: 0, totalPixels: 0, ratio: 0, dimensionDelta, regions: [], diffImage };
   }
 
   const baseCrop = cropRGBA(base.data, base.width, cmpWidth, cmpHeight);
@@ -162,11 +170,16 @@ export async function diffImages(
     diffColor: RED,
   });
 
+  const diffImage = await sharp(diff, { raw: { width: cmpWidth, height: cmpHeight, channels: 4 } })
+    .png()
+    .toBuffer();
+
   return {
     changedPixels,
     totalPixels,
     ratio: changedPixels / totalPixels,
     dimensionDelta,
     regions: clusterRegions(maskFromDiff(diff, cmpWidth, cmpHeight), cmpWidth, cmpHeight),
+    diffImage,
   };
 }
