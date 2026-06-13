@@ -47,6 +47,43 @@ describe("parseConfig — defaults", () => {
   });
 });
 
+describe("parseConfig — optional per-target instance name", () => {
+  it("preserves an explicit storybook target name", () => {
+    const cfg = parseConfig({
+      targets: [{ type: "storybook", url: "http://localhost:6006", name: "components" }],
+    });
+    expect(cfg.targets[0]).toEqual({
+      type: "storybook",
+      url: "http://localhost:6006",
+      name: "components",
+    });
+  });
+
+  it("preserves an explicit app target name alongside routes", () => {
+    const cfg = parseConfig({
+      targets: [{ type: "app", url: "http://localhost:3000", name: "admin", routes: ["/dash"] }],
+    });
+    expect(cfg.targets[0]).toEqual({
+      type: "app",
+      url: "http://localhost:3000",
+      name: "admin",
+      routes: ["/dash"],
+    });
+  });
+
+  it("leaves name undefined when not provided", () => {
+    const cfg = parseConfig(minimal);
+    expect(cfg.targets[0]).toEqual({ type: "storybook", url: "http://localhost:6006" });
+  });
+
+  it("throws naming the field when name is not a non-empty string", () => {
+    expect(() => parseConfig({ targets: [{ type: "storybook", url: "http://x", name: "" }] })).toThrow(
+      /name/,
+    );
+    expect(() => parseConfig({ targets: [{ type: "app", url: "http://x", name: 7 }] })).toThrow(/name/);
+  });
+});
+
 describe("parseConfig — validation (actionable, names the field)", () => {
   it("throws when the root is not an object", () => {
     expect(() => parseConfig(null)).toThrow(/config/i);

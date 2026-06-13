@@ -16,9 +16,14 @@
   state** — discovered/listed stories expand **× viewports only** (the story name supplies
   the state); app `routes` expand **× viewports × config `states`** (states realized via
   Playwright actions in `capture.ts`). `RenderTarget.kind` tells capture which mechanism to
-  use. **Assumes one Storybook/app instance per kind with unique component names** — the
-  capture path `<target>/<state>@<viewport>.png` is keyed on `(name, state, viewport)`, so
-  multi-instance disambiguation (collision-safe paths) is deferred to **T-07 / Phase 1**.
+  use.
+- **Multi-instance namespacing (T-06+):** config supports **multiple** Storybook + app
+  targets. Each target carries an optional `name`; otherwise its instance label is derived
+  from the URL host:port (`localhost:6006` → `localhost-6006`). Labels are **validated
+  unique** across all targets (fail fast on clash). The capture/baseline path is **always
+  nested by instance**: `<instance>/<target>/<state>@<viewport>.png`, so two instances
+  exposing the same component never collide and adding an instance never relocates an
+  existing one's baselines. `RenderTarget` carries `instance`.
 - **Q#4 — token source:** defaults to CSS custom properties; only matters in Phase 1
   (`token-auditor`), so deferred.
 

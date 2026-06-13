@@ -5,6 +5,8 @@ export type DetectMode = "auto";
 export interface StorybookTarget {
   type: "storybook";
   url: string;
+  /** Instance label for the output/baseline path; defaults to the URL host:port (targets.ts). */
+  name?: string;
   /** Explicit story ids to render; bypasses discovery when present (see targets.ts). */
   stories?: string[];
 }
@@ -12,6 +14,8 @@ export interface StorybookTarget {
 export interface AppTarget {
   type: "app";
   url: string;
+  /** Instance label for the output/baseline path; defaults to the URL host:port (targets.ts). */
+  name?: string;
   /** Explicit routes to render; bypasses discovery when present. */
   routes?: string[];
 }
@@ -97,8 +101,16 @@ function parseTarget(raw: unknown, index: number): Target {
   }
   const validUrl = asNonEmptyString(url, `targets[${index}].url`);
 
+  let name: string | undefined;
+  if (raw.name !== undefined) {
+    name = asNonEmptyString(raw.name, `targets[${index}].name`);
+  }
+
   if (type === "storybook") {
     const target: StorybookTarget = { type, url: validUrl };
+    if (name !== undefined) {
+      target.name = name;
+    }
     if (raw.stories !== undefined) {
       target.stories = asStringArray(raw.stories, `targets[${index}].stories`);
     }
@@ -106,6 +118,9 @@ function parseTarget(raw: unknown, index: number): Target {
   }
 
   const target: AppTarget = { type, url: validUrl };
+  if (name !== undefined) {
+    target.name = name;
+  }
   if (raw.routes !== undefined) {
     target.routes = asStringArray(raw.routes, `targets[${index}].routes`);
   }

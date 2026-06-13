@@ -1,4 +1,4 @@
-import type { AppTarget, Config, StorybookTarget } from "./config";
+import type { AppTarget, Config, StorybookTarget, Target } from "./config";
 
 /**
  * Target resolution: turn a validated {@link Config} into the flat list of individual
@@ -13,6 +13,12 @@ import type { AppTarget, Config, StorybookTarget } from "./config";
 
 /** One render to capture: a single component/page in one state at one viewport width. */
 export interface RenderTarget {
+  /**
+   * Instance namespace — the source target's `name`, or its URL host:port. Keeps renders
+   * from different Storybook/app instances in distinct output/baseline paths so two
+   * instances exposing the same component never collide.
+   */
+  instance: string;
   /** Component (Storybook) or page (app) name — capture groups output by this. */
   name: string;
   /** A distinct state: a Storybook story name, or a config `states` entry for an app. */
@@ -112,6 +118,22 @@ function nameFromRoute(route: string): string {
   return trimmed.replace(/\//g, "-");
 }
 
+/** A filesystem-safe instance label from a URL host:port, e.g. "localhost:6006" → "localhost-6006". */
+function instanceFromUrl(url: string): string {
+  let host: string;
+  try {
+    host = new URL(url).host;
+  } catch {
+    return fail(`target url ${JSON.stringify(url)} is not a valid URL.`);
+  }
+  return host.replace(/:/g, "-").replace(/[^a-zA-Z0-9._-]/g, "-");
+}
+
+/** The instance namespace for a target: its explicit `name`, else the URL host:port. */
+function instanceLabel(target: Target): string {
+  return target.name ?? instanceFromUrl(target.url);
+}
+
 /**
  * Parse a Storybook story index (from `/index.json` or `/stories.json`) into story refs.
  * The modern shape is `{ v: >=4, entries: { id: { id, title, name, type } } }`; the legacy
@@ -207,6 +229,7 @@ async function discoverStories(base: string, fetchImpl: FetchLike): Promise<Stor
 
 async function expandStorybook(
   target: StorybookTarget,
+  instance: string,
   viewports: number[],
   fetchImpl: FetchLike,
 ): Promise<RenderTarget[]> {
@@ -224,6 +247,7 @@ async function expandStorybook(
   for (const ref of refs) {
     for (const viewport of viewports) {
       renders.push({
+        instance,
         name: ref.component,
         state: ref.state,
         viewport,
@@ -235,7 +259,12 @@ async function expandStorybook(
   return renders;
 }
 
-function expandApp(target: AppTarget, viewports: number[], states: string[]): RenderTarget[] {
+function expandApp(
+  target: AppTarget,
+  instance: string,
+  viewports: number[],
+  states: string[],
+): RenderTarget[] {
   if (target.routes === undefined || target.routes.length === 0) {
     fail(
       `app target ${target.url} has no "routes". Phase 0 cannot auto-discover app routes — ` +
@@ -248,6 +277,7 @@ function expandApp(target: AppTarget, viewports: number[], states: string[]): Re
     for (const viewport of viewports) {
       for (const state of states) {
         renders.push({
+          instance,
           name: nameFromRoute(route),
           state,
           viewport,
@@ -270,12 +300,29 @@ export async function resolveTargets(
   config: Config,
   fetchImpl: FetchLike = defaultFetch,
 ): Promise<RenderTarget[]> {
+  // Resolve every instance label first and reject collisions up front, so two targets can
+  // never silently overwrite each other's renders/baselines (always-nested path scheme).
+  const labels = config.targets.map((target) => instanceLabel(target));
+  const seen = new Set<string>();
+  labels.forEach((label, index) => {
+    if (seen.has(label)) {
+      fail(
+        `duplicate instance label ${JSON.stringify(label)} (targets[${index}] collides with an ` +
+          `earlier target). Give each target a unique "name".`,
+      );
+    }
+    seen.add(label);
+  });
+
   const renders: RenderTarget[] = [];
-  for (const target of config.targets) {
+  for (let index = 0; index < config.targets.length; index++) {
+    const target = config.targets[index];
+    const instance = labels[index];
+    if (target === undefined || instance === undefined) continue;
     if (target.type === "storybook") {
-      renders.push(...(await expandStorybook(target, config.viewports, fetchImpl)));
+      renders.push(...(await expandStorybook(target, instance, config.viewports, fetchImpl)));
     } else {
-      renders.push(...expandApp(target, config.viewports, config.states));
+      renders.push(...expandApp(target, instance, config.viewports, config.states));
     }
   }
   return renders;

@@ -45,6 +45,9 @@ const SB_URL = "http://localhost:6006";
 const INDEX_URL = `${SB_URL}/index.json`;
 const STORIES_URL = `${SB_URL}/stories.json`;
 const APP_URL = "http://localhost:3000";
+// Instance labels derived from the URL host:port when no explicit `name` is set.
+const SB_INSTANCE = "localhost-6006";
+const APP_INSTANCE = "localhost-3000";
 
 function storybookConfig(opts: { stories?: string[]; viewports?: number[] } = {}): Config {
   const target: Record<string, unknown> = { type: "storybook", url: SB_URL };
@@ -103,6 +106,7 @@ describe("resolveTargets — Storybook discovery via /index.json", () => {
     expect(calls).toEqual([INDEX_URL]); // index.json answered → never touched stories.json
     expect(targets).toHaveLength(4); // 2 stories × 2 viewports, docs excluded
     expect(targets).toContainEqual({
+      instance: SB_INSTANCE,
       name: "Button",
       state: "Primary",
       viewport: 375,
@@ -110,6 +114,7 @@ describe("resolveTargets — Storybook discovery via /index.json", () => {
       url: "http://localhost:6006/iframe.html?id=example-button--primary&viewMode=story",
     });
     expect(targets).toContainEqual({
+      instance: SB_INSTANCE,
       name: "Button",
       state: "Disabled",
       viewport: 1280,
@@ -186,6 +191,7 @@ describe("resolveTargets — /stories.json fallback and Storybook < 7", () => {
     expect(calls).toEqual([INDEX_URL, STORIES_URL]);
     expect(targets).toEqual([
       {
+        instance: SB_INSTANCE,
         name: "Card",
         state: "Default",
         viewport: 1280,
@@ -273,6 +279,7 @@ describe("resolveTargets — explicit story list bypasses discovery", () => {
     const targets = await resolveTargets(cfg, failFetch);
     expect(targets).toHaveLength(4); // 2 stories × 2 viewports
     expect(targets).toContainEqual({
+      instance: SB_INSTANCE,
       name: "example-button",
       state: "primary",
       viewport: 375,
@@ -281,6 +288,7 @@ describe("resolveTargets — explicit story list bypasses discovery", () => {
     });
     // An id with no "--" separator falls back to a "default" state.
     expect(targets).toContainEqual({
+      instance: SB_INSTANCE,
       name: "standalone",
       state: "default",
       viewport: 1280,
@@ -298,6 +306,7 @@ describe("resolveTargets — app route expansion", () => {
     const targets = await resolveTargets(cfg, failFetch);
     expect(targets).toHaveLength(8); // 2 routes × 2 viewports × 2 states
     expect(targets).toContainEqual({
+      instance: APP_INSTANCE,
       name: "login",
       state: "default",
       viewport: 375,
@@ -305,6 +314,7 @@ describe("resolveTargets — app route expansion", () => {
       url: "http://localhost:3000/login",
     });
     expect(targets).toContainEqual({
+      instance: APP_INSTANCE,
       name: "checkout",
       state: "hover",
       viewport: 1280,
@@ -365,5 +375,95 @@ describe("resolveTargets — mixed config", () => {
     expect(targets.map((t) => t.kind)).toEqual(["storybook", "app"]);
     expect(targets[0]?.name).toBe("Card");
     expect(targets[1]?.name).toBe("home");
+  });
+});
+
+// --- Instance labels (multi-instance namespacing) -------------------------
+
+describe("resolveTargets — instance labels", () => {
+  it("derives the instance label from the URL host:port when no name is set", async () => {
+    const { fetch } = mockFetch({
+      [INDEX_URL]: {
+        body: { v: 4, entries: { "x--y": { id: "x--y", title: "X", name: "Y", type: "story" } } },
+      },
+    });
+    const targets = await resolveTargets(storybookConfig(), fetch);
+    expect(targets.every((t) => t.instance === "localhost-6006")).toBe(true);
+  });
+
+  it("uses an explicit target name as the instance label", async () => {
+    const { fetch } = mockFetch({
+      [INDEX_URL]: {
+        body: { v: 4, entries: { "x--y": { id: "x--y", title: "X", name: "Y", type: "story" } } },
+      },
+    });
+    const cfg = parseConfig({
+      targets: [{ type: "storybook", url: SB_URL, name: "components" }],
+      viewports: [1280],
+      states: ["default"],
+    });
+    const targets = await resolveTargets(cfg, fetch);
+    expect(targets.every((t) => t.instance === "components")).toBe(true);
+  });
+
+  it("namespaces multiple Storybook + app instances distinctly", async () => {
+    const { fetch } = mockFetch({
+      "http://localhost:6006/index.json": {
+        body: { v: 4, entries: { "btn--default": { id: "btn--default", title: "Button", name: "Default", type: "story" } } },
+      },
+      "http://localhost:6007/index.json": {
+        body: { v: 4, entries: { "ico--default": { id: "ico--default", title: "Icon", name: "Default", type: "story" } } },
+      },
+    });
+    const cfg = parseConfig({
+      targets: [
+        { type: "storybook", url: "http://localhost:6006", name: "components" },
+        { type: "storybook", url: "http://localhost:6007" }, // host:port fallback
+        { type: "app", url: "http://localhost:3000", name: "web", routes: ["/home"] },
+        { type: "app", url: "http://localhost:4000", name: "admin", routes: ["/home"] },
+      ],
+      viewports: [1280],
+      states: ["default"],
+    });
+    const targets = await resolveTargets(cfg, fetch);
+
+    // Two app instances share component name "home" but live in distinct instance namespaces.
+    const homes = targets.filter((t) => t.name === "home");
+    expect(homes.map((t) => t.instance).sort()).toEqual(["admin", "web"]);
+    expect(targets.find((t) => t.name === "Button")?.instance).toBe("components");
+    expect(targets.find((t) => t.name === "Icon")?.instance).toBe("localhost-6007");
+  });
+
+  it("fails fast when two targets resolve to the same instance label", async () => {
+    const cfg = parseConfig({
+      targets: [
+        { type: "app", url: "http://localhost:3000", name: "dup", routes: ["/a"] },
+        { type: "app", url: "http://localhost:4000", name: "dup", routes: ["/b"] },
+      ],
+      viewports: [1280],
+      states: ["default"],
+    });
+    await expect(resolveTargets(cfg, failFetch)).rejects.toThrow(/duplicate instance label.*dup/i);
+  });
+
+  it("fails fast when two unnamed targets share a host:port", async () => {
+    const cfg = parseConfig({
+      targets: [
+        { type: "app", url: "http://localhost:3000", routes: ["/a"] },
+        { type: "app", url: "http://localhost:3000", routes: ["/b"] },
+      ],
+      viewports: [1280],
+      states: ["default"],
+    });
+    await expect(resolveTargets(cfg, failFetch)).rejects.toThrow(/duplicate instance label/i);
+  });
+
+  it("throws an actionable error when a target url is not a valid URL", async () => {
+    const cfg = parseConfig({
+      targets: [{ type: "app", url: "not-a-url", routes: ["/a"] }],
+      viewports: [1280],
+      states: ["default"],
+    });
+    await expect(resolveTargets(cfg, failFetch)).rejects.toThrow(/not a valid URL/i);
   });
 });
