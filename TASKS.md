@@ -220,13 +220,30 @@ T-01 ─┬─→ T-02 ──────────────┐
     - Encodes SPEC boundaries: read-only on source, never auto-approve a baseline, evidence
       before verdict, nothing sent to an external service.
 
-- [ ] **T-11 · `/visual-baseline` command**
+- [x] **T-11 · `/visual-baseline` command**
   - Acceptance: copies a run's `current/` renders into `baselineDir` for the named target
     (the sign-off); confirms before overwriting an existing baseline; never runs
     automatically; writes only under `baselineDir`.
-  - Verify: `/visual-baseline Button` → re-run `/visual-check Button` → 0 regressions
-  - Files: `commands/visual-baseline.md`
+  - Verify: `npm test -- baseline` — approve → diff current vs new baseline = ratio 0
+    (the sign-off property); skips existing unless `--overwrite`; refuses to write outside
+    `baselineDir`. ✅ `claude plugin validate . --strict` passes. The manual
+    `/visual-baseline Button → re-run → 0 regressions` runs at **T-12** (needs the engine bridge).
+  - Files: `commands/visual-baseline.md`, `scripts/baseline.ts`, `tests/baseline.test.ts`
   - Depends on: T-09
+  - Note: the safety-critical copy lives in a **tested** `scripts/baseline.ts` (latest-run
+    resolution, target filter, skip-existing-unless-`--overwrite`, **hard guard** against any
+    write outside `baselineDir`); the command provides the dry-run preview + explicit
+    confirm-before-overwrite gate and is invoked only on the user's explicit `/visual-baseline`.
+  - Hardening (from the T-11 safety review — make the guarantee script-enforced, not prose):
+    - **`--confirmed` gate:** the script *refuses* to overwrite an existing committed baseline
+      unless `--confirmed` is also passed — so the "never overwrite without approval" invariant
+      is enforced in tested code even if the script is invoked directly. The command passes it
+      only after the user's explicit yes.
+    - **Per-file resilience:** a vanished/unreadable source is recorded in `failed[]` instead
+      of aborting the sign-off mid-way; the `assertUnder` path guard stays a hard fail.
+    - **Live overwrite re-check** (decide on current fs state, not the stale plan) closes the
+      plan→apply TOCTOU window; `latestRunId` skips runs without a `current/` dir; `isSafeKey`
+      added as defense in depth.
 
 ---
 
