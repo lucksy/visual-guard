@@ -199,15 +199,26 @@ T-01 ─┬─→ T-02 ──────────────┐
 
 ## Commands (skills)
 
-- [ ] **T-10 · `/visual-check` command**
+- [x] **T-10 · `/visual-check` command**
   - Acceptance: skill runs the gather→act→verify loop — gather changed UI files via git +
     config, act = `capture.ts` → `compare.ts` → `report.ts`, present the `manifest.json`
     results with pixel numbers **and** a plain-language explanation (Phase 0: the main loop
-    explains; the `visual-reviewer` subagent is wired in Phase 1); target arg optional
-    (defaults to pending changes).
-  - Verify: `claude plugin validate .`; manual `/visual-check Button` on the sample project
+    explains; the `visual-reviewer` subagent is wired in Phase 1); target arg optional.
+  - Verify: `claude plugin validate . --strict` passes ✅; manual `/visual-check Button` on the
+    sample project is part of **T-12** (needs the engine-invocation bridge — see note).
   - Files: `commands/visual-check.md`
   - Depends on: T-09
+  - Decisions / notes:
+    - **No-arg scope:** Phase 0 has no edit-tracking hook (that's Phase 1's `PostToolUse` +
+      `pending.json`), so "defaults to pending changes" is realized as **capture all configured
+      targets**; the report tags each target with the related changed files, so a regression is
+      never skipped by a target-name guess.
+    - **Engine-invocation bridge deferred to T-12** (user decision): the bundled `.ts` engine's
+      deps live in `${CLAUDE_PLUGIN_DATA}` and `tsx` isn't yet an engine dep, so the documented
+      runner isn't runnable until T-12 wires the bridge (add `tsx` to `ENGINE_DEPS` +
+      resolve `node_modules`). The command's **preflight stops actionably** until then.
+    - Encodes SPEC boundaries: read-only on source, never auto-approve a baseline, evidence
+      before verdict, nothing sent to an external service.
 
 - [ ] **T-11 · `/visual-baseline` command**
   - Acceptance: copies a run's `current/` renders into `baselineDir` for the named target
