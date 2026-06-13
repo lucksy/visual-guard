@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parseConfig, type Config } from "../scripts/lib/config";
-import { resolveTargets, type FetchLike } from "../scripts/lib/targets";
+import { resolveTargets, sanitizePathSegment, type FetchLike } from "../scripts/lib/targets";
 
 // --- Test doubles ---------------------------------------------------------
 // targets.ts performs its only I/O through an injected `fetch`, so every test
@@ -465,5 +465,67 @@ describe("resolveTargets — instance labels", () => {
       states: ["default"],
     });
     await expect(resolveTargets(cfg, failFetch)).rejects.toThrow(/not a valid URL/i);
+  });
+});
+
+// --- Path-traversal hardening (instance/name/state become filesystem segments) -------
+
+describe("sanitizePathSegment", () => {
+  it("strips path separators, parent-dir refs, and leading dots", () => {
+    expect(sanitizePathSegment("../../etc/passwd")).not.toMatch(/\.\.|\//);
+    expect(sanitizePathSegment("a/b\\c")).toBe("a-b-c");
+    expect(sanitizePathSegment("..")).toBe("_"); // pure parent-dir refs collapse to empty → "_"
+    expect(sanitizePathSegment("\0\0")).toBe("-"); // control chars → dash (safe, no traversal)
+  });
+
+  it("leaves ordinary segment values unchanged", () => {
+    expect(sanitizePathSegment("Button")).toBe("Button");
+    expect(sanitizePathSegment("localhost-6006")).toBe("localhost-6006");
+    expect(sanitizePathSegment("user-settings")).toBe("user-settings");
+  });
+});
+
+describe("resolveTargets — untrusted values can't escape the path", () => {
+  const traversal = (segment: string): boolean => !segment.includes("..") && !segment.includes("/");
+
+  it("sanitizes a malicious discovered story title and name", async () => {
+    const { fetch } = mockFetch({
+      [INDEX_URL]: {
+        body: {
+          v: 4,
+          entries: {
+            "evil--x": {
+              id: "evil--x",
+              title: "../../../../etc",
+              name: "../../passwd",
+              type: "story",
+            },
+          },
+        },
+      },
+    });
+    const targets = await resolveTargets(storybookConfig(), fetch);
+    expect(targets).toHaveLength(1);
+    expect(traversal(targets[0]!.name)).toBe(true);
+    expect(traversal(targets[0]!.state)).toBe(true);
+  });
+
+  it("sanitizes a malicious explicit story id", async () => {
+    const cfg = storybookConfig({ stories: ["../../evil--../../state"] });
+    const targets = await resolveTargets(cfg, failFetch);
+    expect(traversal(targets[0]!.name)).toBe(true);
+    expect(traversal(targets[0]!.state)).toBe(true);
+  });
+
+  it("sanitizes a malicious app target name (instance) and route (name) and state", async () => {
+    const cfg = parseConfig({
+      targets: [{ type: "app", url: "http://localhost:3000", name: "../../../../", routes: ["/../../etc"] }],
+      viewports: [1280],
+      states: ["../../evil"],
+    });
+    const targets = await resolveTargets(cfg, failFetch);
+    expect(traversal(targets[0]!.instance)).toBe(true);
+    expect(traversal(targets[0]!.name)).toBe(true);
+    expect(traversal(targets[0]!.state)).toBe(true);
   });
 });

@@ -213,8 +213,9 @@ visual-guard/                        # plugin root (dev root: visual-check/)
 └── SPEC.md                          # this file
 
 # --- Created inside the *consuming* project, not the plugin ---
-.visual-baselines/<target>/<state>@<viewport>.png   # committed approved baselines
-.visual-guard/runs/<id>/{current,diff,manifest.json}# transient run output (gitignored)
+.visual-baselines/<instance>/<target>/<state>@<viewport>.png  # committed approved baselines
+.visual-guard/runs/<id>/current/<instance>/<target>/<state>@<viewport>.png  # transient renders (gitignored)
+.visual-guard/runs/<id>/{diff,manifest.json}        # transient run output (gitignored)
 .visual-guard/pending.json                          # "needs review" markers from the hook
 ```
 

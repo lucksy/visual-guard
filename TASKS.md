@@ -110,16 +110,31 @@ T-01 ─┬─→ T-02 ──────────────┐
   - Files: `scripts/lib/targets.ts`, `tests/targets.test.ts`
   - Depends on: T-04
 
-- [ ] **T-07 · `scripts/capture.ts`** → CP3, R2
+- [x] **T-07 · `scripts/capture.ts`** → CP3, R2
   - Acceptance: launches pinned Chromium with R1 settings (deviceScaleFactor 1, reducedMotion,
-    animations off); captures every target × state × viewport from `targets.ts` into
-    `.visual-guard/runs/<id>/current/<target>/<state>@<viewport>.png`; **probes the target URL
-    and fails fast** with a "start your dev server/storybook on :PORT" message when
-    unreachable.
-  - Verify: start sample Storybook → `npx tsx scripts/capture.ts --target Button` → PNGs present;
-    **determinism gate:** capture twice → `diffImages` ratio 0
-  - Files: `scripts/capture.ts`, (optional) `scripts/lib/browser.ts`
+    animations off via `FREEZE_STYLE` + light colorScheme); captures every target × state ×
+    viewport from `targets.ts` into
+    `.visual-guard/runs/<id>/current/<instance>/<target>/<state>@<viewport>.png` (instance-nested
+    per T-06+); **probes each target origin and fails fast** with a "start your dev server/
+    storybook on :PORT" message when unreachable (R2).
+  - Verify: `npm test -- capture` (pure helpers + fake-browser orchestration); **CP3 gate
+    (opt-in):** `VG_E2E=1 npx vitest run capture.e2e` captures a static page twice → `diffImages`
+    ratio **0** ✅ (proven with real Chromium); R2 probe → "could not reach" ✅.
+  - Files: `scripts/capture.ts`, `scripts/lib/browser.ts`, `tests/capture.test.ts`,
+    `tests/browser.test.ts`, `tests/capture.e2e.test.ts`
   - Depends on: T-06, T-03, T-05 (for the determinism check)
+  - Note: browser launch / fetch / fs are dependency-injected so orchestration is unit-testable
+    without a browser; the determinism gate is the opt-in integration test (real Chromium).
+  - Hardening (from the T-07 adversarial review):
+    - **Path traversal:** `instance`/`name`/`state` and the `--run` id become filesystem
+      segments and partly come from untrusted Storybook titles/config — all run through
+      `sanitizePathSegment` so `../../x` can't escape the run dir (RULES.md). Tested.
+    - **R1 freeze-before-load:** `FREEZE_STYLE` is injected via `addInitScript` **before**
+      page load (not just after `goto`), plus a settle step awaits `document.fonts.ready` +
+      `<img>` loads and resets scroll. CP3 now also gates an **animated** fixture → ratio 0.
+    - **Deferred (documented):** JS-animation-library determinism is the component's job
+      (must honor `prefers-reduced-motion`); an unbounded render cap is Phase 2 (needs a
+      `maxRenders` config field — "ask first").
 
 ---
 

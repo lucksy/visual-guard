@@ -93,11 +93,21 @@ interface StoryRef {
 }
 
 function refFromEntry(id: string, title: string | undefined, name: string | undefined): StoryRef {
+  // `component` and `state` become path segments and derive from untrusted story metadata,
+  // so they are sanitized here at the single point both discovered and explicit refs pass through.
   if (title !== undefined) {
-    return { id, component: componentFromTitle(title), state: name ?? "default" };
+    return {
+      id,
+      component: sanitizePathSegment(componentFromTitle(title)),
+      state: sanitizePathSegment(name ?? "default"),
+    };
   }
   const parsed = parseStoryId(id);
-  return { id, component: parsed.name, state: name ?? parsed.state };
+  return {
+    id,
+    component: sanitizePathSegment(parsed.name),
+    state: sanitizePathSegment(name ?? parsed.state),
+  };
 }
 
 function iframeUrl(base: string, id: string): string {
@@ -118,6 +128,22 @@ function nameFromRoute(route: string): string {
   return trimmed.replace(/\//g, "-");
 }
 
+/**
+ * Make a string safe to use as a single filesystem path segment. `instance`, `name`, and
+ * `state` flow into the capture/baseline path, and some of them come from untrusted sources
+ * (Storybook story titles/names fetched over HTTP, config strings) — so a value like
+ * "../../etc/x" must never escape the run directory (RULES.md: prevent path traversal).
+ * Replaces path separators / control chars / spaces with "-", collapses parent-dir runs,
+ * and strips leading dots; an empty result becomes "_".
+ */
+export function sanitizePathSegment(value: string): string {
+  const cleaned = value
+    .replace(/[^A-Za-z0-9._-]+/g, "-") // separators, NUL, spaces, etc. → dash
+    .replace(/\.\.+/g, ".") // collapse "..", "..." → "." (no parent-dir refs)
+    .replace(/^\.+/, ""); // no leading dot (no ".", "..", or hidden files)
+  return cleaned.length > 0 ? cleaned : "_";
+}
+
 /** A filesystem-safe instance label from a URL host:port, e.g. "localhost:6006" → "localhost-6006". */
 function instanceFromUrl(url: string): string {
   let host: string;
@@ -129,9 +155,9 @@ function instanceFromUrl(url: string): string {
   return host.replace(/:/g, "-").replace(/[^a-zA-Z0-9._-]/g, "-");
 }
 
-/** The instance namespace for a target: its explicit `name`, else the URL host:port. */
+/** The instance namespace for a target: its explicit `name`, else the URL host:port (sanitized). */
 function instanceLabel(target: Target): string {
-  return target.name ?? instanceFromUrl(target.url);
+  return sanitizePathSegment(target.name ?? instanceFromUrl(target.url));
 }
 
 /**
@@ -274,14 +300,17 @@ function expandApp(
 
   const renders: RenderTarget[] = [];
   for (const route of target.routes) {
+    // `name` and `state` become path segments; sanitize (route + config state are user-controlled).
+    const name = sanitizePathSegment(nameFromRoute(route));
+    const url = routeUrl(target.url, route);
     for (const viewport of viewports) {
       for (const state of states) {
         renders.push({
           instance,
-          name: nameFromRoute(route),
-          state,
+          name,
+          state: sanitizePathSegment(state),
           viewport,
-          url: routeUrl(target.url, route),
+          url,
           kind: "app",
         });
       }
