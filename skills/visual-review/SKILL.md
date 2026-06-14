@@ -11,6 +11,24 @@ bundle a workflow directly, so this skill ships the orchestration as a **script 
 (`workflow.template.js`, next to this file) and launches it for you with the Workflow tool. It is
 read-only on source and sends nothing to an external service — all capture, diff, and review is local.
 
+## 0. Preflight — engine check (every run)
+
+- If `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is unset, this isn't running as an installed
+  plugin — tell the user and **stop**.
+- **Check the engine first.** This review captures with the same engine as `/visual-check`, so detect
+  it **without installing anything**:
+
+  ```bash
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs" --check
+  ```
+
+  `Read` the one-line JSON (`$STATE`). If `$STATE.installed` is **false**, run the setup-consent flow
+  inline (the same one `/visual-setup` performs): with **AskUserQuestion**, show *what*
+  (`$STATE.engineDeps` + `$STATE.browser`), *why* (render screenshots of the UI locally), *where*
+  (`$STATE.dataDir` — the plugin's data dir, **not** your project), and *size* (~150 MB, one-time).
+  On **Install now** → run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once
+  it exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed` is true, continue.
+
 ## 1. Build (or locate) a run to review
 
 The workflow reviews an existing run's `manifest.json`. If there isn't a fresh one, produce it first
@@ -29,6 +47,7 @@ CONFIG="$(first of visual.config.json, config/visual.config.json, else ${CLAUDE_
 ```
 
 If `capture.ts` reports **"could not reach …"**, relay it and stop (the dev server/Storybook isn't up).
+(The engine itself is already verified in §0.)
 
 ## 2. Compute the review units
 

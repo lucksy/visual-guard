@@ -19,10 +19,21 @@ and browser live. Before running anything:
 
 - If `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is unset, this isn't running as an
   installed plugin — tell the user and **stop**.
-- The runner is `${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx` and the browser lives under
-  `${CLAUDE_PLUGIN_DATA}/browsers`. If either is missing, the engine isn't bootstrapped yet —
-  tell the user it installs on session start, ask them to start a fresh session (or share the
-  SessionStart hook output if it keeps failing), and **stop**. Do not improvise another runner.
+- **Check the engine first — every run.** The engine (runtime deps + a pinned Chromium) installs into
+  `${CLAUDE_PLUGIN_DATA}` on the first session. Detect it **without installing anything**:
+
+  ```bash
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs" --check
+  ```
+
+  `Read` the one-line JSON (`$STATE`). If `$STATE.installed` is **false**, do **not** improvise a
+  download — run the setup-consent flow inline (the same one `/visual-setup` performs): with
+  **AskUserQuestion**, show *what* (`$STATE.engineDeps` + `$STATE.browser`), *why* (render screenshots
+  of the UI locally so Visual Guard can diff it), *where* (`$STATE.dataDir` — the plugin's data dir,
+  **not** your project), and *size* (~150 MB, one-time). On **Install now** → run
+  `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once it exits `0`; on **Not
+  now** → **stop** (nothing changes). When `$STATE.installed` is true, just continue. Never improvise
+  another runner or download anything yourself.
 - Resolve the project's config — the first that exists of `visual.config.json`,
   `config/visual.config.json`, else the bundled default
   `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`. Call it `$CONFIG`.

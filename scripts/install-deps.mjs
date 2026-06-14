@@ -138,7 +138,82 @@ export function ensureBridgeLink(rootNodeModules, depsNodeModules) {
   return "kept-existing";
 }
 
+/** Human-readable label for the pinned browser the installer fetches via Playwright. */
+const BROWSER_LABEL = "Chromium (pinned, via Playwright)";
+
+/**
+ * Inspect the install state of a data dir WITHOUT touching it — fs reads only, no install, no
+ * `process.exit`, no bridge mutation. Mirrors `main()`'s path math and the `isInstalled()`
+ * criteria exactly so `--check` and the actual install agree on what "installed" means:
+ *   installed ⟺ marker (package.json) matches desiredManifest() AND node_modules present AND
+ *   the browsers dir present.
+ *
+ * `dataDir` is resolved() internally so a relative path still inspects the right place (the
+ * installer needs an absolute path for the symlink target, but inspection only reads). Returns a
+ * structured, JSON-serializable state object; the consent gate (`/visual-setup`) reads it.
+ *
+ * @param {string} dataDir
+ * @returns {{
+ *   dataDir: string,
+ *   installed: boolean,
+ *   depsPresent: boolean,
+ *   browserPresent: boolean,
+ *   markerMatches: boolean,
+ *   missing: string[],
+ *   engineDeps: typeof ENGINE_DEPS,
+ *   browser: string,
+ * }}
+ */
+export function computeInstallState(dataDir) {
+  const resolvedDataDir = resolve(dataDir);
+  const browsersDir = join(resolvedDataDir, "browsers");
+  const markerPath = join(resolvedDataDir, "package.json"); // the diff marker
+  const nodeModulesDir = join(resolvedDataDir, "node_modules");
+  const manifest = desiredManifest();
+
+  const depsPresent = existsSync(nodeModulesDir);
+  const browserPresent = existsSync(browsersDir);
+
+  let markerMatches = false;
+  if (existsSync(markerPath)) {
+    try {
+      markerMatches = readFileSync(markerPath, "utf8") === manifest;
+    } catch {
+      markerMatches = false; // unreadable marker → treat as not matching
+    }
+  }
+
+  // Same gate as isInstalled(): all three must hold.
+  const installed = markerMatches && depsPresent && browserPresent;
+
+  const missing = [];
+  if (!depsPresent) {
+    missing.push("deps");
+  }
+  if (!browserPresent) {
+    missing.push("browser");
+  }
+  if (!markerMatches) {
+    missing.push("marker");
+  }
+
+  return {
+    dataDir: resolvedDataDir,
+    installed,
+    depsPresent,
+    browserPresent,
+    markerMatches,
+    missing,
+    engineDeps: ENGINE_DEPS,
+    browser: BROWSER_LABEL,
+  };
+}
+
 function main() {
+  // `--check`: read-only install-state inspection for the /visual-setup consent gate. Prints the
+  // computeInstallState() JSON to STDOUT and exits 0. Installs nothing, never touches the bridge.
+  const checkOnly = process.argv.includes("--check");
+
   const rawDataDir = process.env.CLAUDE_PLUGIN_DATA;
   if (!rawDataDir) {
     // Outside a plugin runtime (e.g. a raw `node` invocation) we cannot know where to install.
@@ -152,6 +227,12 @@ function main() {
   // relative to the link's own directory, not cwd), so a relative CLAUDE_PLUGIN_DATA would
   // otherwise produce a link that points at the wrong place.
   const dataDir = resolve(rawDataDir);
+
+  if (checkOnly) {
+    // STDOUT (not stderr): the consent gate parses this. No install, no bridge, no fs writes.
+    process.stdout.write(JSON.stringify(computeInstallState(dataDir)) + "\n");
+    process.exit(0);
+  }
 
   const browsersDir = join(dataDir, "browsers");
   const markerPath = join(dataDir, "package.json"); // the diff marker

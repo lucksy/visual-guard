@@ -21,13 +21,28 @@ import { fileURLToPath } from "node:url";
  * here. The specifier is held in a variable so `tsc` does not try to resolve the un-typed
  * `.mjs` (which would break `npm run typecheck`); vitest resolves it at runtime.
  */
+interface InstallState {
+  dataDir: string;
+  installed: boolean;
+  depsPresent: boolean;
+  browserPresent: boolean;
+  markerMatches: boolean;
+  missing: string[];
+  engineDeps: Record<string, string>;
+  browser: string;
+}
+
 const installDepsSpecifier = "../scripts/install-deps.mjs";
-const { ensureBridgeLink, ENGINE_DEPS } = (await import(installDepsSpecifier)) as {
+const { ensureBridgeLink, ENGINE_DEPS, computeInstallState, desiredManifest } = (await import(
+  installDepsSpecifier
+)) as {
   ensureBridgeLink: (
     rootNodeModules: string,
     depsNodeModules: string,
   ) => "created" | "repaired" | "kept-existing";
   ENGINE_DEPS: Record<string, string>;
+  computeInstallState: (dataDir: string) => InstallState;
+  desiredManifest: () => string;
 };
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -184,4 +199,84 @@ describe("install-deps engine bridge", () => {
     const out = execFileSync(tsx, [probe], { cwd: tmpdir(), encoding: "utf8" });
     expect(out.trim()).toBe("OK 1");
   }, 30_000);
+});
+
+describe("computeInstallState (--check inspection)", () => {
+  let tmp = "";
+  let dataDir = "";
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-state-"));
+    dataDir = join(tmp, "data");
+    mkdirSync(dataDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    if (tmp) {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  /** Build a (possibly partial) fake install in `dataDir`. */
+  const writeMarker = (contents: string) =>
+    writeFileSync(join(dataDir, "package.json"), contents);
+  const makeDeps = () => mkdirSync(join(dataDir, "node_modules"), { recursive: true });
+  const makeBrowser = () => mkdirSync(join(dataDir, "browsers"), { recursive: true });
+
+  it("reports installed:true with no missing for a fully-installed data dir", () => {
+    writeMarker(desiredManifest()); // exact byte-for-byte marker match
+    makeDeps();
+    makeBrowser();
+
+    const state = computeInstallState(dataDir);
+    expect(state.installed).toBe(true);
+    expect(state.depsPresent).toBe(true);
+    expect(state.browserPresent).toBe(true);
+    expect(state.markerMatches).toBe(true);
+    expect(state.missing).toEqual([]);
+    // It surfaces the plan inputs the consent gate explains to the user.
+    expect(state.engineDeps).toEqual(ENGINE_DEPS);
+    expect(state.browser).toMatch(/Chromium/);
+    expect(state.dataDir).toBe(resolve(dataDir));
+  });
+
+  it("reports browser missing when deps + marker are present but Chromium isn't", () => {
+    writeMarker(desiredManifest());
+    makeDeps();
+    // no browsers dir
+
+    const state = computeInstallState(dataDir);
+    expect(state.installed).toBe(false);
+    expect(state.depsPresent).toBe(true);
+    expect(state.markerMatches).toBe(true);
+    expect(state.browserPresent).toBe(false);
+    expect(state.missing).toContain("browser");
+    expect(state.missing).not.toContain("deps");
+    expect(state.missing).not.toContain("marker");
+  });
+
+  it("reports not-installed when the marker mismatches (e.g. a version bump)", () => {
+    writeMarker(desiredManifest().replace("visual-guard-engine", "stale-engine"));
+    makeDeps();
+    makeBrowser();
+
+    const state = computeInstallState(dataDir);
+    expect(state.installed).toBe(false);
+    expect(state.depsPresent).toBe(true);
+    expect(state.browserPresent).toBe(true);
+    expect(state.markerMatches).toBe(false);
+    expect(state.missing).toEqual(["marker"]);
+  });
+
+  it("reports not-installed with both deps and browser missing for an empty data dir", () => {
+    // nothing created beyond the empty dataDir
+    const state = computeInstallState(dataDir);
+    expect(state.installed).toBe(false);
+    expect(state.depsPresent).toBe(false);
+    expect(state.browserPresent).toBe(false);
+    expect(state.markerMatches).toBe(false);
+    expect(state.missing).toContain("deps");
+    expect(state.missing).toContain("browser");
+    expect(state.missing).toContain("marker");
+  });
 });

@@ -39,6 +39,10 @@ Run these steps inside Claude Code.
 The first time it loads it sets itself up automatically (downloads a browser and the tools it
 needs). This happens once.
 
+> **First-time setup.** The engine installs automatically on the first session. If you added the
+> plugin **mid-session** (so that one-time setup didn't run), run **`/visual-setup`** — it shows
+> exactly what it downloads (and where) and asks before installing. Nothing leaves your machine.
+
 **3. Start your UI**
 
 Start your Storybook or dev server, for example:
@@ -89,6 +93,7 @@ known-good images.
 | Command | What it does |
 |---|---|
 | `/visual-init` | Guided setup wizard — detects your server and tokens, asks you to confirm or fill in each, then writes `visual.config.json`. |
+| `/visual-setup` | Install the engine (browser + tools) if it didn't auto-install — shows what it downloads and asks first. |
 | `/visual-check [name]` | Screenshot your UI, compare to the baseline, and explain what changed. |
 | `/visual-baseline [name]` | Approve the latest screenshots as the new baseline. |
 | `/visual-review` | A deeper review across many components, with each finding double-checked. |

@@ -18,11 +18,26 @@ is **read-only** on source (never edits a file to pass, never approves a baselin
 
 ## 0. Preflight
 
-Same as `/visual-check`: if `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}` are unset, this isn't an
-installed plugin — stop. The runner is `${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx` and Chromium is
-under `${CLAUDE_PLUGIN_DATA}/browsers`; if either is missing, the engine isn't bootstrapped (it
-installs on `SessionStart`) — ask for a fresh session and stop. Resolve `$CONFIG` as the first of
-`visual.config.json`, `config/visual.config.json`, else `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`.
+If `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}` are unset, this isn't an installed plugin — stop.
+
+**Check the engine first — every run.** Detect it **without installing anything**:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs" --check
+```
+
+`Read` the one-line JSON (`$STATE`). If `$STATE.installed` is **false**, run the setup-consent flow
+inline (the same one `/visual-setup` performs): with **AskUserQuestion**, show *what*
+(`$STATE.engineDeps` + `$STATE.browser`), *why* (render screenshots of the UI locally), *where*
+(`$STATE.dataDir` — the plugin's data dir, **not** your project), and *size* (~150 MB, one-time). On
+**Install now** → run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once it
+exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed` is true, continue.
+
+> In a non-interactive CI run (no one to approve), don't prompt — assume the engine is provisioned by
+> the pipeline (a prior session or `node install-deps.mjs` step) and let the capture fail loudly if not.
+
+Resolve `$CONFIG` as the first of `visual.config.json`, `config/visual.config.json`, else
+`${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`.
 
 ## 1. Capture → compare → report
 

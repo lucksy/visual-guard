@@ -14,10 +14,20 @@ to any external service.
 
 ## 0. Preflight
 
-- If `${CLAUDE_PLUGIN_ROOT}` is unset, this isn't running as an installed plugin — tell the user and
-  **stop**.
-- The runner is `${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx`. If it's missing, the engine isn't
-  bootstrapped yet (it installs on `SessionStart`) — ask the user to start a fresh session and **stop**.
+- If `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is unset, this isn't running as an installed
+  plugin — tell the user and **stop**.
+- **Check the engine first — every run.** Detect it **without installing anything**:
+
+  ```bash
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs" --check
+  ```
+
+  `Read` the one-line JSON (`$STATE`). If `$STATE.installed` is **false**, run the setup-consent flow
+  inline (the same one `/visual-setup` performs): with **AskUserQuestion**, show *what*
+  (`$STATE.engineDeps` + `$STATE.browser`), *why* (render screenshots of the UI locally), *where*
+  (`$STATE.dataDir` — the plugin's data dir, **not** your project), and *size* (~150 MB, one-time).
+  On **Install now** → run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once
+  it exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed` is true, continue.
 - Resolve `$CONFIG` the same way `/visual-check` does: the first that exists of `visual.config.json`,
   `config/visual.config.json`, else `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`.
 
