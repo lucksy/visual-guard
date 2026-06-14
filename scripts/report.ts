@@ -438,7 +438,14 @@ function readRenders(runDir: string): RendersMap {
 function gitChangedFiles(): string[] {
   const run = (args: string[]): string[] => {
     try {
-      return execFileSync("git", args, { encoding: "utf8" }).split("\n");
+      // stdio: ignore stdin + stderr (capture only stdout). Outside a git repo / on any git error,
+      // git prints a multi-line usage/"fatal: not a git repository" message to stderr; without this
+      // it would leak to the console and look like a failure, even though we treat the error as
+      // "no changed files" (returning []). Visual Guard runs in non-git projects too — stay quiet.
+      return execFileSync("git", args, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).split("\n");
     } catch {
       return [];
     }

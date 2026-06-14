@@ -1,7 +1,9 @@
-import { describe, it, expect, afterAll } from "vitest";
+import { describe, it, expect, afterAll, afterEach } from "vitest";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { parseConfig, type Config } from "../scripts/lib/config";
 import type { CompareResult, ComparisonStatus, ImageComparison } from "../scripts/compare";
 import type { RendersFile } from "../scripts/capture";
@@ -498,5 +500,61 @@ describe("applyVerdicts (I/O)", () => {
 
     // It only ever writes manifest.json under the run dir — no baseline / no source touched.
     expect(JSON.parse(afterSecond).version).toBe(2);
+  });
+});
+
+describe("report CLI — non-git project robustness", () => {
+  // Real-world shakedown finding: run in a project that is NOT a git repo, git prints a multi-line
+  // usage / "fatal: not a git repository" message; gitChangedFiles must swallow it (return []) AND
+  // not leak it to stderr (it suppresses the child's stderr). Verified by a real subprocess run.
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const tsx = join(repoRoot, "node_modules", ".bin", "tsx");
+  const reportScript = join(repoRoot, "scripts", "report.ts");
+  let tmp = "";
+
+  afterEach(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = "";
+  });
+
+  it("runs cleanly with no git stderr leak when cwd is not a git repository", () => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-report-nogit-")); // a fresh temp dir — NOT a git repo
+    writeFileSync(
+      join(tmp, "visual.config.json"),
+      JSON.stringify({ targets: [{ type: "storybook", url: "http://localhost:6006" }] }),
+    );
+    const runDir = join(tmp, ".visual-guard", "runs", "RUN");
+    mkdirSync(runDir, { recursive: true });
+    const compare = {
+      runId: "RUN",
+      results: [
+        {
+          key: "i/t/default@1280.png",
+          status: "new",
+          ratio: null,
+          changedPixels: null,
+          totalPixels: null,
+          dimensionDelta: null,
+          regions: [],
+          baselinePath: null,
+          currentPath: "current/i/t/default@1280.png",
+          diffPath: null,
+          error: null,
+        },
+      ],
+      summary: { total: 1, added: 1, passed: 0, failed: 0, errored: 0 },
+    };
+    writeFileSync(join(runDir, "compare.json"), JSON.stringify(compare));
+
+    const res = spawnSync(tsx, [reportScript, "--config", "visual.config.json", "--run", "RUN"], {
+      cwd: tmp,
+      encoding: "utf8",
+    });
+
+    expect(res.status).toBe(0);
+    // The bug this guards: git's usage/"not a git repository" text leaking to the user's console.
+    expect(res.stderr).not.toMatch(/not a git repository|git diff --no-index/);
+    const manifest = JSON.parse(readFileSync(join(runDir, "manifest.json"), "utf8"));
+    expect(manifest.changedFiles).toEqual([]); // no git → empty changedFiles, not a crash
   });
 });
