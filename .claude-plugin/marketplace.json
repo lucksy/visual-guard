@@ -1,0 +1,26 @@
+{
+  "name": "lucksy",
+  "owner": {
+    "name": "lucksy",
+    "email": "lucksy@gmail.com"
+  },
+  "description": "Visual Guard — AI visual regression review for Claude Code.",
+  "plugins": [
+    {
+      "name": "visual-guard",
+      "source": ".",
+      "displayName": "Visual Guard",
+      "description": "AI visual regression reviewer: capture, pixel-diff, and explain UI changes before they merge.",
+      "version": "0.1.0",
+      "author": {
+        "name": "lucksy",
+        "email": "lucksy@gmail.com"
+      },
+      "homepage": "https://github.com/lucksy/visual-guard",
+      "repository": "https://github.com/lucksy/visual-guard",
+      "license": "MIT",
+      "keywords": ["visual-regression", "screenshot", "playwright", "ui-testing", "design-system"],
+      "category": "testing"
+    }
+  ]
+}
