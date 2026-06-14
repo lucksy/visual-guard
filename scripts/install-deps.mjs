@@ -46,13 +46,19 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
 // Runtime-only engine deps. Keep the diff-engine versions in lockstep with package.json
-// `dependencies`; `tsx` is the runner the commands invoke and lives here too (not committed).
+// `dependencies`; `tsx` (the command runner) and `typescript` (the token scanner's JSX/Tailwind
+// AST + the JS-eval child process) come from devDependencies and live here too (not committed).
 export const ENGINE_DEPS = {
+  culori: "4.0.2",
   pixelmatch: "5.3.0",
   playwright: "1.49.1",
   pngjs: "7.0.0",
+  postcss: "8.5.15",
+  "postcss-less": "6.0.0",
+  "postcss-scss": "4.0.9",
   sharp: "0.33.5",
   tsx: "4.19.2",
+  typescript: "5.7.3",
 };
 
 /** The engine-only manifest written into the data dir; also the install marker. */

@@ -48,25 +48,34 @@ describe("install-deps engine bridge", () => {
     }
   });
 
-  it("declares tsx (the runner) and the four engine deps", () => {
+  it("declares tsx (the runner), the pixel-engine deps, and the token-parser deps", () => {
     expect(Object.keys(ENGINE_DEPS).sort()).toEqual([
+      "culori",
       "pixelmatch",
       "playwright",
       "pngjs",
+      "postcss",
+      "postcss-less",
+      "postcss-scss",
       "sharp",
       "tsx",
+      "typescript",
     ]);
   });
 
   it("stays in lockstep with package.json (drift would desync the install marker)", () => {
-    // The doc comment + the idempotency marker both assume ENGINE_DEPS == the four runtime
-    // dependencies (same versions) plus the tsx runner. This converts that invariant into a
-    // guard so adding a dep or bumping one side silently can't ship a stale engine.
+    // The doc comment + the idempotency marker both assume ENGINE_DEPS == the runtime
+    // dependencies (same versions) plus the tsx runner and the typescript scanner. This converts
+    // that invariant into a guard so adding a dep or bumping one side silently can't ship a stale engine.
     const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")) as {
       dependencies: Record<string, string>;
       devDependencies: Record<string, string>;
     };
-    expect(ENGINE_DEPS).toEqual({ ...pkg.dependencies, tsx: pkg.devDependencies.tsx });
+    expect(ENGINE_DEPS).toEqual({
+      ...pkg.dependencies,
+      tsx: pkg.devDependencies.tsx,
+      typescript: pkg.devDependencies.typescript,
+    });
   });
 
   it("creates the bridge symlink when the plugin root has no node_modules (production)", () => {

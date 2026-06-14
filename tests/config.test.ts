@@ -18,7 +18,9 @@ describe("parseConfig — defaults", () => {
     expect(cfg.maxDiffRatio).toBe(0.01);
     expect(cfg.baselineDir).toBe(".visual-baselines");
     expect(cfg.uiGlobs).toEqual(["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss}"]);
-    expect(cfg.tokens).toEqual({ source: "src/styles/tokens.css" });
+    expect(cfg.tokens).toEqual({
+      sources: [{ source: "src/styles/tokens.css", format: "auto" }],
+    });
   });
 
   it("preserves explicitly provided values instead of overwriting with defaults", () => {
@@ -77,10 +79,12 @@ describe("parseConfig — optional per-target instance name", () => {
   });
 
   it("throws naming the field when name is not a non-empty string", () => {
-    expect(() => parseConfig({ targets: [{ type: "storybook", url: "http://x", name: "" }] })).toThrow(
+    expect(() =>
+      parseConfig({ targets: [{ type: "storybook", url: "http://x", name: "" }] }),
+    ).toThrow(/name/);
+    expect(() => parseConfig({ targets: [{ type: "app", url: "http://x", name: 7 }] })).toThrow(
       /name/,
     );
-    expect(() => parseConfig({ targets: [{ type: "app", url: "http://x", name: 7 }] })).toThrow(/name/);
   });
 });
 
@@ -120,6 +124,111 @@ describe("parseConfig — validation (actionable, names the field)", () => {
 
   it("throws naming viewports when it holds a non-positive number", () => {
     expect(() => parseConfig({ ...minimal, viewports: [0] })).toThrow(/viewports/);
+  });
+});
+
+describe("parseConfig — tokens (multi-format, back-compat)", () => {
+  it("normalizes a bare string path to one auto-detected source", () => {
+    const cfg = parseConfig({ ...minimal, tokens: "src/theme.css" });
+    expect(cfg.tokens).toEqual({ sources: [{ source: "src/theme.css", format: "auto" }] });
+  });
+
+  it("normalizes the legacy { source } form (Phase-0 back-compat)", () => {
+    const cfg = parseConfig({ ...minimal, tokens: { source: "a/b.css" } });
+    expect(cfg.tokens).toEqual({ sources: [{ source: "a/b.css", format: "auto" }] });
+  });
+
+  it("accepts multiple sources, mixing explicit format, auto, and bare strings", () => {
+    const cfg = parseConfig({
+      ...minimal,
+      tokens: {
+        sources: [
+          { source: "tokens/base.tokens.json", format: "dtcg" },
+          { source: "src/theme.css" },
+          "src/extra.scss",
+        ],
+      },
+    });
+    expect(cfg.tokens.sources).toEqual([
+      { source: "tokens/base.tokens.json", format: "dtcg" },
+      { source: "src/theme.css", format: "auto" },
+      { source: "src/extra.scss", format: "auto" },
+    ]);
+  });
+
+  it("preserves mode, rootFontSize, and ignoreValues", () => {
+    const cfg = parseConfig({
+      ...minimal,
+      tokens: {
+        sources: [{ source: "t.json", format: "tokens-studio", mode: "dark", rootFontSize: 10 }],
+        ignoreValues: ["0", "auto"],
+      },
+    });
+    expect(cfg.tokens.sources[0]).toEqual({
+      source: "t.json",
+      format: "tokens-studio",
+      mode: "dark",
+      rootFontSize: 10,
+    });
+    expect(cfg.tokens.ignoreValues).toEqual(["0", "auto"]);
+  });
+
+  it("throws naming the field for an unknown format", () => {
+    expect(() =>
+      parseConfig({ ...minimal, tokens: { sources: [{ source: "x", format: "sass-maps" }] } }),
+    ).toThrow(/format/);
+  });
+
+  it("throws when sources is an empty array", () => {
+    expect(() => parseConfig({ ...minimal, tokens: { sources: [] } })).toThrow(/sources/);
+  });
+
+  it("throws naming source when a source object has no path", () => {
+    expect(() => parseConfig({ ...minimal, tokens: { sources: [{ format: "css" }] } })).toThrow(
+      /source/,
+    );
+  });
+
+  it("rejects a JS-eval format unless allowJsEval is set", () => {
+    expect(() =>
+      parseConfig({
+        ...minimal,
+        tokens: { sources: [{ source: "tailwind.config.js", format: "tailwind-config" }] },
+      }),
+    ).toThrow(/allowJsEval/);
+  });
+
+  it("allows a JS-eval format when allowJsEval is true", () => {
+    const cfg = parseConfig({
+      ...minimal,
+      tokens: {
+        allowJsEval: true,
+        sources: [{ source: "tailwind.config.js", format: "tailwind-config" }],
+      },
+    });
+    expect(cfg.tokens.allowJsEval).toBe(true);
+    expect(cfg.tokens.sources[0]).toEqual({
+      source: "tailwind.config.js",
+      format: "tailwind-config",
+    });
+  });
+
+  it("rejects setting both source and sources", () => {
+    expect(() =>
+      parseConfig({ ...minimal, tokens: { source: "a.css", sources: ["b.css"] } }),
+    ).toThrow(/source/);
+  });
+
+  it("throws when allowJsEval is not a boolean", () => {
+    expect(() => parseConfig({ ...minimal, tokens: { allowJsEval: "yes" } })).toThrow(
+      /allowJsEval/,
+    );
+  });
+
+  it("uses default sources when tokens is an object with only flags", () => {
+    const cfg = parseConfig({ ...minimal, tokens: { allowJsEval: true } });
+    expect(cfg.tokens.sources).toEqual([{ source: "src/styles/tokens.css", format: "auto" }]);
+    expect(cfg.tokens.allowJsEval).toBe(true);
   });
 });
 

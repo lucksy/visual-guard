@@ -1,0 +1,23 @@
+/*
+ * Sample Badge — the 2nd component for the Visual Guard Phase-1 exit (CP6).
+ *
+ * Its background is the brand COLOR token (`--vg-brand`, defined in Button.css). The Phase-1
+ * "sub-threshold drift" the review-flow e2e applies inlines that token as its IDENTICAL hardcoded
+ * hex (`#2563eb`): the rendered pixels are unchanged (byte-identical), so the luminance-normalized
+ * screenshot diff cannot see it — but `auditTokens` does. That is the SPEC success criterion:
+ * "a hardcoded value replacing a token is flagged even when the pixels don't move."
+ *
+ * (8px / 16px padding are not design-token values, so the scanner leaves them alone — only the
+ * inlined color is drift.)
+ */
+.vg-badge {
+  display: inline-block;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 16px;
+  line-height: 1.2;
+  font-weight: 600;
+  color: var(--vg-brand-text);
+  background: var(--vg-brand);
+  border-radius: 999px;
+  padding: 8px 16px;
+}

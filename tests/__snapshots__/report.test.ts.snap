@@ -31,12 +31,22 @@ exports[`buildManifest > matches the locked golden manifest shape (R6 — contra
       "images": [
         {
           "baselinePath": ".visual-baselines/components/Button/default@1280.png",
+          "currentDimensions": {
+            "height": 480,
+            "width": 1280,
+          },
           "currentPath": ".visual-guard/runs/RUN1/current/components/Button/default@1280.png",
           "diffPath": ".visual-guard/runs/RUN1/diff/components/Button/default@1280.png",
           "dimensionDelta": null,
           "error": null,
           "ratio": 0,
           "regions": [],
+          "renderTarget": {
+            "kind": "storybook",
+            "storyId": "button--default",
+            "url": "http://localhost:6006/iframe.html?id=button--default&viewMode=story",
+            "viewport": 1280,
+          },
           "state": "default",
           "status": "pass",
           "verdict": null,
@@ -44,6 +54,10 @@ exports[`buildManifest > matches the locked golden manifest shape (R6 — contra
         },
         {
           "baselinePath": ".visual-baselines/components/Button/hover@1280.png",
+          "currentDimensions": {
+            "height": 480,
+            "width": 1280,
+          },
           "currentPath": ".visual-guard/runs/RUN1/current/components/Button/hover@1280.png",
           "diffPath": ".visual-guard/runs/RUN1/diff/components/Button/hover@1280.png",
           "dimensionDelta": null,
@@ -57,6 +71,12 @@ exports[`buildManifest > matches the locked golden manifest shape (R6 — contra
               "y": 0,
             },
           ],
+          "renderTarget": {
+            "kind": "storybook",
+            "storyId": "button--hover",
+            "url": "http://localhost:6006/iframe.html?id=button--hover&viewMode=story",
+            "viewport": 1280,
+          },
           "state": "hover",
           "status": "fail",
           "verdict": null,
@@ -74,12 +94,22 @@ exports[`buildManifest > matches the locked golden manifest shape (R6 — contra
       "images": [
         {
           "baselinePath": null,
+          "currentDimensions": {
+            "height": 600,
+            "width": 1280,
+          },
           "currentPath": ".visual-guard/runs/RUN1/current/components/Card/default@1280.png",
           "diffPath": null,
           "dimensionDelta": null,
           "error": null,
           "ratio": null,
           "regions": [],
+          "renderTarget": {
+            "kind": "storybook",
+            "storyId": "card--default",
+            "url": "http://localhost:6006/iframe.html?id=card--default&viewMode=story",
+            "viewport": 1280,
+          },
           "state": "default",
           "status": "new",
           "verdict": null,
@@ -95,12 +125,22 @@ exports[`buildManifest > matches the locked golden manifest shape (R6 — contra
       "images": [
         {
           "baselinePath": ".visual-baselines/icons/Star/default@1280.png",
+          "currentDimensions": {
+            "height": 64,
+            "width": 1280,
+          },
           "currentPath": ".visual-guard/runs/RUN1/current/icons/Star/default@1280.png",
           "diffPath": null,
           "dimensionDelta": null,
           "error": "could not decode image",
           "ratio": null,
           "regions": [],
+          "renderTarget": {
+            "kind": "storybook",
+            "storyId": "star--default",
+            "url": "http://localhost:6006/iframe.html?id=star--default&viewMode=story",
+            "viewport": 1280,
+          },
           "state": "default",
           "status": "error",
           "verdict": null,
@@ -116,12 +156,22 @@ exports[`buildManifest > matches the locked golden manifest shape (R6 — contra
       "images": [
         {
           "baselinePath": ".visual-baselines/web/login/default@375.png",
+          "currentDimensions": {
+            "height": 800,
+            "width": 375,
+          },
           "currentPath": ".visual-guard/runs/RUN1/current/web/login/default@375.png",
           "diffPath": ".visual-guard/runs/RUN1/diff/web/login/default@375.png",
           "dimensionDelta": null,
           "error": null,
           "ratio": 0,
           "regions": [],
+          "renderTarget": {
+            "kind": "app",
+            "storyId": null,
+            "url": "http://localhost:3000/login",
+            "viewport": 375,
+          },
           "state": "default",
           "status": "pass",
           "verdict": null,
@@ -133,6 +183,6 @@ exports[`buildManifest > matches the locked golden manifest shape (R6 — contra
       "target": "login",
     },
   ],
-  "version": 1,
+  "version": 2,
 }
 `;

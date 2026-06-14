@@ -293,11 +293,14 @@ For each changed target, classify the change as one of: `intentional`, `bug`,
 responsive behavior, and dark/light consistency. When pixels are ambiguous, use the
 Playwright MCP tools to re-render and probe the live element before deciding.
 
-Return ONLY this JSON (one object per changed target):
-{ "target": "Button", "state": "default", "viewport": 1280,
-  "severity": "low|medium|high", "classification": "...",
-  "issue": "...", "file": "src/Button.tsx", "line": 42,
-  "cause": "...", "impact": ["..."], "fix": "..." }
+Return ONLY a JSON array — one self-addressing object per changed image (the typed `Verdict`
+plus `target`/`state`/`viewport` identifiers = `VerdictReport`; the engine routes each back to
+its image and stores the 8-field `Verdict`). `state`/`viewport` are null for a source-level
+finding (token-auditor).
+[{ "target": "Button", "state": "default", "viewport": 1280,
+   "severity": "low|medium|high", "classification": "...",
+   "issue": "...", "file": "src/Button.tsx", "line": 42,
+   "cause": "...", "impact": ["..."], "fix": "..." }]
 ```
 
 ### Hook config

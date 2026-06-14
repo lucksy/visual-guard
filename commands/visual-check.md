@@ -33,9 +33,11 @@ and browser live. Before running anything:
   `git diff --name-only HEAD` and `git ls-files --others --exclude-standard`, then keep the
   ones matching the config's `uiGlobs`. Show them, e.g. `Changed UI files: Button.tsx · button.css`.
 - Decide scope: if `$ARGUMENTS` is non-empty, pass it as `--target`. If it is empty, capture
-  **all configured targets** — Phase 0 has no edit-tracking hook, so there is no "pending" set
-  to narrow to; instead the report tags each target with the changed files that relate to it,
-  so a real regression is never skipped by a target-name guess.
+  **all configured targets**. The `PostToolUse` hook (`detect-ui-change.mjs`) records edited UI
+  files in `.visual-guard/pending.json`, but this command still captures every configured target
+  rather than narrowing to that set — the report tags each target with the changed files that
+  relate to it, so a real regression is never skipped by a target-name guess. (Narrowing the
+  capture to the pending set is a later-phase optimization.)
 
 ## 2. Act — capture → compare → report
 
@@ -54,6 +56,10 @@ TARGET="$ARGUMENTS"
 "$RUNNER" "$SCRIPTS/capture.ts" --config "$CONFIG" --run "$RUN_ID" ${TARGET:+--target "$TARGET"}
 "$RUNNER" "$SCRIPTS/compare.ts" --config "$CONFIG" --run "$RUN_ID"
 "$RUNNER" "$SCRIPTS/report.ts"  --config "$CONFIG" --run "$RUN_ID"
+
+# Checkpoint complete — clear the pending-review markers (no-dep, never fails the run) so the
+# Stop-hook nudge resets. Runs only after the three steps above succeed.
+node "${CLAUDE_PLUGIN_ROOT}/scripts/detect-ui-change.mjs" --clear
 ```
 
 - If `capture.ts` fails with **"could not reach …"**, relay its message verbatim — the dev
@@ -61,20 +67,50 @@ TARGET="$ARGUMENTS"
 - If capture reports **"no targets matched"**, tell the user the target didn't match any
   configured story/route and list a few valid ones from the config. Stop.
 
-## 3. Verify — present the manifest (evidence before verdict)
+## 3. Review — structured verdict via the `visual-reviewer` subagent (Phase 1)
 
-`Read` `.visual-guard/runs/$RUN_ID/manifest.json`. Its paths are relative to the project root.
-Walk `targets` worst-status first and, for each, give the user **evidence, then verdict**:
+`Read` `.visual-guard/runs/$RUN_ID/manifest.json` (its paths are relative to the project root).
+For every **flagged** target — one whose `status` is `fail`, `new`, or `error` (a `pass` target
+needs no review) — invoke the read-only **`visual-reviewer`** subagent once, passing that target's
+manifest entry (its `images` with `currentPath`/`baselinePath`/`diffPath`, pixel evidence,
+`renderTarget`, `changedFiles`). The subagent classifies each changed image and returns a JSON
+**array of verdicts** (`target`/`state`/`viewport` + `severity`/`classification`/`issue`/`file`/
+`line`/`cause`/`impact`/`fix`).
+
+Collect every verdict object from every target into one array, write it to
+`.visual-guard/runs/$RUN_ID/verdicts.json`, then merge it into the manifest with the tested engine
+helper (it routes each verdict to its image by `target`/`state`/`viewport` and stores the verdict —
+never hand-edit `manifest.json`). Re-establish the runner here (a fresh shell does not inherit §2's
+variables) and reuse the **same** `$RUN_ID` from §2:
+
+```bash
+RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"
+SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
+# Reuse the same $RUN_ID from §2. (--apply-verdicts merges verdicts.json into the existing
+# manifest.json; it reads no config, so none is passed.)
+"$RUNNER" "$SCRIPTS/report.ts" --run "$RUN_ID" --apply-verdicts
+```
+
+- **Fallback:** if the `visual-reviewer` subagent is unavailable (not found / errors), skip this
+  step and explain the diffs yourself in §4 as in Phase 0 — never block the check on the subagent.
+- The subagent is **read-only** and so are you here: do not edit source to "make it pass", and do
+  not approve a baseline. `verdicts.json`/`manifest.json` live only under `.visual-guard/` (a run
+  artifact); nothing is sent to an external service.
+
+## 4. Present — evidence before verdict
+
+Re-`Read` the now-merged `manifest.json` and walk `targets` worst-status first. For each, give the
+user **evidence, then verdict**:
 
 - **Status** — `fail` (a regression), `new` (no baseline yet), `error` (couldn't decode), or
   `pass` — stated plainly.
 - **Pixel evidence** per image, first: the `ratio` as a percentage, any `dimensionDelta`
   (e.g. `height 32px → 36px`), the changed `regions`, and the `diffPath` PNG to open.
-- **A plain-language explanation**, second. In Phase 0 *you*, the main loop, explain; the
-  structured `visual-reviewer` subagent (classification · cause · impact · fix verdict) is
-  wired in Phase 1, so `verdict` is `null` for now. Use the target's `changedFiles`, and
-  `Read` the relevant source if it helps you say *what* likely changed (e.g. a spacing token
-  replaced by a hardcoded value). Be honest about uncertainty — never invent a cause.
+- **The structured verdict**, second: the image's populated `verdict` — `classification`
+  (`intentional` / `bug` / `design-system-violation`) · `cause` · `file:line` · `impact` · `fix`.
+  If `verdict` is `null` (the subagent fallback fired), *you* explain it: use the target's
+  `changedFiles` and `Read` the relevant source to say *what* likely changed (e.g. a spacing token
+  replaced by a hardcoded value). Either way, be honest about uncertainty — never invent a cause.
 - For `new`: it's unreviewed; suggest `/visual-baseline <target>` to approve the first render.
 - For `error`: surface that render's `error` message.
 

@@ -113,6 +113,26 @@ export function probeOrigins(targets: RenderTarget[]): string[] {
   return [...origins];
 }
 
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/**
+ * Read a PNG's pixel dimensions straight from its IHDR header — no full decode. A valid PNG is
+ * an 8-byte signature followed by the IHDR chunk, whose width/height are big-endian uint32s at
+ * byte offsets 16 and 20. Returns null for anything that isn't a well-formed PNG (a truncated
+ * buffer, a non-PNG, or a 0-sized image), so capture never throws on an odd screenshot buffer.
+ */
+export function readPngDimensions(buffer: Buffer): { width: number; height: number } | null {
+  if (buffer.length < 24 || !buffer.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    return null;
+  }
+  if (buffer.toString("latin1", 12, 16) !== "IHDR") {
+    return null;
+  }
+  const width = buffer.readUInt32BE(16);
+  const height = buffer.readUInt32BE(20);
+  return width > 0 && height > 0 ? { width, height } : null;
+}
+
 // --- Browser I/O boundary (injectable; real Chromium in production) -------
 
 export interface PageLike {
@@ -176,6 +196,30 @@ export interface CaptureResult {
   written: string[];
 }
 
+/**
+ * What capture persists per render in `renders.json` (manifest v2, T-13): enough to let the
+ * `visual-reviewer` re-render the live element via Playwright/Chrome-DevTools MCP to
+ * disambiguate a diff. The Storybook story id is recoverable from `url`, so it is not stored.
+ */
+export interface RenderRecord {
+  /** Fully-resolved URL the render was captured from. */
+  url: string;
+  /** Origin kind — tells the reviewer how the render is realized. */
+  kind: RenderTarget["kind"];
+  /** Viewport width the render was captured at. */
+  viewport: number;
+  /** Pixel dimensions of the captured PNG, or null when they couldn't be read. */
+  currentDimensions: { width: number; height: number } | null;
+}
+
+/** The `renders.json` artifact: render records keyed by the shared `renderRelPath` key. */
+export interface RendersFile {
+  version: number;
+  renders: Record<string, RenderRecord>;
+}
+
+const RENDERS_VERSION = 1;
+
 const defaultDeps: CaptureDeps = {
   fetch: defaultFetch,
   launch: launchChromium,
@@ -225,6 +269,7 @@ export async function captureAll(
   const navTimeoutMs = options.navTimeoutMs ?? 15000;
 
   const written: string[] = [];
+  const renders: Record<string, RenderRecord> = {};
   const browser = await deps.launch();
   try {
     for (const target of targets) {
@@ -248,6 +293,14 @@ export async function captureAll(
           const rel = renderRelPath(target);
           deps.writeFile(join(currentDir, rel), buffer);
           written.push(rel);
+          // Persist the render's identity + dimensions for manifest v2 (T-13), keyed by the
+          // same relative path compare/report key on — so the reviewer can re-render it live.
+          renders[rel] = {
+            url: target.url,
+            kind: target.kind,
+            viewport: target.viewport,
+            currentDimensions: readPngDimensions(buffer),
+          };
         } finally {
           await page.close();
         }
@@ -258,6 +311,15 @@ export async function captureAll(
   } finally {
     await browser.close();
   }
+
+  // Sidecar the resolved render list next to compare.json/manifest.json so report.ts can
+  // attach each image's renderTarget + currentDimensions (manifest v2). Written through the
+  // injected writeFile so the orchestration stays testable without touching the real fs.
+  const rendersFile: RendersFile = { version: RENDERS_VERSION, renders };
+  deps.writeFile(
+    join(runDir, "renders.json"),
+    Buffer.from(`${JSON.stringify(rendersFile, null, 2)}\n`),
+  );
 
   return { runId, runDir, currentDir, written };
 }

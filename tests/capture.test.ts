@@ -8,9 +8,11 @@ import {
   makeRunId,
   parseArgs,
   probeOrigins,
+  readPngDimensions,
   renderRelPath,
   type CaptureDeps,
   type Launcher,
+  type RendersFile,
 } from "../scripts/capture";
 
 const render = (over: Partial<RenderTarget> = {}): RenderTarget => ({
@@ -95,6 +97,31 @@ describe("probeOrigins", () => {
   });
 });
 
+describe("readPngDimensions", () => {
+  /** A 24-byte PNG header (signature + IHDR width/height) — enough for the dimension reader. */
+  const pngHeader = (width: number, height: number): Buffer => {
+    const buf = Buffer.alloc(24);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buf, 0);
+    buf.writeUInt32BE(13, 8); // IHDR chunk length
+    buf.write("IHDR", 12, "latin1");
+    buf.writeUInt32BE(width, 16);
+    buf.writeUInt32BE(height, 20);
+    return buf;
+  };
+
+  it("reads width/height from a PNG IHDR header", () => {
+    expect(readPngDimensions(pngHeader(800, 600))).toEqual({ width: 800, height: 600 });
+  });
+
+  it("returns null for a non-PNG / truncated / zero-sized buffer (never throws)", () => {
+    expect(readPngDimensions(Buffer.from("PNG-BYTES"))).toBeNull(); // too short + wrong signature
+    expect(readPngDimensions(pngHeader(0, 10))).toBeNull(); // zero dimension
+    const wrongChunk = pngHeader(10, 10);
+    wrongChunk.write("IDAT", 12, "latin1"); // valid signature but not IHDR first
+    expect(readPngDimensions(wrongChunk)).toBeNull();
+  });
+});
+
 // --- Orchestration (fake browser, no real Chromium) -----------------------
 
 interface FakeCalls {
@@ -109,7 +136,9 @@ interface FakeCalls {
   browserCloses: number;
 }
 
-function fakeBrowser(): { launch: Launcher; calls: FakeCalls } {
+function fakeBrowser(
+  screenshotBuffer: Buffer = Buffer.from("PNG-BYTES"),
+): { launch: Launcher; calls: FakeCalls } {
   const calls: FakeCalls = {
     contexts: [],
     initScripts: [],
@@ -143,7 +172,7 @@ function fakeBrowser(): { launch: Launcher; calls: FakeCalls } {
           },
           screenshot: async () => {
             calls.screenshots++;
-            return Buffer.from("PNG-BYTES");
+            return screenshotBuffer;
           },
           close: async () => {
             calls.pageCloses++;
@@ -219,6 +248,75 @@ describe("captureAll", () => {
     expect(Object.keys(writes)).toContain(
       join(".vg-test", "runs", "RUN1", "current", "components/button/primary@1280.png"),
     );
+  });
+
+  it("persists a renders.json sidecar keyed by render path (manifest v2, T-13)", async () => {
+    const config = parseConfig({
+      targets: [
+        {
+          type: "storybook",
+          url: "http://localhost:6006",
+          name: "components",
+          stories: ["button--primary"],
+        },
+      ],
+      viewports: [1280],
+      states: ["default"],
+    });
+    const { launch } = fakeBrowser();
+    const writes: Record<string, Buffer> = {};
+
+    await captureAll(
+      config,
+      { runId: "RUN1", outRoot: ".vg-test" },
+      deps({ launch, writeFile: (p, d) => void (writes[p] = d) }),
+    );
+
+    const rendersPath = join(".vg-test", "runs", "RUN1", "renders.json");
+    expect(Object.keys(writes)).toContain(rendersPath);
+    const parsed = JSON.parse(writes[rendersPath]!.toString()) as RendersFile;
+    expect(parsed.version).toBe(1);
+    expect(parsed.renders["components/button/primary@1280.png"]).toEqual({
+      url: "http://localhost:6006/iframe.html?id=button--primary&viewMode=story",
+      kind: "storybook",
+      viewport: 1280,
+      currentDimensions: null, // the fake screenshot buffer isn't a real PNG → dims unread
+    });
+  });
+
+  it("threads a real PNG's dimensions into renders.json (currentDimensions non-null path)", async () => {
+    // A valid 24-byte PNG header (signature + IHDR width/height) so readPngDimensions resolves
+    // dims — proves the capture → renders.json wiring yields a non-null currentDimensions, not
+    // just the null branch the placeholder-buffer test covers.
+    const pngHeader = Buffer.alloc(24);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(pngHeader, 0);
+    pngHeader.writeUInt32BE(13, 8);
+    pngHeader.write("IHDR", 12, "latin1");
+    pngHeader.writeUInt32BE(1280, 16);
+    pngHeader.writeUInt32BE(480, 20);
+
+    const config = parseConfig({
+      targets: [
+        { type: "storybook", url: "http://localhost:6006", name: "components", stories: ["button--primary"] },
+      ],
+      viewports: [1280],
+      states: ["default"],
+    });
+    const { launch } = fakeBrowser(pngHeader);
+    const writes: Record<string, Buffer> = {};
+
+    await captureAll(
+      config,
+      { runId: "RUN1", outRoot: ".vg-test" },
+      deps({ launch, writeFile: (p, d) => void (writes[p] = d) }),
+    );
+
+    const rendersPath = join(".vg-test", "runs", "RUN1", "renders.json");
+    const parsed = JSON.parse(writes[rendersPath]!.toString()) as RendersFile;
+    expect(parsed.renders["components/button/primary@1280.png"]!.currentDimensions).toEqual({
+      width: 1280,
+      height: 480,
+    });
   });
 
   it("uses a timestamp run id when none is provided", async () => {

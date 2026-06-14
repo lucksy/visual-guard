@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Visual Guard sample — Badge</title>
+    <!-- Button.css supplies the :root design tokens + the reset + .vg-stage; Badge.css styles the badge. -->
+    <link rel="stylesheet" href="/src/Button.css" />
+    <link rel="stylesheet" href="/src/Badge.css" />
+  </head>
+  <body>
+    <!-- The 2nd component for the Phase-1 exit (CP6). Its background is the brand COLOR token; the
+         "sub-threshold drift" inlines that token as its identical hardcoded hex, so the pixels are
+         unchanged but the token-drift auditor still flags it. -->
+    <main class="vg-stage">
+      <span class="vg-badge">New</span>
+    </main>
+  </body>
+</html>

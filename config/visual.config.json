@@ -10,5 +10,5 @@
   "maxDiffRatio": 0.01,
   "baselineDir": ".visual-baselines",
   "uiGlobs": ["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss}"],
-  "tokens": { "source": "src/styles/tokens.css" }
+  "tokens": { "sources": [{ "source": "src/styles/tokens.css", "format": "auto" }] }
 }
