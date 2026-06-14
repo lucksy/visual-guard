@@ -53,7 +53,8 @@ npm run storybook     # or: npm run dev
 /visual-init
 ```
 
-This finds your running server and design-token files and writes a `visual.config.json` for you.
+A short wizard: it finds your running server and design-token files, asks you to **confirm each one**
+(or enter your own / add what's missing), then writes `visual.config.json`.
 
 **5. Run your first check**
 
@@ -87,7 +88,7 @@ known-good images.
 
 | Command | What it does |
 |---|---|
-| `/visual-init` | Create a `visual.config.json` for your project (auto-detects your server and tokens). |
+| `/visual-init` | Guided setup wizard — detects your server and tokens, asks you to confirm or fill in each, then writes `visual.config.json`. |
 | `/visual-check [name]` | Screenshot your UI, compare to the baseline, and explain what changed. |
 | `/visual-baseline [name]` | Approve the latest screenshots as the new baseline. |
 | `/visual-review` | A deeper review across many components, with each finding double-checked. |

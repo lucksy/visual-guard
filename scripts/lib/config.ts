@@ -92,7 +92,7 @@ const TOKEN_FORMATS: readonly (TokenFormat | "auto")[] = [
   "tailwind-config",
   "js-theme",
 ];
-const JS_EVAL_FORMATS: readonly TokenFormat[] = ["tailwind-config", "js-theme"];
+export const JS_EVAL_FORMATS: readonly TokenFormat[] = ["tailwind-config", "js-theme"];
 
 const PREFIX = "Visual Guard config";
 

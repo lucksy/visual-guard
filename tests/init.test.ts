@@ -8,7 +8,9 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import {
   buildScaffoldConfig,
@@ -24,7 +26,9 @@ import {
   blockingConfigPath,
   existingConfigPath,
   parseArgs,
+  parseScaffoldInput,
   runInit,
+  runInitFromConfig,
   scanTokenFiles,
   type DetectionResult,
 } from "../scripts/init";
@@ -208,6 +212,13 @@ describe("scaffoldConfigObject — slim, valid output", () => {
     expect(() => buildScaffoldConfig({ targets: obj.targets, tokenSources: obj.tokens })).not.toThrow();
   });
 
+  it("writes the validated/normalized fields only — unknown keys are stripped, not persisted", () => {
+    const obj = scaffoldConfigObject({
+      targets: [{ type: "storybook", url: "http://localhost:6006", junk: 1 } as never],
+    });
+    expect(obj).toEqual({ targets: [{ type: "storybook", url: "http://localhost:6006" }] });
+  });
+
   it("throws (via validation) for an empty scaffold", () => {
     expect(() => scaffoldConfigObject({ targets: [] })).toThrow(/targets/);
   });
@@ -225,14 +236,20 @@ const detect = async (): Promise<DetectionResult> => injectedDetection;
 
 describe("parseArgs (init CLI)", () => {
   it("defaults configPath to undefined and the booleans to false", () => {
-    expect(parseArgs([])).toEqual({ configPath: undefined, force: false, dryRun: false });
+    expect(parseArgs([])).toEqual({
+      configPath: undefined,
+      force: false,
+      dryRun: false,
+      stdin: false,
+    });
   });
 
-  it("parses --config <path>, --force and --dry-run", () => {
-    expect(parseArgs(["--config", "build/vg.json", "--force", "--dry-run"])).toEqual({
+  it("parses --config <path>, --force, --dry-run and --stdin", () => {
+    expect(parseArgs(["--config", "build/vg.json", "--force", "--dry-run", "--stdin"])).toEqual({
       configPath: "build/vg.json",
       force: true,
       dryRun: true,
+      stdin: true,
     });
   });
 
@@ -242,6 +259,140 @@ describe("parseArgs (init CLI)", () => {
 
   it("throws when --config is missing its value", () => {
     expect(() => parseArgs(["--config"])).toThrow(/missing value/);
+  });
+});
+
+describe("parseScaffoldInput (wizard --stdin payload)", () => {
+  it("parses a { targets, tokens } object, mapping tokens -> tokenSources", () => {
+    const raw = JSON.stringify({
+      targets: [{ type: "storybook", url: "http://localhost:6006" }],
+      tokens: { sources: [{ source: "src/theme.css", format: "css" }] },
+    });
+    expect(parseScaffoldInput(raw)).toEqual({
+      targets: [{ type: "storybook", url: "http://localhost:6006" }],
+      tokenSources: { sources: [{ source: "src/theme.css", format: "css" }] },
+    });
+  });
+
+  it("parses a targets-only object (no tokens)", () => {
+    const raw = JSON.stringify({ targets: [{ type: "app", url: "http://localhost:3000", routes: ["/"] }] });
+    expect(parseScaffoldInput(raw)).toEqual({
+      targets: [{ type: "app", url: "http://localhost:3000", routes: ["/"] }],
+    });
+  });
+
+  it("throws on non-JSON input", () => {
+    expect(() => parseScaffoldInput("not json")).toThrow(/JSON config object/);
+  });
+
+  it("throws when there's no targets array", () => {
+    expect(() => parseScaffoldInput(JSON.stringify({ viewports: [375] }))).toThrow(/"targets" array/);
+  });
+
+  it("throws on an empty targets array (fail closed at the boundary)", () => {
+    expect(() => parseScaffoldInput(JSON.stringify({ targets: [] }))).toThrow(/non-empty "targets"/);
+  });
+
+  it("refuses a JS-eval token format — the scaffolder never configures those", () => {
+    const raw = JSON.stringify({
+      targets: [{ type: "storybook", url: "http://localhost:6006" }],
+      tokens: { sources: [{ source: "tailwind.config.js", format: "tailwind-config" }] },
+    });
+    expect(() => parseScaffoldInput(raw)).toThrow(/JS-eval token format/);
+  });
+
+  it("refuses an allowJsEval payload", () => {
+    const raw = JSON.stringify({
+      targets: [{ type: "storybook", url: "http://localhost:6006" }],
+      tokens: { sources: [{ source: "src/theme.css", format: "css" }], allowJsEval: true },
+    });
+    expect(() => parseScaffoldInput(raw)).toThrow(/allowJsEval/);
+  });
+});
+
+describe("runInitFromConfig — wizard-confirmed config, same guards as auto", () => {
+  let tmp = "";
+  const input = {
+    targets: [{ type: "app" as const, url: "http://localhost:4000", routes: ["/home", "/pricing"] }],
+  };
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-wiz-"));
+  });
+  afterEach(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("writes the provided (confirmed) config, and it round-trips through parseConfig", () => {
+    const result = runInitFromConfig(input, { cwd: tmp });
+    expect(result.written).toBe(true);
+    const written = join(tmp, "visual.config.json");
+    const parsed = parseConfig(JSON.parse(readFileSync(written, "utf8")));
+    expect(parsed.targets).toEqual([
+      { type: "app", url: "http://localhost:4000", routes: ["/home", "/pricing"] },
+    ]);
+  });
+
+  it("--dry-run previews the provided config without writing", () => {
+    const result = runInitFromConfig(input, { cwd: tmp, dryRun: true });
+    expect(result.written).toBe(false);
+    expect(result.dryRun).toBe(true);
+    expect(existsSync(join(tmp, "visual.config.json"))).toBe(false);
+  });
+
+  it("never clobbers an existing config without --force, and overwrites with it", () => {
+    const dest = join(tmp, "visual.config.json");
+    writeFileSync(dest, '{"targets":[{"type":"storybook","url":"http://localhost:6006"}]}');
+    expect(runInitFromConfig(input, { cwd: tmp }).written).toBe(false);
+    expect(runInitFromConfig(input, { cwd: tmp, force: true }).written).toBe(true);
+    expect(readFileSync(dest, "utf8")).toContain("localhost:4000");
+  });
+
+  it("refuses to write outside the project root", () => {
+    expect(() =>
+      runInitFromConfig(input, { cwd: tmp, configPath: join(tmp, "..", "escape.json"), force: true }),
+    ).toThrow(/outside the project root/);
+  });
+
+  it("rejects an invalid scaffold (empty targets) via parseConfig validation", () => {
+    expect(() => runInitFromConfig({ targets: [] }, { cwd: tmp })).toThrow(/targets/);
+  });
+});
+
+describe("init CLI --stdin (integrated: main + readStdin via a real subprocess)", () => {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const tsx = join(repoRoot, "node_modules", ".bin", "tsx");
+  const initTs = join(repoRoot, "scripts", "init.ts");
+  let tmp = "";
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-cli-"));
+  });
+  afterEach(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("reads the piped config from stdin and writes visual.config.json", () => {
+    const payload = JSON.stringify({
+      targets: [{ type: "app", url: "http://localhost:4000", routes: ["/"] }],
+    });
+    const out = execFileSync(tsx, [initTs, "--stdin"], { input: payload, cwd: tmp, encoding: "utf8" });
+    expect(JSON.parse(out).written).toBe(true);
+    expect(existsSync(join(tmp, "visual.config.json"))).toBe(true);
+  });
+
+  it("exits non-zero and writes nothing on invalid stdin", () => {
+    let status: number | null = 0;
+    try {
+      execFileSync(tsx, [initTs, "--stdin"], {
+        input: "{}",
+        cwd: tmp,
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (err) {
+      status = (err as { status?: number | null }).status ?? -1;
+    }
+    expect(status).not.toBe(0);
+    expect(existsSync(join(tmp, "visual.config.json"))).toBe(false);
   });
 });
 

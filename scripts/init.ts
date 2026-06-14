@@ -8,8 +8,9 @@ import {
   detectTokenSources,
   scaffoldConfigObject,
   type ProbeResult,
+  type ScaffoldInput,
 } from "./lib/init";
-import type { Target, TokensConfig } from "./lib/config";
+import { JS_EVAL_FORMATS, type Target, type TokensConfig } from "./lib/config";
 
 /**
  * `/visual-init` CLI (T-24): the impure shell around `scripts/lib/init.ts`. It probes the common
@@ -310,6 +311,46 @@ export interface InitResult {
  * without `--force`. Returns a structured result so the command can preview what was detected and
  * what (would have) happened.
  */
+type SlimConfig = { targets: Target[]; tokens?: TokensConfig };
+
+export interface PersistResult {
+  /** Absolute (or as-given) path written (or that would be written). */
+  configPath: string;
+  /** An existing config that blocked the write (when not --force and not --dry-run). */
+  existingPath: string | null;
+  written: boolean;
+  dryRun: boolean;
+}
+
+/**
+ * The single safe-write path shared by the auto ({@link runInit}) and wizard
+ * ({@link runInitFromConfig}) flows. Never clobbers an existing config (default location OR the
+ * explicit destination) without `--force`, never writes outside the project root, and emits
+ * pretty-printed JSON. `config` must already be a validated slim scaffold.
+ */
+function persistScaffold(
+  config: SlimConfig,
+  options: { cwd: string; configPath: string; force?: boolean; dryRun?: boolean },
+): PersistResult {
+  const { cwd, configPath } = options;
+  // Gate on the ACTUAL destination (not just the default locations): a custom --config that
+  // points at an existing file must be protected by --force too.
+  const existingPath = blockingConfigPath(cwd, configPath);
+
+  if (options.dryRun) {
+    return { configPath, existingPath, written: false, dryRun: true };
+  }
+  // Never clobber a config the user already has without an explicit --force.
+  if (existingPath !== null && !options.force) {
+    return { configPath, existingPath, written: false, dryRun: false };
+  }
+
+  assertUnder(configPath, cwd);
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  return { configPath, existingPath, written: true, dryRun: false };
+}
+
 export async function runInit(options: InitOptions = {}): Promise<InitResult> {
   const cwd = options.cwd ?? process.cwd();
   const configPath = options.configPath ?? join(cwd, "visual.config.json");
@@ -322,23 +363,104 @@ export async function runInit(options: InitOptions = {}): Promise<InitResult> {
     tokenSources: detection.tokenSources,
   });
 
-  // Gate on the ACTUAL destination (not just the default locations): a custom --config that
-  // points at an existing file must be protected by --force too.
-  const existingPath = blockingConfigPath(cwd, configPath);
+  const persisted = persistScaffold(config, {
+    cwd,
+    configPath,
+    force: options.force,
+    dryRun: options.dryRun,
+  });
+  return { detection, config, ...persisted };
+}
 
-  if (options.dryRun) {
-    return { detection, config, configPath, existingPath, written: false, dryRun: true };
+export interface InitFromConfigOptions {
+  cwd?: string;
+  configPath?: string;
+  force?: boolean;
+  dryRun?: boolean;
+}
+
+/**
+ * Write a caller-provided scaffold — the wizard's confirmed answers — through the SAME guards as the
+ * auto path. The input is validated by round-tripping through `parseConfig` (via
+ * {@link scaffoldConfigObject}), so the wizard can never persist a config the engine would reject.
+ */
+export function runInitFromConfig(
+  input: ScaffoldInput,
+  options: InitFromConfigOptions = {},
+): PersistResult & { config: SlimConfig } {
+  const cwd = options.cwd ?? process.cwd();
+  const configPath = options.configPath ?? join(cwd, "visual.config.json");
+  const config = scaffoldConfigObject(input); // validates (throws on an invalid scaffold)
+  const persisted = persistScaffold(config, {
+    cwd,
+    configPath,
+    force: options.force,
+    dryRun: options.dryRun,
+  });
+  return { config, ...persisted };
+}
+
+/**
+ * Parse the `--stdin` payload: a JSON `{ targets, tokens? }` object (the config shape the wizard
+ * assembles from the user's answers). Shape is checked lightly here; `scaffoldConfigObject` does the
+ * deep, field-naming validation. `tokens` maps to the scaffold's `tokenSources`.
+ */
+export function parseScaffoldInput(raw: string): ScaffoldInput {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    fail("--stdin expected a JSON config object on stdin.");
   }
-
-  // Never clobber a config the user already has without an explicit --force.
-  if (existingPath !== null && !options.force) {
-    return { detection, config, configPath, existingPath, written: false, dryRun: false };
+  if (!isRecord(parsed) || !Array.isArray(parsed.targets) || parsed.targets.length === 0) {
+    fail(`--stdin config must be an object with a non-empty "targets" array.`);
   }
+  const input: ScaffoldInput = { targets: parsed.targets as Target[] };
+  if (parsed.tokens !== undefined) {
+    assertNoJsEval(parsed.tokens);
+    input.tokenSources = parsed.tokens as TokensConfig;
+  }
+  return input;
+}
 
-  assertUnder(configPath, cwd);
-  mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
-  return { detection, config, configPath, existingPath, written: true, dryRun: false };
+/**
+ * The scaffolder never configures the JS-eval token formats (`tailwind-config` / `js-theme`) — the
+ * auto path can't produce them and the wizard never offers them. Reject them (and `allowJsEval`) at
+ * the `--stdin` boundary so the scaffolder can't be used to write a config that makes Visual Guard
+ * execute a project file; those must be enabled by hand-editing `visual.config.json`.
+ */
+function assertNoJsEval(tokens: unknown): void {
+  if (!isRecord(tokens)) {
+    return; // shape errors surface in parseConfig with a field-named message
+  }
+  if (tokens.allowJsEval === true) {
+    fail(`--stdin won't enable "allowJsEval" — enable JS-eval token formats by editing the config.`);
+  }
+  const sources = Array.isArray(tokens.sources) ? tokens.sources : [];
+  const jsEval: readonly string[] = JS_EVAL_FORMATS;
+  for (const source of sources) {
+    const format = isRecord(source) ? source.format : undefined;
+    if (typeof format === "string" && jsEval.includes(format)) {
+      fail(`--stdin won't configure the JS-eval token format "${format}" — set it by editing the config.`);
+    }
+  }
+}
+
+const STDIN_MAX_BYTES = 512_000; // a config is tiny; cap the payload so a bad pipe can't balloon memory
+
+function readStdin(maxBytes = STDIN_MAX_BYTES): Promise<string> {
+  return new Promise((resolvePromise, reject) => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > maxBytes) {
+        reject(new Error(`${PREFIX}: --stdin payload too large (> ${maxBytes} bytes).`));
+      }
+    });
+    process.stdin.on("end", () => resolvePromise(data));
+    process.stdin.on("error", reject);
+  });
 }
 
 // --- CLI ------------------------------------------------------------------------------------
@@ -347,13 +469,16 @@ export interface InitCliArgs {
   configPath?: string;
   force: boolean;
   dryRun: boolean;
+  /** Read a confirmed `{ targets, tokens? }` config from stdin instead of auto-detecting (wizard). */
+  stdin: boolean;
 }
 
-/** Parse `--config <path> --force --dry-run`; unknown flags / missing values throw (baseline.ts idiom). */
+/** Parse `--config <path> --force --dry-run --stdin`; unknown flags / missing values throw (baseline.ts idiom). */
 export function parseArgs(argv: string[]): InitCliArgs {
   let configPath: string | undefined;
   let force = false;
   let dryRun = false;
+  let stdin = false;
 
   const value = (index: number, flag: string): string => {
     const next = argv[index];
@@ -375,16 +500,33 @@ export function parseArgs(argv: string[]): InitCliArgs {
       case "--dry-run":
         dryRun = true;
         break;
+      case "--stdin":
+        stdin = true;
+        break;
       default:
         fail(`unknown argument ${JSON.stringify(arg)}.`);
     }
   }
 
-  return { configPath, force, dryRun };
+  return { configPath, force, dryRun, stdin };
 }
 
 async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
+
+  // Wizard write path: the /visual-init command pipes the user-confirmed config in on stdin.
+  if (args.stdin) {
+    const input = parseScaffoldInput(await readStdin());
+    const result = runInitFromConfig(input, {
+      configPath: args.configPath,
+      force: args.force,
+      dryRun: args.dryRun,
+    });
+    console.log(JSON.stringify(result));
+    return;
+  }
+
+  // Auto path: probe + scan + write what was detected (non-interactive / CI).
   const result = await runInit({
     configPath: args.configPath,
     force: args.force,

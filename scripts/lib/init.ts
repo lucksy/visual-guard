@@ -198,19 +198,20 @@ export function buildScaffoldConfig(input: ScaffoldInput): Config {
 }
 
 /**
- * The minimal config object to serialize for a scaffold: just the detected `targets` and (when
- * detected) `tokens`. Everything else is intentionally omitted so the file stays small and the
- * engine's DEFAULTS apply — `parseConfig` fills them at load time. Validated first via
- * {@link buildScaffoldConfig}, then the slim object is returned for writing.
+ * The minimal config object to serialize for a scaffold: just the `targets` and (when provided)
+ * `tokens`. Everything else is intentionally omitted so the file stays small and the engine's
+ * DEFAULTS apply — `parseConfig` fills them at load time. The fields are taken from the **validated,
+ * normalized** {@link buildScaffoldConfig} output (not the raw input), so unknown/extra keys are
+ * stripped and the bytes written are exactly what `parseConfig` accepted.
  */
 export function scaffoldConfigObject(input: ScaffoldInput): {
   targets: Target[];
   tokens?: TokensConfig;
 } {
-  buildScaffoldConfig(input); // validate (throws if invalid); we write the slim form below
-  const obj: { targets: Target[]; tokens?: TokensConfig } = { targets: input.targets };
+  const validated = buildScaffoldConfig(input); // throws on an invalid scaffold; normalizes the rest
+  const obj: { targets: Target[]; tokens?: TokensConfig } = { targets: validated.targets };
   if (input.tokenSources !== undefined) {
-    obj.tokens = input.tokenSources;
+    obj.tokens = validated.tokens; // the normalized token config, only when the caller provided one
   }
   return obj;
 }
