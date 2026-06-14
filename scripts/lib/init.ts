@@ -1,0 +1,216 @@
+import { basename, extname } from "node:path";
+import {
+  parseConfig,
+  type Config,
+  type StorybookTarget,
+  type AppTarget,
+  type Target,
+  type TokenFormat,
+  type TokenSourceObject,
+  type TokensConfig,
+} from "./config";
+
+/**
+ * Scaffolding logic for `/visual-init` (T-24). Pure and side-effect free — no network, no fs —
+ * so it is fully unit-testable. The impure shell in `scripts/init.ts` probes ports, scans the
+ * cwd for token files, and writes the config; this module decides *what* config to write.
+ *
+ * A freshly-installed engineer's first `/visual-check` fails against the sample defaults
+ * (`localhost:6006` storybook + `localhost:3000` app routes, `src/styles/tokens.css`). This
+ * module turns whatever was actually detected on the machine into a minimal valid VisualConfig
+ * that `parseConfig` accepts, so that first check "just works".
+ */
+
+const PREFIX = "Visual Guard init";
+
+function fail(message: string): never {
+  throw new Error(`${PREFIX}: ${message}`);
+}
+
+/**
+ * The localhost ports to readiness-probe, in priority order. Storybook's default (6006) is
+ * first — it is the most common Visual Guard target — followed by the common app dev-server
+ * defaults: 3000 (CRA/Next.js), 5173 (Vite), 8080 (webpack-dev-server/Express), 4321 (Astro).
+ */
+export function candidatePorts(): number[] {
+  return [6006, 3000, 5173, 8080, 4321];
+}
+
+/** The default app routes suggested when a reachable origin isn't a Storybook (no auto-discovery). */
+export const DEFAULT_APP_ROUTES = ["/"];
+
+/** The fallback template target written when nothing on the machine is reachable. */
+export const FALLBACK_STORYBOOK_URL = "http://localhost:6006";
+
+/**
+ * The outcome of probing one origin (filled in by the impure shell). `reachable` mirrors the R2
+ * semantics from capture.ts: any HTTP response counts as reachable; only a refused/timed-out
+ * connection is unreachable. `storyEntryCount` is the number of renderable Storybook entries
+ * discovered at `<url>/index.json` (or `/stories.json`) — `undefined` when discovery wasn't run
+ * or didn't yield a Storybook index, `0` for an empty (docs-only) Storybook.
+ */
+export interface ProbeResult {
+  url: string;
+  reachable: boolean;
+  /** Renderable Storybook entries found, or undefined if this isn't a Storybook index. */
+  storyEntryCount?: number;
+  /** Routes to seed an app target with; defaults to {@link DEFAULT_APP_ROUTES}. */
+  routes?: string[];
+}
+
+/**
+ * Classify a reachable origin into a Visual Guard target. An origin is a **storybook** target
+ * when story discovery found a Storybook index (`storyEntryCount` is defined — even `0`, since a
+ * docs-only Storybook is still a Storybook); otherwise it is an **app** target seeded with the
+ * probe's `routes` (or the default route, since Phase 0 cannot auto-discover app routes). Throws
+ * on an unreachable probe — the caller decides what to do with those (template fallback).
+ */
+export function classifyTarget(probe: ProbeResult): Target {
+  if (!probe.reachable) {
+    fail(`refusing to classify an unreachable origin ${JSON.stringify(probe.url)}.`);
+  }
+  if (probe.storyEntryCount !== undefined) {
+    const target: StorybookTarget = { type: "storybook", url: probe.url };
+    return target;
+  }
+  const routes = probe.routes && probe.routes.length > 0 ? probe.routes : [...DEFAULT_APP_ROUTES];
+  const target: AppTarget = { type: "app", url: probe.url, routes };
+  return target;
+}
+
+// --- Token-source detection ------------------------------------------------
+
+/**
+ * Map a file path to its token {@link TokenFormat} by extension alone — deterministic and
+ * conservative (no content sniffing here; `parseConfig` keeps `format: "auto"` for the engine's
+ * own content-aware detection when we can't be certain). Mirrors the extension precedence in
+ * `scripts/lib/token-adapters/index.ts`:
+ *   .css → css · .scss/.sass → scss · .less → less · .tokens/.tokens.json → dtcg.
+ * `.json` is left to `auto` (DTCG vs Style-Dictionary vs Tokens-Studio can't be told apart by
+ * extension), and the JS-eval formats (tailwind-config / js-theme) are never auto-selected — they
+ * require opt-in (`tokens.allowJsEval`) and an explicit format. Returns null when unknown.
+ */
+function formatForPath(path: string): TokenFormat | "auto" | null {
+  const lower = path.toLowerCase();
+  // `.tokens.json` and `.tokens` are the DTCG community convention — match before bare `.json`.
+  if (lower.endsWith(".tokens.json") || lower.endsWith(".tokens")) {
+    return "dtcg";
+  }
+  const ext = extname(lower);
+  switch (ext) {
+    case ".css":
+      return "css";
+    case ".scss":
+    case ".sass":
+      return "scss";
+    case ".less":
+      return "less";
+    case ".json":
+      // DTCG / Style-Dictionary / Tokens-Studio share `.json`; defer to content auto-detection.
+      return "auto";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Prefer the most token-like file when several candidates exist: a path whose basename contains
+ * "token" sorts first, then by the format-priority order, then alphabetically — so a deterministic
+ * single source is chosen for the scaffold (the user can add more by hand).
+ */
+const FORMAT_RANK: Record<TokenFormat | "auto", number> = {
+  css: 0,
+  tailwind: 1,
+  scss: 2,
+  less: 3,
+  dtcg: 4,
+  "style-dictionary": 5,
+  "tokens-studio": 6,
+  "tailwind-config": 7,
+  "js-theme": 8,
+  auto: 9,
+};
+
+function looksLikeTokenFile(path: string): boolean {
+  return /token/i.test(basename(path));
+}
+
+/**
+ * Turn a list of on-disk token-file candidates into a {@link TokensConfig}, deterministically.
+ * Each recognized path maps to a `{ source, format }`; unknown extensions are dropped. The result
+ * is ordered: token-named files first, then by format priority, then alphabetically — so the same
+ * inputs always yield the same config. Returns `undefined` when nothing is recognized, so the
+ * caller can omit `tokens` entirely and let `parseConfig` fall back to its default source.
+ */
+export function detectTokenSources(filePaths: string[]): TokensConfig | undefined {
+  const recognized: { source: TokenSourceObject; rank: number; named: boolean }[] = [];
+  for (const path of filePaths) {
+    const format = formatForPath(path);
+    if (format === null) {
+      continue;
+    }
+    recognized.push({
+      source: { source: path, format },
+      rank: FORMAT_RANK[format],
+      named: looksLikeTokenFile(path),
+    });
+  }
+  if (recognized.length === 0) {
+    return undefined;
+  }
+  recognized.sort((a, b) => {
+    if (a.named !== b.named) {
+      return a.named ? -1 : 1; // token-named files first
+    }
+    if (a.rank !== b.rank) {
+      return a.rank - b.rank; // then by format priority
+    }
+    return a.source.source.localeCompare(b.source.source); // then stable alphabetical
+  });
+  return { sources: recognized.map((entry) => entry.source) };
+}
+
+// --- Config assembly -------------------------------------------------------
+
+export interface ScaffoldInput {
+  /** Targets to write (Storybook/app); must be non-empty (the one required config field). */
+  targets: Target[];
+  /** Detected token sources; omitted → `parseConfig` defaults to `src/styles/tokens.css`. */
+  tokenSources?: TokensConfig;
+}
+
+/**
+ * Build a complete, valid {@link Config} from detected targets + token sources. Only `targets`
+ * (and optionally `tokens`) are written; every other field is left to `parseConfig` so the
+ * repo's hardcoded DEFAULTS (viewports, states, threshold, maxDiffRatio, baselineDir, uiGlobs)
+ * are the single source of truth. Validates by round-tripping through `parseConfig` — so a
+ * scaffold can never be written that the engine would later reject.
+ */
+export function buildScaffoldConfig(input: ScaffoldInput): Config {
+  if (input.targets.length === 0) {
+    fail(`"targets" is required — at least one storybook or app target must be scaffolded.`);
+  }
+  const raw: Record<string, unknown> = { targets: input.targets };
+  if (input.tokenSources !== undefined) {
+    raw.tokens = input.tokenSources;
+  }
+  return parseConfig(raw);
+}
+
+/**
+ * The minimal config object to serialize for a scaffold: just the detected `targets` and (when
+ * detected) `tokens`. Everything else is intentionally omitted so the file stays small and the
+ * engine's DEFAULTS apply — `parseConfig` fills them at load time. Validated first via
+ * {@link buildScaffoldConfig}, then the slim object is returned for writing.
+ */
+export function scaffoldConfigObject(input: ScaffoldInput): {
+  targets: Target[];
+  tokens?: TokensConfig;
+} {
+  buildScaffoldConfig(input); // validate (throws if invalid); we write the slim form below
+  const obj: { targets: Target[]; tokens?: TokensConfig } = { targets: input.targets };
+  if (input.tokenSources !== undefined) {
+    obj.tokens = input.tokenSources;
+  }
+  return obj;
+}

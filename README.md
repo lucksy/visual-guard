@@ -132,8 +132,30 @@ gives continuous visibility so a check isn't run blind against a down or errorin
 
 ## Install
 
-Visual Guard ships as a standard Claude Code plugin. Install it from a marketplace, or point
-Claude Code at this directory:
+### Install from the marketplace
+
+Visual Guard ships as a standard Claude Code plugin. From inside Claude Code, add the marketplace
+and install it:
+
+```text
+/plugin marketplace add lucksy/visual-guard
+/plugin install visual-guard@lucksy
+```
+
+Then scaffold a project-specific config and run your first check:
+
+```text
+/visual-init     # probe your dev servers + tokens, write visual.config.json
+/visual-check    # capture → pixel-diff → explain
+```
+
+`/visual-init` detects your running Storybook / dev server and design-token files and writes a
+working `visual.config.json`, so the first `/visual-check` runs against *your* project instead of
+the sample defaults. It never overwrites an existing config without `--force`.
+
+### Local development
+
+Or point Claude Code at this directory:
 
 ```bash
 claude --plugin-dir /path/to/visual-check
@@ -198,6 +220,7 @@ never collide, and baselines are stable as instances are added.
 
 | Command | What it does |
 |---|---|
+| `/visual-init` | Scaffold a `visual.config.json` for this project — probes your dev servers / Storybook, detects design-token files, and writes a working config so the first `/visual-check` just works. Never clobbers an existing config without `--force`. |
 | `/visual-check [target]` | Capture → pixel-diff → explain. With no target, captures **all** configured targets and tags each with its related changed files. |
 | `/visual-baseline [target]` | Approve the latest run's renders as the new committed baseline (the sign-off). Previews first, confirms before any overwrite, and writes only under `baselineDir`. |
 | `/visual-review` | **[Phase 1]** Fan-out review across many components/viewports, with each finding adversarially verified before it's reported. |
