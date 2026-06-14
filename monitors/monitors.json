@@ -1,0 +1,8 @@
+[
+  {
+    "name": "dev-server-readiness",
+    "description": "Watch the configured Storybook / dev-server targets for readiness and route/index health around a visual check, reporting each status transition so capture isn't run blind against a down or erroring server.",
+    "when": "on-skill-invoke:visual-check",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/monitor-targets.mjs\""
+  }
+]

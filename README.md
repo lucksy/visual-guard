@@ -9,10 +9,12 @@ headless Chromium, pixel-diffs them against an approved baseline, and explains w
 with a deliberate, local **sign-off** workflow to approve new baselines. No one has to eyeball
 screenshots by hand.
 
-This is **Phase 0 (MVP)**: deterministic capture + diff, the `/visual-check` and
-`/visual-baseline` commands, and the one-time engine bootstrap. The agent-native depth
-(structured `visual-reviewer` subagent, token-drift auditor, checkpoint hooks, fan-out review
-workflow) lands in Phase 1 — see [Roadmap](#roadmap).
+**Phase 0 (MVP)** delivers deterministic capture + diff, the `/visual-check` and
+`/visual-baseline` commands, and the one-time engine bootstrap. **Phase 1 (agent-native depth)**
+adds the structured `visual-reviewer` subagent, a `token-auditor` for design-token drift,
+`PostToolUse`/`Stop` checkpoint hooks, and the `/visual-review` fan-out workflow that
+adversarially verifies each finding — see the [Phase 1 flow](#phase-1--agent-native-review) below
+and the [Roadmap](#roadmap).
 
 ---
 
@@ -48,6 +50,83 @@ Approve 1 render from run 20260613-180659 as the baseline for `button`?  yes
 A runnable version of exactly this flow lives in
 [`tests/e2e/sample/`](tests/e2e/sample/) and is asserted end-to-end by
 [`tests/e2e/canonical-flow.e2e.test.ts`](tests/e2e/canonical-flow.e2e.test.ts).
+
+---
+
+## Phase 1 — agent-native review
+
+Phase 1 turns the pixel numbers into a **structured, verified verdict** and catches regressions
+the pixels can't see.
+
+**Structured verdict.** When `/visual-check` flags a target, it invokes the read-only
+`visual-reviewer` subagent per changed image. The reviewer opens the baseline/current/diff PNGs,
+reads the changed source, and — when a diff is ambiguous — **re-renders the live element** via the
+Playwright MCP before deciding. It returns a typed verdict that is merged back into `manifest.json`:
+
+```text
+⚠️  button — fail (3.18%)
+  classification: design-system-violation
+  cause:  src/Button.css:12 — padding: 48px 40px replaces var(--vg-space-pad)
+  impact: off-system spacing · taller button
+  fix:    restore padding: var(--vg-space-pad)
+```
+
+**Token drift the pixels miss.** The `token-auditor` flags a hardcoded value that inlines a design
+token **even when the pixel delta is below the gate** — e.g. a `--vg-brand` color written as its
+identical hex moves zero pixels (the screenshot diff says `pass`) yet is still a design-system
+regression. This is the Phase-1 exit criterion, proven end-to-end in
+[`tests/e2e/review-flow.e2e.test.ts`](tests/e2e/review-flow.e2e.test.ts) (CP6).
+
+**Fan-out review.** `/visual-review` launches a **dynamic workflow** that fans review out across
+many components × viewports (the `visual-reviewer` + `token-auditor` subagents), **adversarially
+verifies each finding** with independent skeptics behind a majority gate, and synthesizes **one**
+report — so only independently-verified findings reach you. Plugins can't bundle a workflow, so it
+ships as a skill ([`skills/visual-review/`](skills/visual-review/)) that launches the bundled
+template and offers to save it as `/visual-review`.
+
+**Checkpoint hooks.** A `PostToolUse` hook records edited UI files into `.visual-guard/pending.json`
+(detection only — never a capture in the hook), and a `Stop` hook nudges you to run `/visual-check`
+if anything is pending.
+
+---
+
+## Phase 2 — operations & CI
+
+Phase 2 makes Visual Guard a pipeline gate and adds the operational tooling around it.
+
+**CI gate (deterministic non-zero exit).** `scripts/ci.ts` turns a run's `manifest.json` into a
+pass/fail decision and a process exit code, so a pipeline fails on an **unapproved** regression.
+A `fail` (pixel/dimension regression) always blocks; a `new` render (no baseline = unapproved) and
+an `error` (undecodable) block by default and can be relaxed with `--allow-new` / `--allow-error`.
+
+```bash
+RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"; S="${CLAUDE_PLUGIN_ROOT}/scripts"
+export PLAYWRIGHT_BROWSERS_PATH="${CLAUDE_PLUGIN_DATA}/browsers"
+"$RUNNER" "$S/capture.ts" --config "$CONFIG" --run "$RUN_ID" \
+  && "$RUNNER" "$S/compare.ts" --config "$CONFIG" --run "$RUN_ID" \
+  && "$RUNNER" "$S/report.ts"  --config "$CONFIG" --run "$RUN_ID"
+"$RUNNER" "$S/ci.ts" --run "$RUN_ID"      # exit 0 = clean · 1 = unapproved regressions · 2 = could not run
+```
+
+> A `claude -p` headless run does **not** auto-exit non-zero when a check fails, so the
+> authoritative gate is `ci.ts`'s own exit code — that is what fails the pipeline. `/visual-ci`
+> orchestrates the same steps interactively and reports the result.
+
+**PR-comment generator.** `scripts/pr-report.ts` renders the run as Markdown (a summary table plus
+evidence-then-verdict per flagged target) to `.visual-guard/runs/<id>/pr-comment.md`. Visual Guard
+**generates, never posts** — everything stays local; your CI posts it:
+`gh pr comment "$PR" -F .visual-guard/runs/$RUN_ID/pr-comment.md`.
+
+**Coverage map.** `/visual-coverage` crosses the config's resolved render grid (the same expansion
+capture uses) with the committed baselines to show, per component, which `state@viewport` cells are
+covered, which are **gaps** (a regression could slip through there), and which baselines are
+**orphans** (on disk but no longer in config).
+
+**Readiness monitor.** `monitors/monitors.json` registers a `dev-server-readiness` monitor
+(`when: on-skill-invoke:visual-check`) that polls each configured target's reachability and health
+(Storybook `/index.json` story count; app route status) and reports each status transition. It is
+read-only and non-gating — `capture.ts`'s origin probe stays the hard fail-fast; the monitor just
+gives continuous visibility so a check isn't run blind against a down or erroring server.
 
 ---
 
@@ -122,7 +201,8 @@ never collide, and baselines are stable as instances are added.
 | `/visual-check [target]` | Capture → pixel-diff → explain. With no target, captures **all** configured targets and tags each with its related changed files. |
 | `/visual-baseline [target]` | Approve the latest run's renders as the new committed baseline (the sign-off). Previews first, confirms before any overwrite, and writes only under `baselineDir`. |
 | `/visual-review` | **[Phase 1]** Fan-out review across many components/viewports, with each finding adversarially verified before it's reported. |
-| `/visual-coverage` | **[Phase 2]** The component × state coverage map. |
+| `/visual-coverage` | **[Phase 2]** The component × state coverage map — covered cells, gaps (expected but unbaselined), and orphan baselines. |
+| `/visual-ci` | **[Phase 2]** Run the full gate (capture → diff → report → CI gate) and generate a PR-comment Markdown report. The deterministic non-zero exit for CI comes from `scripts/ci.ts`. |
 
 The engine the commands orchestrate is also runnable directly:
 
@@ -189,26 +269,31 @@ claude plugin validate . --strict
 # Opt-in integration tests that launch real Chromium (skipped by default):
 VG_E2E=1 npx vitest run capture.e2e        # the determinism gate (CP3)
 VG_E2E=1 npx vitest run canonical-flow     # the full canonical flow (CP5)
+VG_E2E=1 npx vitest run review-flow        # the Phase-1 fan-out exit (CP6)
+VG_E2E=1 npx vitest run ci-flow            # the Phase-2 CI gate + PR report (CP7)
 ```
 
-The pure pixel/diff/target/config logic in `scripts/lib/` is unit-tested and coverage-gated;
-the manifest contract is golden-tested; Playwright capture and the canonical flow are covered
-by the opt-in `VG_E2E` integration tests.
+The pure pixel/diff/target/config/token logic in `scripts/lib/` is unit-tested and coverage-gated;
+the manifest + verdict contracts are golden/contract-tested; the subagent prompts and the
+`/visual-review` workflow template are pinned by contract/structure tests; Playwright capture and
+the canonical + review flows are covered by the opt-in `VG_E2E` integration tests.
 
 ---
 
 ## Roadmap
 
-- **Phase 0 — MVP (this release):** deterministic capture + diff, `/visual-check`,
+- **Phase 0 — MVP (shipped):** deterministic capture + diff, `/visual-check`,
   `/visual-baseline`, the `SessionStart` engine bootstrap.
-- **Phase 1 — Agent-native depth:** the read-only `visual-reviewer` subagent (classify ·
+- **Phase 1 — Agent-native depth (shipped):** the read-only `visual-reviewer` subagent (classify ·
   explain · cite cause · recommend fix, deep-probing live elements via MCP), a `token-auditor`
   for design-token drift (catches a hardcoded value replacing a token even when pixels don't
   move), `PostToolUse`/`Stop` hooks for checkpoint triggering, and the `/visual-review` fan-out
   workflow that adversarially verifies each finding.
-- **Phase 2 — Operations:** a dev-server/Storybook readiness monitor, the `/visual-coverage`
-  map, a PR-comment generator, and a non-interactive CI mode that exits non-zero on unapproved
-  regressions.
+- **Phase 2 — Operations (shipped):** a dev-server/Storybook readiness **monitor**
+  (`monitors/monitors.json`), the **`/visual-coverage`** map (state × component, with gaps and
+  orphan baselines), a **PR-comment generator** (`scripts/pr-report.ts` — generates Markdown
+  locally; your CI posts it), and a non-interactive **CI gate** (`scripts/ci.ts`) that exits
+  non-zero on unapproved regressions. See the [Phase 2 flow](#phase-2--operations--ci) below.
 
 See [`SPEC.md`](SPEC.md) for the full design and [`TASKS.md`](TASKS.md) for the build log.
 
