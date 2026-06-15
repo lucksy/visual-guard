@@ -23,22 +23,24 @@
 - **Gates per phase:** `npm test` (vitest + ≥80% lib coverage), `npm run typecheck`, `npm run lint`,
   `claude plugin validate . --strict`. **Do NOT** run `prettier --write .` (repo isn't
   prettier-clean) — hand-wrap long lines.
-- **The Figma PAT is the only secret.** Never in `visual.config.json`, the DB, manifests, logs,
-  thumbnails, or any committed file. Masked `figd_…<last4>` on every surface.
+- **No Figma secret.** Figma is read via the **Figma MCP** (`mcp__figma-desktop`) — there is no PAT
+  or token anywhere. Studio stores only images + non-secret metadata (node ids, names, variant
+  defs); nothing sensitive in config/DB/logs. (A REST/PAT provider, with its token-security rules, is
+  a future option only.)
 
 ---
 
 ## Sequencing
 
 ```
-P0 Figma access + token + access-check + config delta   ── connect, never block
+P0 Figma config (multi-file) + MCP availability check    ── no token, never block
         │
 P1 Data/DB layer (better-sqlite3, schema, store, reindex) ── the spine everything writes to
         │
    ┌────┴───────────────┐
    ▼                    ▼
-P2 Sync (engine fetch   P3 Web-app server + JSON API + image serving
-   + workflow orchestr.)      │
+P2 Sync (code=engine,   P3 Web-app server + JSON API + image serving
+   figma=MCP workflow)        │
         │                     ▼
         └───────────► P4 Web-app UI (gallery + detail + timeline + variants)
                                 │
@@ -53,45 +55,41 @@ hardened for active design systems.
 
 ---
 
-## Phase 0 — Figma access, secure token, access check, config delta
+## Phase 0 — Figma config + MCP availability (no token)
 
-**Goal.** Establish the only external dependency (Figma REST + PAT) and the security boundary, and
-extend config additively — de-risking the two scariest items first (the secret surface and Figma's
-quirks: View-seat throttle, expiring image URLs, empty published-components endpoint). No DB, no
-rendering yet.
+**Goal.** Add the additive `figma` config (multi-file) and a clean "is the Figma MCP available?"
+check, and grow `/visual-init` to collect the file key(s) — **no token, no secret surface, no REST
+client.** De-risks the cheap-but-fundamental questions early: that the MCP (`get_metadata` /
+`get_screenshot`) can address component nodes by id in the open file and return what Studio needs.
 
 **Deliverables.**
 - `scripts/lib/figma/url.ts` (pure): `extractFigmaFileKey`, `looksLikeFigmaKey`, `parseNodeId`
-  (URL `123-456` → API `123:456`).
-- `scripts/lib/figma/token.ts` (pure + injected fs): resolution precedence
-  `flag > VISUAL_GUARD_FIGMA_TOKEN > FIGMA_TOKEN > CLAUDE_PLUGIN_OPTION_FIGMA_TOKEN`; `maskToken`;
-  `scrubSecrets` (replaces any `figd_[A-Za-z0-9-]+`); `loadDotenvInto`; `persistToken` (atomic
-  temp+rename, `chmod 0600`, merge-preserving).
-- `scripts/lib/figma/client.ts` (pure + injected `FetchLike`): `figmaGet(path)` adding
-  `X-Figma-Token`; outcome union `ok | auth-error | not-found | rate-limited | network-error`;
-  429 retry honoring `Retry-After` (≤3×); base origin overridable via `FIGMA_API_BASE`.
-- `scripts/lib/figma/access-check.ts` (pure + injected client): two-stage `GET /v1/me` →
-  `GET /v1/files/:key?depth=1`; returns `{ ok, lines[] }`, never throws; four-way disambiguation.
-- `scripts/figma.ts` (CLI, owns I/O): `connect --verify` (hidden-input persist), `persist-token`,
-  `access-check`. Mirrors ds-bridge `config connect`.
+  (URL `123-456` → API `123:456`) — for normalizing a pasted Figma URL into the stored `key`.
 - `parseFigma(raw)` in `scripts/lib/config.ts` + `FigmaConfig` on `Config`
-  (`figma?: { fileKey, tokenEnv?, componentMap?, scale? }`); absent → `undefined`.
-- `/visual-init` "Design system (Figma)" section + "offer sync" step (`commands/visual-init.md` +
-  `scripts/init.ts` write path); `.gitignore` gets an **explicit** `.visual-guard.env` line.
+  (`figma?: { files: { key, label? }[]; componentMap?: Record<string,string> }`; a bare `fileKey`
+  string normalizes to a one-element `files`); absent → `undefined`. **No `tokenEnv`.**
+- `/visual-init` "Design system (Figma)" section (paste file URL(s) → key(s)+label(s); a
+  **Figma-MCP availability check**; auto-map confirm/edit/add; offer to run the first sync) in
+  `commands/visual-init.md` + the `scripts/init.ts` write path. **No `.gitignore`/token changes.**
+- An MCP-availability helper the commands use: probe that `mcp__figma-desktop` is present and a file
+  is open (a cheap `get_metadata`); if not, an actionable "open your Figma file & re-run" message.
 
 **Depends on.** Nothing (extends existing config/init).
 
 **Testing.** Unit (pure files, carry the coverage): URL/key/node parsing incl. `figma.site` + bad
-input; token precedence; **a test asserting a token never appears in any masked/scrubbed output or
-thrown error**; atomic `0600` write + merge; client outcome mapping for 401/403/404/429(+Retry-After)
-/network via mock `FetchLike`; access-check copy for all four branches. `config.test.ts`: existing
-config (no `figma`) round-trips **unchanged**; `figma` requires non-empty `fileKey`. `scripts/figma.ts`
-integration test with a mock client (no network). All four gates.
+input; `parseFigma` validates `files[]` (each needs a non-empty `key`), normalizes a bare `fileKey`,
+and returns `undefined` when absent. `config.test.ts`: an existing config (no `figma`) round-trips
+**byte-identical**; a `figma.files` block validates; an empty/invalid `files` entry is rejected with a
+named error. (No token/secret tests — there is no token.) All four gates.
 
-**Exit criteria.** `node scripts/figma.ts access-check` on a real file prints `✓ Token valid` +
-`✓ Library readable`; a bad token prints the 401 remediation and persists nothing; a no-`figma`
-config loads identically to before; `git check-ignore .visual-guard.env` succeeds; no test/artifact
-contains a raw `figd_` token; all gates pass.
+**Exit criteria.** An existing `visual.config.json` with no `figma` block loads identically to before;
+`/visual-init` accepts a pasted Figma URL and writes `figma.files: [{ key, label }]`; the
+availability check cleanly reports "MCP ready" vs "open Figma & re-run"; all gates pass.
+
+> **Note vs. the old plan:** choosing the Figma MCP deletes the entire former Phase-0 token-security
+> workstream (`token.ts`, `client.ts`, `access-check.ts`, `scripts/figma.ts`, `.visual-guard.env`,
+> masking/scrubbing, the `figd_`-never-leaks tests). That code only returns if a REST provider is
+> ever added for CI parity.
 
 ---
 
@@ -137,55 +135,55 @@ needed for this phase to deliver value**; all gates pass with ≥80% lib coverag
 
 ## Phase 2 — Capture / Sync (dual Figma + code population)
 
-**Goal.** Populate both snapshot streams fast and idempotently. **Network fan-out lives in the
-engine script** (in-process bounded concurrency + `Retry-After` backoff + eager download); the
-**dynamic Workflow orchestrates phases with progress and fans out only the LLM work** (ambiguous
-matching, conformance classification) — per SPEC §D5. De-risks Figma rate limits + expiring URLs.
+**Goal.** Populate both snapshot streams idempotently. **Code capture is the engine** (headless,
+reuses `capture.ts`). **Figma capture is the `/visual-sync` dynamic Workflow fanning out subagents
+that call the Figma MCP** (`get_metadata` to enumerate, `get_screenshot` per node) — agent-driven,
+because MCP tools are agent-only. No token, no rate limit, no expiring URLs — per SPEC §D1/§D5.
 
 **Deliverables.**
 - `scripts/lib/studio/enumerate-code.ts` (pure): `groupCodeComponents(RenderTarget[])` reusing
   `targets.ts`.
-- `scripts/lib/studio/enumerate-figma.ts` (pure, injected client): parse `/components` +
-  `/component_sets`; **tree-scan fallback** for `type===COMPONENT/COMPONENT_SET` when published is empty.
+- `scripts/lib/studio/figma-nodes.ts` (pure): parse a `get_metadata` payload into
+  `FigmaComponent[]` (a `COMPONENT_SET` = a component, its child `COMPONENT`s = variants) — pure so
+  it's unit-tested against fixtures without the live MCP.
 - `scripts/lib/studio/match.ts` (pure): `matchComponents(code, figma, overrides)` — override wins →
   normalized-name → leftovers surfaced `code-only`/`figma-only` (never dropped).
-- `scripts/lib/studio/limit.ts` (pure): a small promise-pool concurrency limiter (bounded, testable).
-- `scripts/studio/figma-export.ts` (CLI, owns HTTP + token read + DB write): `enumerate | export
-  --ids | sync-figma`. Runs the **in-process** bounded fan-out: batch ids ≤ (verified cap), export,
-  **eagerly download** the expiring URLs (re-export on a 404'd URL, not just re-download), dedupe-append
-  to the DB. Receives the token by **env-var name**, reads `process.env` itself — never a value in argv/log.
-- `scripts/studio/sync.ts` (CLI): code capture via `captureAll()` + compare (`current_vs_baseline`)
-  + persist; honors `figma.scale` (2), `figma.concurrency` (6).
-- `skills/visual-sync/SKILL.md` + `workflow.template.js`: orchestrates phases (preflight → enumerate
-  → `figma-export sync-figma` → `sync.ts` code → match → classify → report progress via `log()`),
-  fanning out **LLM** subagents for ambiguous matches + conformance classification; supports a
-  `$ARGUMENTS` target subset.
-- `commands/visual-sync.md`: the `/visual-sync` wrapper with the engine `--check` preflight.
+- `scripts/studio/sync.ts` (CLI, engine, headless): **code** capture via `captureAll()` + compare
+  (`current_vs_baseline`) + persist to the DB. No Figma here (the engine can't call the MCP).
+- `scripts/studio/record-figma.ts` (CLI): given a captured Figma node screenshot (bytes/path) +
+  metadata, dedupe-append a `source='figma'` snapshot to the DB. The **agent** (in the workflow)
+  calls the MCP and hands bytes/metadata to this recorder — the token-free analogue of the old
+  export script.
+- `skills/visual-sync/SKILL.md` + `workflow.template.js`: the dynamic Workflow — preflight (engine
+  `--check` + **Figma-MCP availability**) → `get_metadata` enumerate → fan out subagents that
+  `get_screenshot` batches of nodes and call `record-figma.ts` → run `sync.ts` for code → match →
+  classify conformance → `log()` progress; supports a `$ARGUMENTS` file/target subset and writes rows
+  **progressively** (code first, Figma streams in).
+- `commands/visual-sync.md`: the `/visual-sync` wrapper (engine `--check` + MCP availability preflight).
 
-**Depends on.** P0 (token + client + access check), P1 (DB store + image layout).
+**Depends on.** P0 (config + MCP availability), P1 (DB store + image layout).
 
-**Testing.** Unit (pure, coverage): code grouping; figma parse incl. empty-published tree-scan
-fallback; matching priority + false-positive guard; the concurrency limiter (ordering, bound, error
-isolation). `visual-sync-template.test.ts` (mirrors `visual-review-template.test.ts`): AsyncFunction
-syntax check, `meta` via plain `Function`, **assert the template embeds no `figd_` token and passes
-only `tokenEnv`**. `figma-export.ts` integration (mock client + temp DB): batched export → eager
-download → dedupe append; 429 → backoff; 404 → re-export; **assert no token in the DB or any artifact**.
-`sync.ts` integration reusing capture fixtures (or gated `VG_E2E`) to prove a code-only sync populates
-the DB end-to-end. All gates.
+**Testing.** Unit (pure, coverage): code grouping; `figma-nodes.ts` parsing a `get_metadata` fixture
+(component-set → component+variants); matching priority + false-positive guard. `record-figma.ts`
+integration (temp DB): dedupe-append a Figma snapshot, second identical bytes add no row.
+`visual-sync-template.test.ts` (mirrors `visual-review-template.test.ts`): AsyncFunction syntax check +
+`meta` via plain `Function`. `sync.ts` integration reusing capture fixtures (or gated `VG_E2E`) to
+prove a **code-only** sync populates the DB end-to-end (no MCP needed for the code path). All gates.
 
-**Exit criteria.** `/visual-sync` writes both figma + code snapshots, statuses computed, with bounded
-concurrency that doesn't trip 429 on a medium library; re-running on an unchanged DS appends **zero**
-new history rows (idempotent); a code-only project still populates fully; an expiring/failed image URL
-recovers via re-export, not a blank; all gates pass.
+**Exit criteria.** `/visual-sync` populates code snapshots headlessly and Figma snapshots when the
+desktop app is open (via the MCP workflow), statuses computed; re-running on an unchanged DS appends
+**zero** new history rows (content-hash idempotent); a code-only project (no Figma at all) populates
+fully; if Figma is closed, code still syncs and Figma components stay `figma-pending`; all gates pass.
 
 ---
 
 ## Phase 3 — Web-app server + JSON API + image serving
 
-**Goal.** Serve the DB to a browser, localhost-only, token never reaching the page. A tiny
-`node:http` server (via bundled `tsx`, **zero new deps**) exposes a read-mostly JSON API and streams
-path-validated PNGs. De-risks the "blocking server vs agent turn" and path-traversal concerns before
-any UI exists.
+**Goal.** Serve the DB to a browser, localhost-only; the page makes zero external calls (there's no
+token anywhere). A tiny `node:http` server (via bundled `tsx`, **zero new deps**) exposes a
+read-mostly JSON API and streams path-validated PNGs. `POST /api/sync` re-runs the **code** capture
+(engine); the Figma capture stays in `/visual-sync` (agent+MCP). De-risks the "blocking server vs
+agent turn" and path-traversal concerns before any UI exists.
 
 **Deliverables.**
 - `scripts/studio/server.ts` + pure `scripts/studio/lib/`:
@@ -200,19 +198,19 @@ any UI exists.
   `/api/components/:id/history?source=`, `/api/components/:id/variants`, `/api/snapshots/:id`,
   `/api/snapshots/:id/image` (PNG stream, `ETag`/immutable), `POST /api/sync`. Error
   `{ error: { code, message } }`. CSP per SPEC §10.
-- `scripts/studio/serve.ts` direct entry (`--no-open`, prints URL) + `/visual-app` command
-  (`commands/visual-app.md`) launching the server **backgrounded/detached** so the agent turn completes.
+- `scripts/studio/serve.ts` direct entry (`--no-open`, prints URL) + `/visual-studio` command
+  (`commands/visual-studio.md`) launching the server **backgrounded/detached** so the agent turn completes.
 
 **Depends on.** P1 (DB to read). P2 optional (empty DB → friendly "run /visual-sync" payload).
 
 **Testing.** Unit (pure, coverage): route matching incl. SPA fallback + CSP/MIME; **`..`/absolute/
 symlink path-traversal escapes refused** (dedicated test); pidfile staleness. `studio-server.e2e.test.ts`
 (integration): boot `serve.ts --no-open` over a seeded temp DB, hit every route, assert JSON shapes +
-PNG bytes + `image/png` + the CSP header; assert 127.0.0.1-only and that **no route returns the token**.
+PNG bytes + `image/png` + the CSP header; assert 127.0.0.1-only and that the CSP forbids off-origin calls.
 All gates.
 
 **Exit criteria.** `serve.ts --no-open` over a seeded DB returns valid JSON for every endpoint and
-streams real PNG bytes; a crafted `..` image path is refused; unreachable off 127.0.0.1; `/visual-app`
+streams real PNG bytes; a crafted `..` image path is refused; unreachable off 127.0.0.1; `/visual-studio`
 returns control to the agent (no hung turn); all gates pass.
 
 ---
@@ -236,9 +234,9 @@ at-a-glance Figma-vs-code parity view. Delivers value as cards stream in during 
   provenance), `CompareViewer` (`F/C/S/O/D`; **Overlay default for Figma-vs-code**; Diff labeled as
   *code regression vs previous code*), `VariantTabs` (union + origin chips), side panel
   (description / used-in / related / variants-parity), "Open in Figma" + "Open the story" deep links.
-- States: first-run panel (Connect Figma & Sync — **instructs the terminal flow, never captures a
-  token**), streaming skeletons, empty-filter, inline non-blocking errors. Full keyboard map, WCAG
-  AA, alt text from metadata.
+- States: first-run panel ("Open your Figma file & run `/visual-sync`" — **no token to enter**),
+  streaming skeletons, empty-filter, inline non-blocking errors (Figma desktop closed / MCP
+  unavailable → code halves still render). Full keyboard map, WCAG AA, alt text from metadata.
 
 **Depends on.** P3 (the API).
 
@@ -249,7 +247,7 @@ assets and CSP forbids off-origin `connect-src`/`script-src` (**no external call
 Browser/visual validation via chrome-devtools/Playwright MCP against `serve.ts --no-open` (manual/MCP,
 not in the vitest gate). All gates.
 
-**Exit criteria.** `/visual-app` after a sync shows the gallery with figma+code thumbnails + correct
+**Exit criteria.** `/visual-studio` after a sync shows the gallery with figma+code thumbnails + correct
 badges; a component page shows the timeline, comparison toggles, and variants with parity gaps; cards
 stream in during a running sync; the app works **fully offline** (no external calls — verified in the
 network panel); keyboard-only + dark mode both work; all gates pass.
@@ -267,10 +265,10 @@ comparison into a gate.
   `studio prune` (idempotent, runs at sync tail) — delete out-of-window non-approved snapshot rows,
   cascade `regressions`, sweep unreferenced `cache/blobs`, `VACUUM` past a freed-page threshold.
   **Committed baseline PNGs are never auto-deleted.**
-- Incremental sync: Figma re-export keyed on node `lastModified` / file `version` (cheap
-  `GET /v1/files/:key?depth=1`); code re-render keyed on Storybook story-set hash + `uiGlobs` mtime
-  (reuse `detect-ui-change.mjs`'s `pending.json`); content-hash dedupe is the backstop. `figma-pending`
-  resumable state for partial syncs.
+- Incremental sync: code re-render keyed on Storybook story-set hash + `uiGlobs` mtime (reuse
+  `detect-ui-change.mjs`'s `pending.json`); Figma re-capture skips unchanged nodes when
+  `get_metadata` exposes a `lastModified`, with **content-hash dedupe** as the correctness backstop.
+  `figma-pending` resumable state for partial syncs (e.g. Figma desktop closed mid-run).
 - Conformance tuning: `scripts/lib/studio/conformance.ts` (pure) — tolerant dimension delta (reuse
   `diff.ts` `dimensionDelta`) + coarse palette/dominant-color distance (`sharp` downscale + `culori`)
   → `{ dimensionDelta, paletteDelta, level: aligned|minor|divergent }`. Advisory; the
@@ -295,13 +293,13 @@ as advisory levels (not pass/fail); `/visual-ci` provably ignores conformance; a
 
 | Risk | De-risk phase | Mitigation |
 |---|---|---|
-| **PAT leak** | **P0** | one `maskToken`/`scrubSecrets`, opt-in `0600` `.visual-guard.env`, explicit `.gitignore` line + `git check-ignore`, "token never in artifacts" test (P0 + P2). |
+| **Figma MCP unavailable (desktop app closed)** | **P0/P2** | availability check before sync → actionable "open Figma & re-run"; un-captured components stay `figma-pending` and resume. |
+| **Figma sync interactive-only (no CI/headless)** | **—** | documented; code regression still runs headless/CI; REST is the future path for CI parity. |
+| **Bulk MCP capture token-cost/slow on big libraries** | **P2/P5** | bounded subagent fan-out + content-hash incremental; code-first ordering so value shows immediately. |
 | **`better-sqlite3` native build** | **P1** | reuse the proven `sharp` bootstrap; Node-20 prebuilds; existing "remove marker, retry next session" fallback. |
-| **Figma rate limits / expiring URLs** | **P2** | bounded **in-process** concurrency + `Retry-After` backoff; eager download; **re-export** on a 404'd URL. |
-| **View-seat throttle** | **P0** | two-stage access check before the fan-out. |
 | **Design-vs-code diff noise** | **P1 schema** + **P5 tolerant** | conformance is a separate, advisory `axis`; tolerant dimension+palette; never the pixel gate; CI provably ignores it. |
 | **Web-app bundling** | **P4** | prebuilt, committed, zero-build vanilla ES-module SPA; no bundler/UI kit. |
-| **Blocking server hangs the turn** | **P3** | `/visual-app` runs the server backgrounded/detached; pidfile reopens instead of double-starting. |
+| **Blocking server hangs the turn** | **P3** | `/visual-studio` runs the server backgrounded/detached; pidfile reopens instead of double-starting. |
 | **Path traversal** | **P3** | `images.ts` hard-refuses paths outside `.visual-baselines/`/`.visual-guard/`; escape test. |
 | **`parseConfig` backward-compat** | **P0** | additive `parseFigma`; explicit "no-`figma` config round-trips unchanged" test. |
 | **Matching false positives** | **P2** | override > normalized > surfaced; never fuzzy; user-overridable in the UI. |
@@ -311,11 +309,11 @@ as advisory levels (not pass/fail); `/visual-ci` provably ignores conformance; a
 
 ## A note on "dynamic workflows" (important)
 
-The original brief asked for "dynamic workflows to speed up accessing Figma pages." The honest
-engineering reality (SPEC §D5): the plugin's **Workflow tool orchestrates LLM subagents and can't do
-filesystem/raw-HTTP work itself**. So the **fast parallel network fetch is an in-process concurrency
-limiter inside `scripts/studio/figma-export.ts`** (this is what actually makes it fast and is the
-correct tool), while the **dynamic Workflow** still earns its place — it orchestrates the sync phases
-with live progress and fans out the genuinely LLM-shaped work (resolving ambiguous Figma↔code matches,
-classifying conformance drift). This split is faster, correct for the runtime, and keeps the
-token out of any subagent argument.
+The original brief asked for "dynamic workflows to speed up accessing Figma pages." Choosing the
+**Figma MCP** makes that instinct exactly right. MCP tools are **agent-callable only** (a plain
+`tsx` script can't invoke them), and the Workflow runtime is built to **orchestrate subagents** — so
+the fast, correct way to capture a whole library is the `/visual-sync` dynamic Workflow fanning out
+subagents that each `get_screenshot` a batch of component nodes via the MCP, recording snapshots
+through the engine. Code capture stays in the headless engine (`capture.ts`). No token, no rate
+limit, no HTTP-in-a-workflow awkwardness — the workflow does what it's good at (parallel subagents),
+and the engine does what it's good at (headless rendering + the DB).

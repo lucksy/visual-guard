@@ -66,7 +66,8 @@ between them, the **history** of both, and the **gaps** (designed-not-built, bui
 2. **A status per component** rolling up presence + drift across both sources.
 3. **A bundled web app** (localhost-only, no build step) — a gallery of components and a detail
    page with the timeline, the Figma‖Code comparison, variants, and usages.
-4. **A sync** that populates both streams (Figma via REST, code via the existing capture engine).
+4. **A sync** that populates both streams (Figma via the **Figma MCP**, code via the existing
+   capture engine).
 
 It is built **on top of** the existing engine (`capture.ts`, `compare.ts`/`diff.ts`,
 `baseline.ts`, `config.ts`, the `install-deps.mjs` bootstrap + `/visual-setup` consent gate) — not a
@@ -77,18 +78,22 @@ rewrite. Code baselines stay exactly where they live today (`.visual-baselines/`
 ## 5. Scope
 
 **In scope (v1):**
-- Figma REST access via a Personal Access Token; secure token handling; an access check.
+- Figma access via the **Figma MCP** (`mcp__figma-desktop`) — **no token**, no rate limits; an
+  availability check (is the Figma desktop app open?).
+- **Multi-Figma-file** libraries (`figma.files: [{ key, label? }]`).
 - Local SQLite index of components, variants, usages, snapshots (history), and comparisons.
-- A sync that fetches Figma component images + renders code components and records both.
+- An **agent-driven** sync (`/visual-sync`) that captures Figma component images via the MCP
+  (fanned out across subagents) and renders code components via the engine, recording both.
 - The bundled web app: gallery + component detail (timeline, comparison, variants, usages).
 - Component-level Figma↔code matching (normalized name + an override map).
 - Code-vs-code **regression** (the existing pixel gate) and Figma-vs-code **conformance** (advisory).
 
 **Out of scope (v1) — see [Non-goals](#15-non-goals):**
+- The **REST API + PAT** provider, and therefore **headless / CI / server-triggered Figma sync**
+  (the Figma side is interactive-only; code regression still runs headless/CI). REST is a designed-for
+  future provider if CI design-parity is ever needed.
 - Per-variant cross-source linking / parity badges (variants are listed side-by-side per source).
-- Browser-side token entry (token entry stays in the terminal flow).
 - Figma-side "where used" (only code usage via grep in v1).
-- Multi-Figma-file libraries (single `fileKey`; schema leaves room for `fileKeys[]` later).
 - Conformance as a CI gate (it is advisory, forever).
 - App-route (non-Storybook) targets as Studio components (Studio is Storybook-centric for v1).
 
@@ -101,16 +106,17 @@ contradictory across sub-designs). Each is a **decision**, not an option.
 
 | # | Decision | Why | Rejected alternative |
 |---|---|---|---|
-| D1 | **Figma access = REST API + Personal Access Token** (`X-Figma-Token` header). | Headless, deterministic, parallelizable, works in CI — required for "plug-and-play + fast bulk fetch". | Figma Desktop MCP: GUI-bound, interactive, can't fan out, no CI. |
-| D2 | **Token via env var** (`FIGMA_TOKEN`, also `VISUAL_GUARD_FIGMA_TOKEN`), with **opt-in** persist to a gitignored, `0600` `.visual-guard.env`. **Never** in config/DB/logs/thumbnails; masked `figd_…<last4>`. | Mirrors the proven ds-bridge `.ds-bridge.env` precedent; survives the Claude Code "sensitive config dropped on restart" issue; opt-in = we never store a secret unasked. | Token in config (leaks to git); OS keychain (not portable/CI); browser-entered token (crosses the trust boundary). |
+| D1 | **Figma access = the Figma MCP** (`mcp__figma-desktop`: `get_metadata` to enumerate component nodes, `get_screenshot` per node for the design image, `get_variable_defs` for tokens). **No token, no rate limits.** | Truly plug-and-play — no secret to create/store/scrub, no rate ceiling, already configured in this environment. MCP tools are agent-callable, which makes the "dynamic workflow" fan-out the *correct* parallelism. | REST API + PAT: headless + CI-capable + bulk-batch, **but** needs a token and hits a 10–20/min rate limit. Kept as a **designed-for future provider** for CI design-parity. |
+| D2 | **No secret to manage.** Figma auth lives entirely in the desktop app / MCP session; Studio reads designs through MCP tool calls and stores only **images + non-secret metadata** (node ids, names, variant defs). Nothing sensitive is ever written to config, the DB, logs, or thumbnails. | Eliminates the entire token-handling/security surface — the single biggest simplification of choosing MCP. | REST would reintroduce a PAT + `.visual-guard.env` + masking/scrubbing — deliberately avoided. |
 | D3 | **Source of truth = committed PNGs + a committed `figma_meta.json`; the SQLite DB is a gitignored, rebuildable index.** | Satisfies "history is **team-shared**" (a teammate clones and has the history) while avoiding binary-DB merge conflicts. `reindex` rebuilds the DB from the committed artifacts. | Commit the DB (binary churn/conflicts); store history only in the gitignored data dir (per-machine — breaks team-shared history). |
 | D4 | **SQLite driver = `better-sqlite3`**, shipped through the existing `ENGINE_DEPS` bootstrap. | The repo's Node floor is **20**, so `node:sqlite` (Node 22+, experimental) is not reliably present. `better-sqlite3` is native — but the repo **already** ships a native module (`sharp`) through the same bridge, so the risk is proven-solved. Sync API matches the engine's pure-lib style. | `node:sqlite` (not available at Node 20); `sql.js` (re-serializes whole DB per write); JSON store (no indexed history queries). |
-| D5 | **Concurrency model — corrected.** The parallel **network I/O** (batched Figma image exports + eager downloads, with a bounded concurrency limiter + `Retry-After` backoff) lives **inside a single `tsx` engine script**. The **dynamic Workflow** orchestrates the sync *phases* with live progress **and** fans out the parts that genuinely need an LLM (ambiguous component matching, conformance classification). | The Workflow runtime orchestrates **subagents** and "can't touch the filesystem itself" — it is **not** a raw parallel-HTTP engine. Putting HTTP fan-out in-process is both correct and faster; reserving the workflow for orchestration + LLM judgment is what it's actually good at. | "The dynamic workflow makes the parallel HTTP calls" — mechanically wrong for this runtime. |
+| D5 | **Parallelism = a dynamic Workflow fanning out subagents that call the Figma MCP.** MCP tools are **agent-callable only** (a plain `tsx` script can't invoke them), so the right model for "capture many components fast" is the Workflow tool fanning out subagents, each capturing a batch of component nodes via the MCP and recording snapshots through the engine. Code capture stays in the engine (Playwright). | Exactly what the Workflow runtime is for (orchestrating subagents) — and it finally makes the original "use dynamic workflows to speed up Figma access" the *correct* tool. No rate limit to bound; cap fan-out at the workflow's concurrency default. | A serial in-process loop (and a non-agent script can't call MCP anyway). |
 | D6 | **Two comparison axes, separated.** `current_vs_baseline` (code vs. its previous code) = the existing **pixelmatch regression** gate (valid, trustworthy). `figma_vs_code` = **conformance**, shown as overlay + a tolerant dimension/palette signal — **advisory only, never a gate, never CI**. | Cross-source pixel diff is noise (Figma renders at intrinsic size/scale 2; code at a viewport width — the engine crops to the top-left intersection, so a naive diff is ~100% bogus). | Reusing `compare.ts` pixelmatch for Figma-vs-code (would ship a "Diff" tab that lies). |
 | D7 | **Matching = explicit override map > normalized-name match > surfaced as `figma-only`/`code-only`.** Component-level only in v1; variants listed side-by-side per source (no cross-source variant link). User-overridable in the UI. | Honest "unmatched" beats a wrong silent match in a DS tool; normalization handles the common case with zero input. | Fuzzy/AI auto-match (silent wrong pairs); exact-name only (everything unmatched). |
 | D8 | **Web app = prebuilt, zero-build, committed vanilla-ES-module SPA** served by a tiny `node:http` server (run via the bundled `tsx`, **no new deps**). | "Ships inside a plugin, no per-user build step." A 2-screen app needs no framework; CSS custom properties give theming with zero runtime. | React/Vite (build step + committed bundle); Express (transitive-dep weight). Preact is a documented maintainer-side upgrade path. |
-| D9 | **Server: loopback-only (`127.0.0.1`), OS-assigned port, launched backgrounded/detached, pidfile single-instance, token never reaches the browser.** | A foreground `listen()` would hang the agent turn; loopback + CSP + server-only token = minimal attack surface; the page is a pure consumer of already-fetched data. | Foreground server (hangs the turn); `0.0.0.0` (LAN exposure); proxying live Figma at view time (online dependence + rate-limit exposure). |
+| D9 | **Server: loopback-only (`127.0.0.1`), OS-assigned port, launched backgrounded/detached, pidfile single-instance.** The page makes **zero external calls** — it's a pure consumer of already-captured images (and there's no token anywhere to leak). | A foreground `listen()` would hang the agent turn; loopback + CSP = minimal surface. | Foreground server (hangs the turn); `0.0.0.0` (LAN exposure). |
 | D10 | **Config grows by an additive, validated `figma?` block** (`parseFigma`, mirroring `parseTokens`). Absent `figma` = today's code-only behavior, byte-for-byte. | Backward compatibility must be **proven** (parseConfig returns a fixed object and drops unknown keys), not assumed. | Asserting "compatible by construction" (false); a separate config file (drift). |
+| D11 | **Multi-Figma-file in v1:** `figma.files: [{ key, label? }]` (a single `fileKey` string accepted as a one-file shorthand). Matching is namespaced per file; the gallery gets a library filter. | A design system often spans several Figma files; supporting it now avoids a later schema break. | Single-file only (a real DS outgrows it). **MCP caveat:** the MCP is bound to the *currently-open* desktop file, so `/visual-sync` syncs the open file and maps it by key — see §8. |
 
 ---
 
@@ -220,35 +226,36 @@ re-run (this is why no "collapse identical ticks" mechanism is needed).
 
 ---
 
-## 8. Figma access & security
+## 8. Figma access (via the Figma MCP)
 
-**Endpoints used** (verify exact limits against live June-2026 Figma docs before shipping — see
-[Open questions](#16-open-questions)):
+Studio reads Figma through the **Figma desktop MCP** (`mcp__figma-desktop`) — **no token, no REST,
+no rate limit.** Auth is whatever the user is already signed into in the Figma desktop app.
 
-| Purpose | Call | Notes |
+**MCP tools used:**
+
+| Purpose | MCP tool | Notes |
 |---|---|---|
-| Validate token + identity | `GET /v1/me` | cheapest auth proof |
-| File reachable by this seat | `GET /v1/files/:key?depth=1` | catches the **View-seat throttle** that `/v1/me` misses |
-| Published components | `GET /v1/files/:key/components`, `/component_sets` | **fall back to a tree scan** for `type===COMPONENT/COMPONENT_SET` when empty (unpublished) |
-| Render to image | `GET /v1/images/:key?ids=<batch>&format=png&scale=2` (svg for vectors) | URLs **expire (~30 days)** → download eagerly; batch ids per call |
+| Enumerate components | `get_metadata` | returns the node tree of the open file / a node subtree; we pick `type===COMPONENT`/`COMPONENT_SET` nodes (a set = a component, its children = variants). |
+| Capture the design image | `get_screenshot` | a faithful render of a node by id → the **Figma baseline** PNG (no expiring-URL/rate-limit concerns). |
+| Tokens / variables | `get_variable_defs` | design-token values for the component (feeds the existing token features). |
+| Extra context | `get_design_context` | optional richer node context for descriptions / props. |
 
-**Token handling (the security boundary):**
-- Resolution precedence: `flag` > `VISUAL_GUARD_FIGMA_TOKEN` > `FIGMA_TOKEN` >
-  `CLAUDE_PLUGIN_OPTION_FIGMA_TOKEN`, resolved at read time.
-- Opt-in persist to `.visual-guard.env` (atomic temp+rename, `chmod 0600`, merge-preserving).
-  `/visual-init` **adds an explicit `.visual-guard.env` line to `.gitignore`** (the `.env.*` glob
-  does **not** match it) and verifies with `git check-ignore`.
-- **Never** written to `visual.config.json`, the DB, manifests, logs, or thumbnails. A single
-  `maskToken()` / `scrubSecrets()` runs on every surfaced string. A test asserts no `figd_` token
-  appears in any artifact or thrown error.
+**Availability check (the honest "can we reach Figma?"):** before a sync, probe that the
+`mcp__figma-desktop` server is present and a file is open (a cheap `get_metadata`). If it isn't,
+**stop with an actionable message**: *"Open your Figma file in the Figma desktop app, then re-run
+`/visual-sync`."* (Per the runtime's own caveat, an interactively-authenticated MCP may be absent in
+headless/cron runs — which is exactly why the Figma side is interactive-only and there's no CI parity.)
 
-**Access check** (the honest "can we reach Figma?"): two-stage `GET /v1/me` then
-`GET /v1/files/:key?depth=1`, branching on `401` (bad token) / `403` (no file access) / `404`
-(wrong key) / `429` (View-seat throttle / rate limit) / network (offline), each with actionable copy.
+**No secret, no security surface.** There is no PAT, no `.visual-guard.env`, no masking/scrubbing.
+Studio persists only **images + non-secret metadata** (node ids, names, variant defs). This is the
+biggest simplification of choosing MCP over REST.
 
-**File key:** accept a pasted Figma URL or a bare key; normalize with one regex
-(`figma.(com|site)/(file|design|board|proto|slides)/<key>`), parse optional `?node-id`. Store the
-bare (non-secret) `fileKey` in `visual.config.json`.
+**File key + multi-file (D11):** config lists `figma.files: [{ key, label? }]`. A pasted Figma URL
+is normalized to a bare key with one regex (`figma.(com|site)/(file|design|board|proto|slides)/<key>`)
+for convenience. **Because the MCP is bound to the *currently-open* desktop file,** `/visual-sync`
+syncs the file that is open, identifies it by its key, and maps it to the matching `figma.files`
+entry; to sync several files the user opens each and re-runs (or runs `/visual-sync <label>`). The
+stored key is non-secret and committed in `visual.config.json`.
 
 ---
 
@@ -257,25 +264,24 @@ bare (non-secret) `fileKey` in `visual.config.json`.
 ### 9.1 Enumeration
 - **Code side:** reuse `targets.ts` Storybook `/index.json` discovery — a story title's last
   segment is the **component**, each story is a **variant/state** (the existing `componentFromTitle`
-  grouping).
-- **Figma side:** published `components` / `component_sets` (a `COMPONENT_SET` = a component, its
-  child `COMPONENT`s = variants), with a tree-scan fallback when the published list is empty.
+  grouping). Engine-driven, headless.
+- **Figma side (via MCP):** `get_metadata` on the open file → pick `COMPONENT` / `COMPONENT_SET`
+  nodes (a set = a component, its child components = variants). Agent-driven.
 
 ### 9.2 Matching (D7)
-Override map wins → normalized-name match → leftovers surfaced as `figma-only` / `code-only`
-(never dropped). Accepted pairs persist as `figma.componentMap`. Component-level only in v1.
+Override map wins → normalized-name match (Figma node name ↔ code component name) → leftovers
+surfaced as `figma-only` / `code-only` (never dropped). Accepted pairs persist as
+`figma.componentMap`. Component-level only in v1.
 
-### 9.3 The concurrency model (D5 — the correction)
-- **Network fan-out lives in a `tsx` engine script** (`scripts/studio/figma-export.ts` /
-  `sync.ts`): a bounded in-process concurrency limiter (default 6), batched `GET /v1/images`
-  (≤ a verified ids-per-call cap), **eager** download of the expiring S3 URLs (no barrier — a slow
-  tail must not outlive its URL; on a 404 it **re-exports**, not just re-downloads), and shared
-  `Retry-After` backoff (reuse the ds-bridge 3×-retry client pattern).
-- **The dynamic Workflow** (`skills/visual-sync/`) orchestrates the *phases* with visible progress
-  and reserves subagent fan-out for **LLM work**: judging ambiguous component matches and
-  classifying conformance ("spacing drift", "off-palette"). The token is passed to the engine by
-  **env-var name only**, never as a value.
-- **Code capture** reuses `capture.ts` (Playwright) unchanged.
+### 9.3 The concurrency model (D5)
+- **Figma capture = the `/visual-sync` dynamic Workflow fanning out subagents over the MCP.** MCP
+  tools are agent-callable only, so this is both the correct *and* the fast model: `get_metadata`
+  enumerates once, then subagents capture batches of component nodes in parallel via `get_screenshot`,
+  saving each PNG and recording its snapshot through the engine. No rate limit to bound; fan-out is
+  capped at the workflow's concurrency default. *(This is the "use dynamic workflows to speed up
+  Figma access" idea — now the right tool, because MCP is agent-driven.)*
+- **Code capture = the engine** (`capture.ts` / Playwright), driven by `scripts/studio/sync.ts`
+  (headless-capable, reused unchanged).
 
 ### 9.4 Compare (D6)
 - `current_vs_baseline` = `diff.ts` pixelmatch vs. the previous **code** snapshot → real regression.
@@ -285,11 +291,14 @@ Override map wins → normalized-name match → leftovers surfaced as `figma-onl
 
 ### 9.5 Idempotency, incremental, resumable
 - Content-hash dedupe: identical bytes → no new history row.
-- Incremental: Figma re-export keyed on node `lastModified` / file `version`; code re-render keyed
-  on Storybook story-set hash + `uiGlobs` mtime (reuse `detect-ui-change.mjs`).
+- Incremental: code re-render keyed on Storybook story-set hash + `uiGlobs` mtime (reuse
+  `detect-ui-change.mjs`); Figma re-capture relies on **content-hash dedupe** (an identical
+  screenshot adds no history row), and skips unchanged nodes when `get_metadata` exposes a node
+  `lastModified`.
 - Resumable: per-component `sync_state` (`synced | figma-pending | code-pending | error`); a
   re-run retries only non-synced rows. A partial sync is a clearly-labeled valid state, never a
-  silent half-truth.
+  silent half-truth. (Figma sync requires the desktop app open; if it's closed mid-run, the
+  remaining components stay `figma-pending` and `/visual-sync` resumes them next time.)
 
 ---
 
@@ -305,8 +314,11 @@ Override map wins → normalized-name match → leftovers surfaced as `figma-onl
 - **Image serving:** by DB key, **path-confined** — normalize and hard-refuse any path outside
   `.visual-baselines/` or `.visual-guard/` (mirrors `baseline.ts`; a `..`-escape test is mandatory).
 - **Security:** CSP `default-src 'self'; img-src 'self' data:; connect-src 'self'; script-src 'self';
-  object-src 'none'; base-uri 'none'`. The token is **server-side only**; the browser makes zero
-  external calls and is served zero secrets.
+  object-src 'none'; base-uri 'none'`. The browser makes **zero external calls** — there is no token
+  anywhere, and the page only consumes already-captured local images.
+- **Sync button:** `POST /api/sync` re-runs the **code** capture (engine, headless). The **Figma**
+  capture needs the MCP (agent-only), so the button's Figma action is "run `/visual-sync` in Claude
+  Code (Figma desktop open)" rather than a server-triggered fetch.
 - **Freshness:** manual Refresh + re-query on window focus; SSE is a later additive upgrade.
 
 ---
@@ -394,9 +406,10 @@ subtle shadows (borders at rest, shadow on hover); full **light + dark** via `[d
 pair meets **WCAG AA**.
 
 ### 11.5 States & a11y
-First-run panel (Connect Figma & Sync, with a "your token stays on this machine" note), streaming
-skeleton cards during sync (cards resolve in place — value appears within seconds), empty-filter,
-and **inline, non-blocking** errors (token missing → code halves still render; 429 → stale chip;
+First-run panel ("Open your Figma file in the desktop app, then run `/visual-sync`" — no token to
+enter), streaming skeleton cards during sync (cards resolve in place — value appears within
+seconds), empty-filter, and **inline, non-blocking** errors (Figma desktop not open / MCP
+unavailable → code halves still render, Figma halves show "Open Figma & run /visual-sync";
 per-component sync-failed retry; code-render-missing shows the URL it tried). Full keyboard map,
 focus rings, alt text from metadata, live-region sync progress.
 
@@ -408,21 +421,24 @@ focus rings, alt text from metadata, live-region sync progress.
 install plugin
    └─ /visual-setup        engine consent install (already shipped)
    └─ /visual-init         project config wizard — NOW also a "Design system (Figma)" section:
-        • paste Figma file URL/key   • name the token env var (validate with the access check)
-        • offer opt-in secure persist   • auto-map Figma↔code components (confirm/edit/add)
+        • paste Figma file URL(s) → file key(s) + label(s)   • NO token to enter
+        • check the Figma MCP is available (desktop app open?)   • auto-map Figma↔code (confirm/edit/add)
         • offer to run the first sync
-   └─ /visual-sync         dedicated sync → populates studio.db (code first, Figma streams in)
-   └─ /visual-app          opens the bundled localhost SPA → components visible immediately
+   └─ /visual-sync         dedicated sync → populates studio.db (code via engine; Figma via the MCP workflow)
+   └─ /visual-studio       opens the bundled localhost SPA → components visible immediately
 ```
 
 - The Figma section is **fully skippable** — code-only mode is the on-ramp and works with zero
   Figma config (timeline = the existing approved-baseline lineage; first sync seeds one tick).
-- **Be honest:** design-system *parity* value requires Figma; code-only is today's self-regression
-  tool with a catalog UI. The gallery leads with a non-nagging "Connect Figma to see designs"
-  affordance, never empty frames or a blocking spinner.
-- **Config delta** (additive, backward-compatible — D10):
+- **Be honest:** design-system *parity* value requires Figma (and the Figma desktop app open for a
+  sync); code-only is today's self-regression tool with a catalog UI. The gallery leads with a
+  non-nagging "Open Figma & run /visual-sync to see designs" affordance, never empty frames.
+- **Config delta** (additive, backward-compatible — D10/D11; **no token**):
   ```jsonc
-  "figma": { "fileKey": "abc123", "tokenEnv": "FIGMA_TOKEN", "componentMap": { "BtnPrimary": "Button" }, "scale": 2 },
+  "figma": {
+    "files": [{ "key": "abc123", "label": "Core" }],
+    "componentMap": { "BtnPrimary": "Button" }
+  },
   "studio": { "retainPerSource": 20, "retainCurrent": 3, "pruneOrphanBlobs": true }
   ```
 
@@ -432,9 +448,9 @@ install plugin
 
 | Command | What it does |
 |---|---|
-| `/visual-init` *(extended)* | adds the optional **Design system (Figma)** section (file key, token, access check, mapping, offer sync). |
+| `/visual-init` *(extended)* | adds the optional **Design system (Figma)** section (file key(s), Figma-MCP availability check, component mapping, offer sync — **no token**). |
 | `/visual-sync` *(new)* | runs the sync (Figma fetch + code capture → DB). Re-runnable; incremental; resumable. |
-| `/visual-app` *(new)* | boots the bundled localhost web app (backgrounded) and opens the browser. |
+| `/visual-studio` *(new)* | boots the bundled localhost web app (backgrounded) and opens the browser. |
 
 Every command keeps the existing engine-detect-and-consent preflight (`install-deps.mjs --check`).
 `/visual-ci` is **unchanged** and consumes only the regression axis — conformance never gates a build.
@@ -453,28 +469,39 @@ Every command keeps the existing engine-detect-and-consent preflight (`install-d
 ## 15. Non-goals (v1)
 
 - Per-variant cross-source parity badges (variants shown side-by-side per source; linking is v2).
-- Browser-side token entry (the web "Connect Figma" CTA **instructs/deep-links** to the terminal
-  flow — it never captures a secret).
+- The **REST/PAT provider** and therefore **headless / CI / server-triggered Figma sync** — Figma is
+  interactive-only via the MCP in v1 (code regression still runs headless/CI). REST is a
+  designed-for future provider.
 - Figma-side "where used" (code usage via grep only).
-- Multi-Figma-file libraries (single `fileKey`; `fileKeys[]` is a designed-for future).
 - Conformance as a gate, ever.
 - Non-Storybook app-route targets as Studio components.
 
 ---
 
-## 16. Open questions (need a decision before/within implementation)
+## 16. Decisions (resolved)
 
-1. **Token env name to lead with:** `FIGMA_TOKEN` (instant reuse if already set for ds-bridge) vs.
-   `VISUAL_GUARD_FIGMA_TOKEN` (no collisions). *Recommendation: accept both, lead docs with
-   `FIGMA_TOKEN`.* Should we also read ds-bridge's `.ds-bridge.env` (convenient, but couples plugins)?
-2. **Commit Figma baseline PNGs?** Default yes (team-shared design history, content-addressed +
-   retention-bounded) — but it adds binary churn; offer a gitignore-and-rebuild-from-Figma opt-out.
-3. **Verified Figma limits:** the per-`/v1/images` ids cap, rate ceiling, and URL expiry must be
-   pinned against **live June-2026 docs** (RULES flags Figma knowledge as possibly outdated) before
-   the concurrency defaults (6 / batch ≤50) are trusted.
-4. **Command names:** `/visual-app` vs `/visual-studio`? (Spec uses `/visual-app`.)
-5. **Multi-file** support timing (`fileKey` vs `fileKeys[]`).
-6. **"Used in"** depth in v1 (code-grep only confirmed; Figma-instance usage deferred).
+All prior open questions are now locked:
+
+1. **Figma access = the Figma MCP — no token.** Figma is read through `mcp__figma-desktop`; there is
+   **no PAT, env var, or secret file** to manage. *(If a REST provider is ever added for CI parity,
+   it would lead with `FIGMA_TOKEN`; not in v1.)*
+2. **Commit Figma baseline PNGs:** **yes** — committed under `.visual-baselines/.figma/`,
+   content-addressed (dedupes identical frames) and retention-bounded, so design history is
+   team-shared. A documented opt-out (gitignore `.figma/` + rebuild-from-Figma) exists for
+   repo-size-sensitive teams.
+3. **Figma constraint = the desktop app must be open** (the MCP is bound to the loaded file). No REST
+   rate limit and no expiring URLs to manage. A sync is **interactive-only** (no headless/CI Figma);
+   capture parallelism is **subagent fan-out** in the `/visual-sync` workflow (§9.3). *(The verified
+   REST limits — Tier-1 10/15/20 req-min, 30-day image-URL expiry — are recorded only for the future
+   REST provider; they don't apply to the MCP path.)*
+4. **Command name:** **`/visual-studio`** (opens the bundled web app).
+5. **Multi-Figma-file libraries: in v1.** Config takes `figma.files: [{ key, label? }]` (a single
+   `fileKey` string is accepted as a one-file shorthand). Matching is namespaced per file; the
+   gallery gets a library filter (§11.2). With MCP, syncing a given file requires that file open.
+6. **"Used in":** **code-grep only in v1** (Figma-side instance usage deferred to v2).
+
+Remaining standing rule (not a question): conformance (`figma_vs_code`) is **advisory forever** —
+never a CI gate.
 
 ---
 
@@ -482,10 +509,10 @@ Every command keeps the existing engine-detect-and-consent preflight (`install-d
 
 | Risk | Mitigation | Phase |
 |---|---|---|
-| PAT leak (config/DB/logs/committed) | single mask/scrub, opt-in `0600` file, explicit gitignore + `git check-ignore`, "token never in artifacts" test | P0 |
+| Figma MCP unavailable (desktop app closed) | availability check before sync → actionable "open Figma & re-run"; un-captured components stay `figma-pending` and resume next sync | P0/P2 |
+| Figma sync is interactive-only (no CI/headless) | documented; **code regression still runs headless/CI**; the REST provider is the future path if CI design-parity is ever needed | — |
+| Bulk MCP capture is agent-token-cost / slow on big libraries | bounded subagent fan-out + content-hash **incremental** (only changed nodes re-captured); code-first so value shows immediately | P2/P5 |
 | `better-sqlite3` native build | reuse the proven `sharp` bootstrap; prebuilds for Node 20; verify bridge resolution | P1 |
-| Figma rate limits / expiring URLs | bounded in-process concurrency + `Retry-After` backoff; eager download; **re-export** on 404 | P2 |
-| View-seat throttle | two-stage access check before the fan-out | P0 |
 | Cross-source diff is noisy | conformance is a **separate, advisory** axis; overlay-first; never the pixel gate | P1/P5 |
 | Blocking server hangs the agent turn | server launched **backgrounded/detached**; pidfile reopens instead of double-starting | P3 |
 | Path traversal serving PNGs | hard path-confinement + escape test (mirrors `baseline.ts`) | P3 |
