@@ -28,7 +28,7 @@
  *
  * ENGINE_DEPS is kept in sync with `dependencies` in ../package.json, plus `tsx` (the runner).
  */
-import { execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -278,7 +278,57 @@ export function resolveDataDir(env = process.env) {
   return null;
 }
 
-function main() {
+/**
+ * Run a child process to completion, streaming its output to our inherited stdout/stderr while
+ * emitting a periodic heartbeat so a long, quiet phase never *looks* frozen. Used for the two slow
+ * install phases (npm + Chromium) so the user can see the engine setup is alive and progressing.
+ *
+ * Why plain lines and not a `\r` spinner: under the SessionStart hook and under a slash command's
+ * Bash, stdout is NOT a TTY, so a carriage-return progress bar wouldn't render — appended lines read
+ * as progress in every context (and the child's own npm/Playwright progress streams in between).
+ *
+ * The heartbeat timer is `unref`'d so it never keeps the process alive on its own; the awaited child
+ * handle is what holds the event loop open until "close".
+ *
+ * @param {string} label    Phase label, e.g. "▸ 2/2 Downloading Chromium (~150 MB)…"
+ * @param {string} command  Executable to run.
+ * @param {string[]} args   Arguments.
+ * @param {{ cwd: string, env: NodeJS.ProcessEnv }} opts
+ * @returns {Promise<void>} resolves on exit 0, rejects on spawn error or non-zero exit.
+ */
+export function runStep(label, command, args, opts) {
+  return new Promise((resolveStep, rejectStep) => {
+    const startedAt = Date.now();
+    const elapsed = () => Math.round((Date.now() - startedAt) / 1000);
+    process.stderr.write(`[visual-guard] ${label}\n`);
+
+    const child = spawn(command, args, { cwd: opts.cwd, env: opts.env, stdio: "inherit" });
+
+    const heartbeat = setInterval(() => {
+      process.stderr.write(`[visual-guard]   … still working (${elapsed()}s)\n`);
+    }, 6000);
+    if (typeof heartbeat.unref === "function") {
+      heartbeat.unref();
+    }
+
+    const finish = (fn, arg) => {
+      clearInterval(heartbeat);
+      fn(arg);
+    };
+
+    child.on("error", (err) => finish(rejectStep, err));
+    child.on("close", (code) => {
+      if (code === 0) {
+        process.stderr.write(`[visual-guard]   ✓ done (${elapsed()}s)\n`);
+        finish(resolveStep, undefined);
+      } else {
+        finish(rejectStep, new Error(`${command} exited with code ${code}`));
+      }
+    });
+  });
+}
+
+async function main() {
   // `--check`: read-only install-state inspection for the /visual-setup consent gate. Prints the
   // computeInstallState() JSON to STDOUT and exits 0 — ALWAYS, even when the data dir can't be
   // resolved — so a mid-session Bash invocation never shows a hard error. Installs nothing.
@@ -367,26 +417,27 @@ function main() {
     // The marker must exist for `npm install` to read it, but must NOT survive a failure.
     writeFileSync(markerPath, manifest);
 
-    console.error(
-      "[visual-guard] Installing engine deps + Chromium into the plugin data dir (one-time)…",
+    process.stderr.write(
+      "[visual-guard] Setting up the engine (one-time): runtime deps + a pinned Chromium " +
+        `(~150 MB) → ${dataDir}\n`,
     );
 
-    execFileSync("npm", ["install", "--no-audit", "--no-fund", "--no-package-lock"], {
+    // Two streamed phases, each with a heartbeat so a long, quiet download never looks frozen.
+    await runStep(
+      "▸ 1/2 Installing engine packages (npm)…",
+      "npm",
+      ["install", "--no-audit", "--no-fund", "--no-package-lock"],
+      { cwd: dataDir, env },
+    );
+    await runStep("▸ 2/2 Downloading Chromium (~150 MB)…", playwrightBin, ["install", "chromium"], {
       cwd: dataDir,
       env,
-      stdio: "inherit",
-    });
-
-    execFileSync(playwrightBin, ["install", "chromium"], {
-      cwd: dataDir,
-      env,
-      stdio: "inherit",
     });
 
     // Deps + browser are in place — now wire them to the plugin root so the engine is runnable.
     refreshBridge();
 
-    console.error("[visual-guard] Engine deps ready.");
+    process.stderr.write("[visual-guard] ✓ Engine ready — deps + Chromium installed.\n");
     process.exit(0);
   } catch (err) {
     // Leave NO marker behind so the next session retries from a clean slate.
@@ -404,5 +455,9 @@ const invokedDirectly =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (invokedDirectly) {
-  main();
+  main().catch((err) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[visual-guard] Dependency bootstrap failed: ${message}`);
+    process.exit(1);
+  });
 }

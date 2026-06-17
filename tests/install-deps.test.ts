@@ -33,7 +33,7 @@ interface InstallState {
 }
 
 const installDepsSpecifier = "../scripts/install-deps.mjs";
-const { ensureBridgeLink, ENGINE_DEPS, computeInstallState, desiredManifest, resolveDataDir } =
+const { ensureBridgeLink, ENGINE_DEPS, computeInstallState, desiredManifest, resolveDataDir, runStep } =
   (await import(installDepsSpecifier)) as {
     ensureBridgeLink: (
       rootNodeModules: string,
@@ -43,6 +43,12 @@ const { ensureBridgeLink, ENGINE_DEPS, computeInstallState, desiredManifest, res
     computeInstallState: (dataDir: string) => InstallState;
     desiredManifest: () => string;
     resolveDataDir: (env?: Record<string, string | undefined>) => string | null;
+    runStep: (
+      label: string,
+      command: string,
+      args: string[],
+      opts: { cwd: string; env: NodeJS.ProcessEnv },
+    ) => Promise<void>;
   };
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -279,6 +285,28 @@ describe("computeInstallState (--check inspection)", () => {
     expect(state.missing).toContain("deps");
     expect(state.missing).toContain("browser");
     expect(state.missing).toContain("marker");
+  });
+});
+
+describe("runStep — streamed install phase with heartbeat", () => {
+  const opts = { cwd: process.cwd(), env: process.env };
+
+  it("resolves when the child exits 0", async () => {
+    await expect(
+      runStep("test step", process.execPath, ["-e", "process.exit(0)"], opts),
+    ).resolves.toBeUndefined();
+  });
+
+  it("rejects with the exit code when the child exits non-zero", async () => {
+    await expect(
+      runStep("test step", process.execPath, ["-e", "process.exit(3)"], opts),
+    ).rejects.toThrow(/code 3/);
+  });
+
+  it("rejects when the command cannot be spawned", async () => {
+    await expect(
+      runStep("test step", "definitely-not-a-real-binary-xyz", [], opts),
+    ).rejects.toBeInstanceOf(Error);
   });
 });
 
