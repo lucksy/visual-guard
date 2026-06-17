@@ -128,6 +128,17 @@ describe("parseConfig — validation (actionable, names the field)", () => {
   it("throws naming viewports when it holds a non-positive number", () => {
     expect(() => parseConfig({ ...minimal, viewports: [0] })).toThrow(/viewports/);
   });
+
+  it("accepts a positive-integer concurrency and omits it when absent", () => {
+    expect(parseConfig({ ...minimal, concurrency: 12 }).concurrency).toBe(12);
+    expect(parseConfig(minimal).concurrency).toBeUndefined();
+  });
+
+  it("throws naming concurrency when it is not a positive integer", () => {
+    expect(() => parseConfig({ ...minimal, concurrency: 0 })).toThrow(/concurrency/);
+    expect(() => parseConfig({ ...minimal, concurrency: 2.5 })).toThrow(/concurrency/);
+    expect(() => parseConfig({ ...minimal, concurrency: "lots" })).toThrow(/concurrency/);
+  });
 });
 
 describe("parseConfig — tokens (multi-format, back-compat)", () => {

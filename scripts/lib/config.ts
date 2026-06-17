@@ -123,6 +123,11 @@ export interface Config {
   figma?: FigmaConfig;
   /** Studio retention knobs (always defaulted). */
   studio: StudioConfig;
+  /**
+   * Capture-pool worker count. Absent → auto (cores-based). Raise it for large design systems to
+   * capture more renders in parallel; the engine clamps it to the number of renders in a run.
+   */
+  concurrency?: number;
 }
 
 const DEFAULTS = {
@@ -506,6 +511,8 @@ export function parseConfig(raw: unknown): Config {
   const tokens = parseTokens(raw.tokens);
   const figma = parseFigma(raw.figma);
   const studio = parseStudio(raw.studio);
+  const concurrency =
+    raw.concurrency === undefined ? undefined : asPositiveInteger(raw.concurrency, "concurrency");
 
   return {
     detect,
@@ -531,6 +538,8 @@ export function parseConfig(raw: unknown): Config {
     // Only attach `figma` when present, so a config without it stays byte-identical to before (D10).
     ...(figma !== undefined ? { figma } : {}),
     studio,
+    // Likewise additive: absent `concurrency` keeps the config shape unchanged (engine auto-sizes).
+    ...(concurrency !== undefined ? { concurrency } : {}),
   };
 }
 

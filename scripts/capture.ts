@@ -1,4 +1,5 @@
 import { mkdirSync, writeFileSync } from "node:fs";
+import { availableParallelism, cpus } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { chromium } from "playwright";
@@ -41,13 +42,16 @@ export interface CliArgs {
   config: string;
   target?: string;
   runId?: string;
+  /** Capture pool size override (`--concurrency N`); falls back to config, then auto. */
+  concurrency?: number;
 }
 
-/** Parse `--config <path> --target <name> --run <id>`; unknown flags / missing values throw. */
+/** Parse `--config <path> --target <name> --run <id> --concurrency <n>`; unknown flags / missing values throw. */
 export function parseArgs(argv: string[]): CliArgs {
   let config = "config/visual.config.json";
   let target: string | undefined;
   let runId: string | undefined;
+  let concurrency: number | undefined;
 
   const value = (index: number, flag: string): string => {
     const next = argv[index];
@@ -69,12 +73,36 @@ export function parseArgs(argv: string[]): CliArgs {
       case "--run":
         runId = value(++i, "--run");
         break;
+      case "--concurrency": {
+        const raw = value(++i, "--concurrency");
+        const parsed = Number(raw);
+        if (!Number.isInteger(parsed) || parsed < 1) {
+          fail(`--concurrency must be a positive integer (got ${JSON.stringify(raw)}).`);
+        }
+        concurrency = parsed;
+        break;
+      }
       default:
         fail(`unknown argument ${JSON.stringify(arg)}.`);
     }
   }
 
-  return { config, target, runId };
+  return { config, target, runId, concurrency };
+}
+
+/**
+ * Resolve the capture pool's worker count. An explicit request (config `concurrency` or
+ * `--concurrency`) wins, floored to an integer ≥ 1. Otherwise default to a modest fraction of the
+ * machine's cores (cores − 1, clamped to 2..8): enough to be several times faster than serial
+ * without overwhelming a dev server or RAM. Design systems with thousands of components can raise
+ * it explicitly. The caller clamps the result down to the number of renders.
+ */
+export function resolveConcurrency(requested: number | undefined, cores: number): number {
+  if (requested !== undefined && Number.isFinite(requested) && requested >= 1) {
+    return Math.floor(requested);
+  }
+  const usableCores = Number.isFinite(cores) && cores > 0 ? Math.floor(cores) : 4;
+  return Math.min(Math.max(usableCores - 1, 2), 8);
 }
 
 /** The shared relative key for a render — used under current/, baseline/, and diff/. */
@@ -187,6 +215,12 @@ export interface CaptureOptions {
    * harness + Studio-sync paths, where one auto-generated story must not nuke the entire run.
    */
   failFast?: boolean;
+  /**
+   * Capture-pool worker count. Absent → auto (cores-based, see {@link resolveConcurrency}). Each
+   * worker owns an isolated browser context; the R1 determinism settings are per-context, so the
+   * pool size never changes a single render's pixels — only how many render in parallel.
+   */
+  concurrency?: number;
 }
 
 export interface CaptureDeps {
@@ -284,58 +318,125 @@ export async function captureAll(
 
   const written: string[] = [];
   const renders: Record<string, RenderRecord> = {};
+
+  // Bounded-concurrency capture: a pool of workers pulls renders off a shared index queue, each
+  // owning an isolated browser context (the R1 determinism settings are per-context, so running
+  // many in parallel never changes a single render's pixels). Results are slotted by the target's
+  // ORIGINAL index, so `written`/`renders` stay in config/target order regardless of which worker
+  // finishes first. With failFast, the first failure stops new work being pulled and is rethrown
+  // after the in-flight renders drain and the browser closes.
+  const cores = availableParallelism?.() ?? cpus().length;
+  const workerCount = Math.min(resolveConcurrency(options.concurrency, cores), targets.length);
+
+  type Slot = { rel: string; record: RenderRecord; wrote: boolean };
+  const slots: Array<Slot | null> = new Array(targets.length).fill(null);
+  let nextIndex = 0;
+  let aborted = false;
+  let firstError: unknown = null;
+
   const browser = await deps.launch();
-  try {
-    for (const target of targets) {
-      const context = await browser.newContext(contextOptions(target.viewport));
+
+  /** Capture one render end-to-end in its own context. Throws (failFast) or returns an error slot. */
+  const captureOne = async (target: RenderTarget): Promise<Slot> => {
+    const rel = renderRelPath(target);
+    const context = await browser.newContext(contextOptions(target.viewport));
+    try {
+      // Freeze animations/transitions BEFORE any page CSS/JS runs, so a load-time animation is
+      // never captured mid-flight (R1).
+      await context.addInitScript(FREEZE_INIT_SCRIPT);
+      const page = await context.newPage();
       try {
-        // Freeze animations/transitions BEFORE any page CSS/JS runs, so a load-time
-        // animation is never captured mid-flight (R1).
-        await context.addInitScript(FREEZE_INIT_SCRIPT);
-        const page = await context.newPage();
-        const rel = renderRelPath(target);
         try {
-          try {
-            await page.goto(target.url, { waitUntil: "networkidle", timeout: navTimeoutMs });
-            // Belt-and-suspenders freeze for any style inserted late, then wait for fonts /
-            // images to settle and reset scroll before the shot.
-            await page.addStyleTag({ content: FREEZE_STYLE });
-            await page.evaluate(SETTLE_SCRIPT);
-            const buffer = await page.screenshot({ fullPage: true });
-            deps.writeFile(join(currentDir, rel), buffer);
-            written.push(rel);
-            // Persist the render's identity + dimensions for manifest v2 (T-13), keyed by the
-            // same relative path compare/report key on — so the reviewer can re-render it live.
-            renders[rel] = {
+          await page.goto(target.url, { waitUntil: "networkidle", timeout: navTimeoutMs });
+          // Belt-and-suspenders freeze for any style inserted late, then wait for fonts / images
+          // to settle and reset scroll before the shot.
+          await page.addStyleTag({ content: FREEZE_STYLE });
+          await page.evaluate(SETTLE_SCRIPT);
+          const buffer = await page.screenshot({ fullPage: true });
+          deps.writeFile(join(currentDir, rel), buffer);
+          // Persist the render's identity + dimensions for manifest v2 (T-13), keyed by the same
+          // relative path compare/report key on — so the reviewer can re-render it live.
+          return {
+            rel,
+            wrote: true,
+            record: {
               url: target.url,
               kind: target.kind,
               viewport: target.viewport,
               currentDimensions: readPngDimensions(buffer),
-            };
-          } catch (err) {
-            // failFast (default): a down/broken render aborts the run loudly. Tolerant mode
-            // (managed harness / Studio sync): record the error, write NO png, and keep going so a
-            // single bad story can't nuke the whole capture — report surfaces it from renders.json.
-            if (failFast) {
-              fail(`failed to capture ${target.instance}/${target.name} (${target.url}): ${detailOf(err)}`);
-            }
-            renders[rel] = {
+            },
+          };
+        } catch (err) {
+          // failFast (default): a down/broken render aborts the run loudly. Tolerant mode (managed
+          // harness / Studio sync): record the error, write NO png, and keep going so a single bad
+          // story can't nuke the whole capture — report surfaces it from renders.json.
+          if (failFast) {
+            fail(`failed to capture ${target.instance}/${target.name} (${target.url}): ${detailOf(err)}`);
+          }
+          return {
+            rel,
+            wrote: false,
+            record: {
               url: target.url,
               kind: target.kind,
               viewport: target.viewport,
               currentDimensions: null,
               error: detailOf(err),
-            };
-          }
-        } finally {
-          await page.close();
+            },
+          };
         }
       } finally {
-        await context.close();
+        await page.close();
+      }
+    } finally {
+      await context.close();
+    }
+  };
+
+  const worker = async (): Promise<void> => {
+    while (!aborted) {
+      const index = nextIndex++;
+      if (index >= targets.length) {
+        return;
+      }
+      const target = targets[index];
+      if (target === undefined) {
+        return;
+      }
+      try {
+        slots[index] = await captureOne(target);
+      } catch (err) {
+        // failFast: captureOne threw — keep the FIRST error and stop the pool pulling new work.
+        if (firstError === null) {
+          firstError = err;
+        }
+        aborted = true;
+        return;
       }
     }
+  };
+
+  try {
+    await Promise.all(Array.from({ length: Math.max(1, workerCount) }, () => worker()));
   } finally {
     await browser.close();
+  }
+
+  // failFast: rethrow the first failure only after the browser is closed (no leaked Chromium).
+  if (firstError !== null) {
+    throw firstError instanceof Error ? firstError : new Error(String(firstError));
+  }
+
+  // Flatten per-index slots in target order so written[]/renders are deterministic regardless of
+  // worker completion order.
+  for (const slot of slots) {
+    if (slot === null) {
+      continue;
+    }
+    renders[slot.rel] = slot.record;
+    if (slot.wrote) {
+      written.push(slot.rel);
+    }
   }
 
   // Sidecar the resolved render list next to compare.json/manifest.json so report.ts can
@@ -356,7 +457,13 @@ async function main(argv: string[]): Promise<void> {
   // A managed (VG-scaffolded) harness renders auto-generated stories that can error individually — be
   // tolerant so one bad story can't abort the whole run. A user's own server stays fail-fast (loud).
   const failFast = managedLadleTargets(config).length === 0;
-  const result = await captureAll(config, { target: args.target, runId: args.runId, failFast });
+  const result = await captureAll(config, {
+    target: args.target,
+    runId: args.runId,
+    failFast,
+    // `--concurrency` overrides the persisted config knob; both fall back to the cores-based default.
+    concurrency: args.concurrency ?? config.concurrency,
+  });
   console.log(`${PREFIX}: wrote ${result.written.length} render(s) -> ${result.currentDir}`);
 }
 

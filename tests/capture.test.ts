@@ -10,6 +10,7 @@ import {
   probeOrigins,
   readPngDimensions,
   renderRelPath,
+  resolveConcurrency,
   type CaptureDeps,
   type Launcher,
   type RendersFile,
@@ -46,6 +47,33 @@ describe("parseArgs", () => {
 
   it("throws on a flag missing its value", () => {
     expect(() => parseArgs(["--target"])).toThrow(/missing value/);
+  });
+
+  it("reads --concurrency as a positive integer", () => {
+    expect(parseArgs(["--concurrency", "6"]).concurrency).toBe(6);
+  });
+
+  it("throws on a non-positive or non-integer --concurrency", () => {
+    expect(() => parseArgs(["--concurrency", "0"])).toThrow(/positive integer/);
+    expect(() => parseArgs(["--concurrency", "2.5"])).toThrow(/positive integer/);
+    expect(() => parseArgs(["--concurrency", "x"])).toThrow(/positive integer/);
+  });
+});
+
+describe("resolveConcurrency", () => {
+  it("uses an explicit request (floored) when >= 1", () => {
+    expect(resolveConcurrency(5, 8)).toBe(5);
+    expect(resolveConcurrency(2.9, 8)).toBe(2);
+    expect(resolveConcurrency(1, 1)).toBe(1);
+    expect(resolveConcurrency(50, 4)).toBe(50); // explicit is not clamped — the caller does that
+  });
+
+  it("falls back to a cores-based default (cores−1, clamped 2..8) on absent/bogus request", () => {
+    expect(resolveConcurrency(undefined, 8)).toBe(7);
+    expect(resolveConcurrency(0, 8)).toBe(7); // < 1 → fallback
+    expect(resolveConcurrency(undefined, 1)).toBe(2); // clamp up to 2
+    expect(resolveConcurrency(undefined, 100)).toBe(8); // clamp down to 8
+    expect(resolveConcurrency(undefined, 0)).toBe(3); // unknown cores → assume 4 → 3
   });
 });
 
@@ -421,6 +449,50 @@ describe("captureAll", () => {
     expect(result.written).toEqual([
       "web/home/default@1280.png",
       "admin/home/default@1280.png",
+    ]);
+  });
+
+  it("preserves target order in `written` even when later renders finish first (concurrency)", async () => {
+    // Four stories; a launcher whose goto delay DECREASES with story order, so completion order is
+    // reversed (d, c, b, a) while the pool runs them in parallel. The index-slotted result must
+    // still come back in target order (a, b, c, d) — order is config-driven, never completion-driven.
+    const order = ["a--x", "b--x", "c--x", "d--x"];
+    const config = parseConfig({
+      targets: [{ type: "storybook", url: "http://localhost:6006", name: "components", stories: order }],
+      viewports: [1280],
+      states: ["default"],
+    });
+    const reverseCompletionLauncher: Launcher = async () => ({
+      newContext: async () => ({
+        addInitScript: async () => undefined,
+        newPage: async () => ({
+          goto: async (url: string) => {
+            const idx = order.findIndex((id) => url.includes(`id=${id}`));
+            // a (idx 0) waits longest → finishes last; d (idx 3) finishes first.
+            await new Promise((resolve) => setTimeout(resolve, (order.length - idx) * 10));
+            return null;
+          },
+          addStyleTag: async () => null,
+          evaluate: async () => undefined,
+          screenshot: async () => Buffer.from("PNG-BYTES"),
+          close: async () => undefined,
+        }),
+        close: async () => undefined,
+      }),
+      close: async () => undefined,
+    });
+
+    const result = await captureAll(
+      config,
+      { runId: "R", outRoot: ".vg-test", concurrency: 4 },
+      deps({ launch: reverseCompletionLauncher }),
+    );
+
+    expect(result.written).toEqual([
+      "components/a/x@1280.png",
+      "components/b/x@1280.png",
+      "components/c/x@1280.png",
+      "components/d/x@1280.png",
     ]);
   });
 
