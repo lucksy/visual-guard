@@ -1,16 +1,25 @@
-import { existsSync, mkdirSync, readdirSync, lstatSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   buildScaffoldConfig,
   candidatePorts,
   classifyTarget,
+  classifyProjectKind,
+  detectComponentLibrary,
+  detectHarness,
   detectTokenSources,
   scaffoldConfigObject,
+  type ComponentDir,
+  type ComponentLibrary,
+  type HarnessKind,
   type ProbeResult,
+  type ProjectKind,
   type ScaffoldInput,
 } from "./lib/init";
-import { JS_EVAL_FORMATS, type Target, type TokensConfig } from "./lib/config";
+import { JS_EVAL_FORMATS, type FigmaConfig, type Target, type TokensConfig } from "./lib/config";
+import { isReachable } from "./lib/reachable";
+import { detectFramework, pickHarnessFor, type Framework, type ScaffoldableHarness } from "./lib/harness/detect";
 
 /**
  * `/visual-init` CLI (T-24): the impure shell around `scripts/lib/init.ts`. It probes the common
@@ -40,7 +49,7 @@ function fail(message: string): never {
  */
 async function probePort(port: number, timeoutMs: number): Promise<ProbeResult> {
   const url = `http://localhost:${port}`;
-  const reachable = await isReachable(url, timeoutMs);
+  const reachable = await isReachable(url, { timeoutMs });
   if (!reachable) {
     return { url, reachable: false };
   }
@@ -50,20 +59,6 @@ async function probePort(port: number, timeoutMs: number): Promise<ProbeResult> 
     result.storyEntryCount = storyEntryCount;
   }
   return result;
-}
-
-/** Any HTTP response = reachable; a thrown fetch (ECONNREFUSED / abort) = unreachable. */
-async function isReachable(origin: string, timeoutMs: number): Promise<boolean> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    await fetch(origin, { signal: controller.signal });
-    return true;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /**
@@ -200,6 +195,156 @@ export function scanTokenFiles(root: string, maxDepth = 4): string[] {
 
 const toPosix = (path: string): string => path.split(sep).join("/");
 
+// --- Design-system scan (impure; finds the component layer + story-explorer harness) ---------
+
+/** UI component file extensions counted to size a component directory. */
+const UI_EXTENSIONS = [".tsx", ".jsx", ".vue", ".svelte"];
+/** Atomic-design subfolder names — their presence signals a design-system structure. */
+const ATOMIC_DIRS = new Set(["atoms", "molecules", "organisms"]);
+/** A story-explorer config FILE (Ladle/Histoire keep a root config; Storybook uses a `.storybook/` dir). */
+const isHarnessConfigFile = (entry: string): boolean =>
+  /^(ladle|histoire)\.config\.(c|m)?[jt]s$/i.test(entry);
+/** A story-explorer config DIR. */
+const isHarnessConfigDir = (entry: string): boolean => entry === ".storybook" || entry === ".ladle";
+
+/** Count UI component files (.tsx/.jsx/.vue/.svelte) in a directory subtree (bounded, lstat-safe). */
+function countUiFiles(dir: string, maxDepth = 4): number {
+  let count = 0;
+  const walk = (current: string, depth: number): void => {
+    let entries: string[];
+    try {
+      entries = readdirSync(current);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (SKIP_DIRS.has(entry) || entry.startsWith(".")) {
+        continue;
+      }
+      const full = join(current, entry);
+      let stat;
+      try {
+        stat = lstatSync(full);
+      } catch {
+        continue;
+      }
+      if (stat.isSymbolicLink()) {
+        continue;
+      }
+      if (stat.isDirectory()) {
+        if (depth < maxDepth) {
+          walk(full, depth + 1);
+        }
+      } else if (stat.isFile() && UI_EXTENSIONS.some((ext) => entry.toLowerCase().endsWith(ext))) {
+        count += 1;
+      }
+    }
+  };
+  walk(dir, 0);
+  return count;
+}
+
+export interface DesignSystemScan {
+  /** Story-explorer config dirs/files found (e.g. ".storybook", "ladle.config.ts"). */
+  harnessConfigs: string[];
+  /** Dependency names declared across the project's package.json files. */
+  deps: string[];
+  /** Candidate component directories (any dir named `components`) with their UI-file counts. */
+  componentDirs: ComponentDir[];
+  /** True when atomic-design subfolders were seen anywhere under the root. */
+  atomic: boolean;
+}
+
+/**
+ * Scan the project for its **design-system layer**: a story-explorer harness (Storybook/Ladle/Histoire,
+ * via a config dir/file or a declared dependency) and component directories (any `components/` dir,
+ * sized by its UI files), plus whether atomic-design folders are present. Bounded recursive walk that
+ * mirrors {@link scanTokenFiles} (lstat-based, skips heavy/generated dirs, never throws). The pure
+ * classifiers in `lib/init.ts` turn this into a {@link ProjectKind} the wizard branches on.
+ */
+export function scanDesignSystem(root: string, maxDepth = 4): DesignSystemScan {
+  const harnessConfigs = new Set<string>();
+  const deps = new Set<string>();
+  const componentDirs: ComponentDir[] = [];
+  let atomic = false;
+
+  const collectDeps = (pkgPath: string): void => {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as Record<string, unknown>;
+      for (const field of ["dependencies", "devDependencies", "peerDependencies"]) {
+        const block = pkg[field];
+        if (block && typeof block === "object") {
+          for (const name of Object.keys(block as Record<string, unknown>)) {
+            deps.add(name);
+          }
+        }
+      }
+    } catch {
+      /* unreadable / not JSON — ignore */
+    }
+  };
+
+  const walk = (current: string, depth: number): void => {
+    let entries: string[];
+    try {
+      entries = readdirSync(current);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (SKIP_DIRS.has(entry)) {
+        continue;
+      }
+      const full = join(current, entry);
+      let stat;
+      try {
+        stat = lstatSync(full);
+      } catch {
+        continue;
+      }
+      if (stat.isSymbolicLink()) {
+        continue;
+      }
+      if (stat.isFile()) {
+        if (entry === "package.json") {
+          collectDeps(full);
+        } else if (isHarnessConfigFile(entry)) {
+          harnessConfigs.add(toPosix(relative(root, full)));
+        }
+        continue;
+      }
+      if (!stat.isDirectory()) {
+        continue;
+      }
+      const lower = entry.toLowerCase();
+      if (isHarnessConfigDir(lower)) {
+        harnessConfigs.add(toPosix(relative(root, full)));
+        continue; // don't descend into a harness config dir
+      }
+      if (entry.startsWith(".")) {
+        continue; // other dotdirs aren't part of the DS scan
+      }
+      if (ATOMIC_DIRS.has(lower)) {
+        atomic = true;
+      }
+      if (lower === "components") {
+        const rel = toPosix(relative(root, full));
+        componentDirs.push({ path: rel.length > 0 ? rel : entry, fileCount: countUiFiles(full) });
+      }
+      if (depth < maxDepth) {
+        walk(full, depth + 1);
+      }
+    }
+  };
+  walk(root, 0);
+  return {
+    harnessConfigs: [...harnessConfigs].sort(),
+    deps: [...deps].sort(),
+    componentDirs,
+    atomic,
+  };
+}
+
 // --- Detection orchestration (impure I/O around the pure lib) -------------------------------
 
 export interface DetectionResult {
@@ -213,9 +358,23 @@ export interface DetectionResult {
   usedFallback: boolean;
   /** Token-file candidates the scan surfaced (for the preview), recognized or not. */
   tokenCandidates: string[];
+  /** How the wizard should treat this project (component-native vs app routes). */
+  projectKind: ProjectKind;
+  /** A detected story-explorer harness (Storybook/Ladle/Histoire) — the design-system capture path. */
+  harness?: HarnessKind;
+  /** A detected component library in code (when there's no running/declared harness). */
+  componentLibrary?: ComponentLibrary;
+  /** The UI framework inferred from declared deps — drives which harness the wizard offers to scaffold. */
+  framework: Framework;
+  /** The harness Visual Guard would scaffold for {@link framework} when no harness exists. */
+  scaffoldableHarness: ScaffoldableHarness;
 }
 
-/** Probe every candidate port, classify the reachable ones, and scan for token files. */
+/**
+ * Probe every candidate port, classify the reachable ones, scan for token files, AND scan the code for
+ * the design-system layer (a story-explorer harness + component directories). The latter lets the
+ * wizard steer a DS team to component capture instead of defaulting to app routes (pages).
+ */
 export async function detectProject(cwd: string, timeoutMs: number): Promise<DetectionResult> {
   const probes: ProbeResult[] = [];
   for (const port of candidatePorts()) {
@@ -238,9 +397,40 @@ export async function detectProject(cwd: string, timeoutMs: number): Promise<Det
   const tokenCandidates = scanTokenFiles(cwd);
   const tokenSources = detectTokenSources(tokenCandidates);
 
-  const result: DetectionResult = { probes, targets, usedFallback, tokenCandidates };
+  // Design-system awareness: a harness/component library in code, classified against the probes so the
+  // wizard knows whether to capture components (DS) or fall back to app routes (pages).
+  const ds = scanDesignSystem(cwd);
+  const harness = detectHarness({ configs: ds.harnessConfigs, deps: ds.deps });
+  const componentLibrary = detectComponentLibrary(ds.componentDirs, ds.atomic);
+  const reachableStorybook = probes.some((p) => p.reachable && p.storyEntryCount !== undefined);
+  const reachableApp = probes.some((p) => p.reachable && p.storyEntryCount === undefined);
+  const projectKind = classifyProjectKind({
+    harness,
+    reachableStorybook,
+    componentLibrary,
+    reachableApp,
+  });
+  // Framework drives WHICH harness the wizard offers to scaffold when there's no story explorer.
+  const framework = detectFramework(ds.deps);
+  const scaffoldableHarness = pickHarnessFor(framework);
+
+  const result: DetectionResult = {
+    probes,
+    targets,
+    usedFallback,
+    tokenCandidates,
+    projectKind,
+    framework,
+    scaffoldableHarness,
+  };
   if (tokenSources !== undefined) {
     result.tokenSources = tokenSources;
+  }
+  if (harness !== null) {
+    result.harness = harness;
+  }
+  if (componentLibrary !== null) {
+    result.componentLibrary = componentLibrary;
   }
   return result;
 }
@@ -296,7 +486,7 @@ export interface InitOptions {
 export interface InitResult {
   detection: DetectionResult;
   /** The config object that was (or would be) written. */
-  config: { targets: Target[]; tokens?: TokensConfig };
+  config: { targets: Target[]; tokens?: TokensConfig; figma?: FigmaConfig };
   /** Absolute path written (or that would be written). */
   configPath: string;
   /** An existing config that blocked the write (when not --force and not --dry-run). */
@@ -311,7 +501,7 @@ export interface InitResult {
  * without `--force`. Returns a structured result so the command can preview what was detected and
  * what (would have) happened.
  */
-type SlimConfig = { targets: Target[]; tokens?: TokensConfig };
+type SlimConfig = { targets: Target[]; tokens?: TokensConfig; figma?: FigmaConfig };
 
 export interface PersistResult {
   /** Absolute (or as-given) path written (or that would be written). */
@@ -401,9 +591,10 @@ export function runInitFromConfig(
 }
 
 /**
- * Parse the `--stdin` payload: a JSON `{ targets, tokens? }` object (the config shape the wizard
- * assembles from the user's answers). Shape is checked lightly here; `scaffoldConfigObject` does the
- * deep, field-naming validation. `tokens` maps to the scaffold's `tokenSources`.
+ * Parse the `--stdin` payload: a JSON `{ targets, tokens?, figma? }` object (the config shape the
+ * wizard assembles from the user's answers). Shape is checked lightly here; `scaffoldConfigObject`
+ * does the deep, field-naming validation. `tokens` maps to the scaffold's `tokenSources`; `figma`
+ * passes through to `parseFigma` (which extracts file keys from pasted URLs).
  */
 export function parseScaffoldInput(raw: string): ScaffoldInput {
   let parsed: unknown;
@@ -419,6 +610,11 @@ export function parseScaffoldInput(raw: string): ScaffoldInput {
   if (parsed.tokens !== undefined) {
     assertNoJsEval(parsed.tokens);
     input.tokenSources = parsed.tokens as TokensConfig;
+  }
+  // Figma carries no token/secret and no code-eval surface, so it needs no boundary guard here —
+  // `parseFigma` (via scaffoldConfigObject) validates the shape and extracts keys before any write.
+  if (parsed.figma !== undefined) {
+    input.figma = parsed.figma as FigmaConfig;
   }
   return input;
 }

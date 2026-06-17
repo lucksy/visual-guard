@@ -10,6 +10,7 @@ import {
   type RenderTarget,
 } from "./lib/targets";
 import { FREEZE_INIT_SCRIPT, FREEZE_STYLE, SETTLE_SCRIPT, contextOptions } from "./lib/browser";
+import { managedLadleTargets } from "./lib/harness/serve-plan";
 
 /**
  * Capture engine (T-07): resolve a config into renders, fail fast if a target server is
@@ -179,6 +180,13 @@ export interface CaptureOptions {
   outRoot?: string;
   /** Per-navigation timeout in ms; defaults to 15000. */
   navTimeoutMs?: number;
+  /**
+   * Abort the whole run on the first render that fails to load/screenshot (default true — a plain
+   * `/visual-check` against the user's own server should fail loudly). When false, a failed render is
+   * recorded (`RenderRecord.error`), no PNG is written, and capture continues — used by the managed-
+   * harness + Studio-sync paths, where one auto-generated story must not nuke the entire run.
+   */
+  failFast?: boolean;
 }
 
 export interface CaptureDeps {
@@ -210,6 +218,11 @@ export interface RenderRecord {
   viewport: number;
   /** Pixel dimensions of the captured PNG, or null when they couldn't be read. */
   currentDimensions: { width: number; height: number } | null;
+  /**
+   * Set only when this render FAILED to capture (load/screenshot threw) under `failFast: false` — no
+   * PNG was written, so compare never sees it; report surfaces this as an `error`-status manifest image.
+   */
+  error?: string;
 }
 
 /** The `renders.json` artifact: render records keyed by the shared `renderRelPath` key. */
@@ -267,6 +280,7 @@ export async function captureAll(
   const runDir = join(options.outRoot ?? ".visual-guard", "runs", runId);
   const currentDir = join(runDir, "current");
   const navTimeoutMs = options.navTimeoutMs ?? 15000;
+  const failFast = options.failFast ?? true;
 
   const written: string[] = [];
   const renders: Record<string, RenderRecord> = {};
@@ -279,28 +293,40 @@ export async function captureAll(
         // animation is never captured mid-flight (R1).
         await context.addInitScript(FREEZE_INIT_SCRIPT);
         const page = await context.newPage();
+        const rel = renderRelPath(target);
         try {
           try {
             await page.goto(target.url, { waitUntil: "networkidle", timeout: navTimeoutMs });
+            // Belt-and-suspenders freeze for any style inserted late, then wait for fonts /
+            // images to settle and reset scroll before the shot.
+            await page.addStyleTag({ content: FREEZE_STYLE });
+            await page.evaluate(SETTLE_SCRIPT);
+            const buffer = await page.screenshot({ fullPage: true });
+            deps.writeFile(join(currentDir, rel), buffer);
+            written.push(rel);
+            // Persist the render's identity + dimensions for manifest v2 (T-13), keyed by the
+            // same relative path compare/report key on — so the reviewer can re-render it live.
+            renders[rel] = {
+              url: target.url,
+              kind: target.kind,
+              viewport: target.viewport,
+              currentDimensions: readPngDimensions(buffer),
+            };
           } catch (err) {
-            fail(`failed to load ${target.instance}/${target.name} (${target.url}): ${detailOf(err)}`);
+            // failFast (default): a down/broken render aborts the run loudly. Tolerant mode
+            // (managed harness / Studio sync): record the error, write NO png, and keep going so a
+            // single bad story can't nuke the whole capture — report surfaces it from renders.json.
+            if (failFast) {
+              fail(`failed to capture ${target.instance}/${target.name} (${target.url}): ${detailOf(err)}`);
+            }
+            renders[rel] = {
+              url: target.url,
+              kind: target.kind,
+              viewport: target.viewport,
+              currentDimensions: null,
+              error: detailOf(err),
+            };
           }
-          // Belt-and-suspenders freeze for any style inserted late, then wait for fonts /
-          // images to settle and reset scroll before the shot.
-          await page.addStyleTag({ content: FREEZE_STYLE });
-          await page.evaluate(SETTLE_SCRIPT);
-          const buffer = await page.screenshot({ fullPage: true });
-          const rel = renderRelPath(target);
-          deps.writeFile(join(currentDir, rel), buffer);
-          written.push(rel);
-          // Persist the render's identity + dimensions for manifest v2 (T-13), keyed by the
-          // same relative path compare/report key on — so the reviewer can re-render it live.
-          renders[rel] = {
-            url: target.url,
-            kind: target.kind,
-            viewport: target.viewport,
-            currentDimensions: readPngDimensions(buffer),
-          };
         } finally {
           await page.close();
         }
@@ -327,7 +353,10 @@ export async function captureAll(
 async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
   const config = loadConfig(args.config);
-  const result = await captureAll(config, { target: args.target, runId: args.runId });
+  // A managed (VG-scaffolded) harness renders auto-generated stories that can error individually — be
+  // tolerant so one bad story can't abort the whole run. A user's own server stays fail-fast (loud).
+  const failFast = managedLadleTargets(config).length === 0;
+  const result = await captureAll(config, { target: args.target, runId: args.runId, failFast });
   console.log(`${PREFIX}: wrote ${result.written.length} render(s) -> ${result.currentDir}`);
 }
 

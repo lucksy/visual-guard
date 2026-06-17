@@ -1,4 +1,4 @@
-import type { AppTarget, Config, StorybookTarget, Target } from "./config";
+import type { AppTarget, Config, LadleTarget, StorybookTarget, Target } from "./config";
 
 /**
  * Target resolution: turn a validated {@link Config} into the flat list of individual
@@ -28,7 +28,7 @@ export interface RenderTarget {
   /** Fully-resolved URL Playwright navigates to. */
   url: string;
   /** Origin of this target — tells capture how to realize the state. */
-  kind: "storybook" | "app";
+  kind: "storybook" | "app" | "ladle";
 }
 
 /** Minimal structural subset of the DOM `Response` that this module needs. */
@@ -285,6 +285,93 @@ async function expandStorybook(
   return renders;
 }
 
+// --- Ladle (the React story explorer Visual Guard can scaffold) ------------
+
+/** Ladle's per-story preview URL — `mode=preview` renders the story without Ladle's UI chrome. */
+function ladlePreviewUrl(base: string, id: string): string {
+  return `${stripTrailingSlash(base)}/?story=${encodeURIComponent(id)}&mode=preview`;
+}
+
+/**
+ * Parse Ladle's `/meta.json` into story refs. Ladle's manifest is `{ stories: { "<id>": { name, ... } } }`,
+ * where `<id>` shares Storybook's `component--story` kebab convention — so component/state derive from the
+ * id via the same {@link refFromEntry}/{@link parseStoryId} path the explicit-stories Storybook case uses.
+ * A present `name` field becomes the (sanitized) state label; everything is sanitized for the capture path.
+ */
+function parseLadleMeta(payload: unknown, sourceUrl: string): StoryRef[] {
+  if (!isRecord(payload)) {
+    fail(`Ladle meta at ${sourceUrl} was not a JSON object.`);
+  }
+  const stories = payload.stories;
+  if (!isRecord(stories)) {
+    fail(`Ladle meta at ${sourceUrl} has no "stories"; is this Ladle (is the dev server up)?`);
+  }
+  const refs: StoryRef[] = [];
+  for (const [id, value] of Object.entries(stories)) {
+    // A blank id would yield an empty component name and a broken "//" capture path — skip it.
+    if (id.trim().length === 0) continue;
+    const name = isRecord(value) && typeof value.name === "string" ? value.name : undefined;
+    refs.push(refFromEntry(id, undefined, name));
+  }
+  return refs;
+}
+
+/** Query `<base>/meta.json` and parse it into story refs (Ladle's discovery endpoint). */
+async function discoverLadleStories(base: string, fetchImpl: FetchLike): Promise<StoryRef[]> {
+  const metaUrl = `${stripTrailingSlash(base)}/meta.json`;
+  let response: FetchResponse;
+  try {
+    response = await fetchImpl(metaUrl);
+  } catch (err) {
+    return fail(
+      `could not discover Ladle stories at ${base} (${metaUrl}: ${detailOf(err)}). Is Ladle running? ` +
+        `You can also list explicit story ids in config to bypass discovery.`,
+    );
+  }
+  if (!response.ok) {
+    return fail(
+      `could not discover Ladle stories at ${base} (${metaUrl}: HTTP ${response.status}). Is Ladle running?`,
+    );
+  }
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (err) {
+    return fail(`Ladle meta at ${metaUrl} was not valid JSON (${detailOf(err)}).`);
+  }
+  return parseLadleMeta(payload, metaUrl);
+}
+
+async function expandLadle(
+  target: LadleTarget,
+  instance: string,
+  viewports: number[],
+  fetchImpl: FetchLike,
+): Promise<RenderTarget[]> {
+  // An explicit `stories` list bypasses discovery (mirrors expandStorybook); blank ids are dropped.
+  const refs =
+    target.stories !== undefined
+      ? target.stories
+          .filter((id) => id.trim().length > 0)
+          .map((id) => refFromEntry(id, undefined, undefined))
+      : await discoverLadleStories(target.url, fetchImpl);
+
+  const renders: RenderTarget[] = [];
+  for (const ref of refs) {
+    for (const viewport of viewports) {
+      renders.push({
+        instance,
+        name: ref.component,
+        state: ref.state,
+        viewport,
+        url: ladlePreviewUrl(target.url, ref.id),
+        kind: "ladle",
+      });
+    }
+  }
+  return renders;
+}
+
 function expandApp(
   target: AppTarget,
   instance: string,
@@ -350,6 +437,8 @@ export async function resolveTargets(
     if (target === undefined || instance === undefined) continue;
     if (target.type === "storybook") {
       renders.push(...(await expandStorybook(target, instance, config.viewports, fetchImpl)));
+    } else if (target.type === "ladle") {
+      renders.push(...(await expandLadle(target, instance, config.viewports, fetchImpl)));
     } else {
       renders.push(...expandApp(target, instance, config.viewports, config.states));
     }

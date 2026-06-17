@@ -1,0 +1,441 @@
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { dirname, join, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
+import { loadConfig, type Config } from "../lib/config";
+import { captureAll, readPngDimensions } from "../capture";
+import { classify, isSafeKey, walkPngFiles } from "../compare";
+import { diffImages } from "../lib/diff";
+import { openDb, type DB } from "../lib/studio/db";
+import {
+  appendSnapshot,
+  latestLaneStatus,
+  markFigmaPending,
+  pruneStoryUsages,
+  recomputeStatus,
+  recordComparison,
+  recordUsage,
+  setSyncState,
+  upsertComponent,
+  upsertVariant,
+  type RegressionStatus,
+} from "../lib/studio/store";
+import {
+  blobPath,
+  blobsDir,
+  codeComponentKey,
+  parseCodeBaselineKey,
+  studioDbPath,
+  DEFAULT_OUT_ROOT,
+} from "../lib/studio/keys";
+import { pruneStudio } from "../lib/studio/prune";
+import {
+  computeCodeFingerprint,
+  matchesAnyGlob,
+  planSync,
+  type FingerprintFile,
+} from "../lib/studio/fingerprint";
+import { managedLadleTargets } from "../lib/harness/serve-plan";
+
+/**
+ * Component Studio code sync (P2, SPEC §9). **Code capture is the engine** (headless Playwright via
+ * `captureAll`); there is no Figma/MCP here (the engine can't call MCP tools — that is the agent-driven
+ * `/visual-sync` workflow). For every live render it appends a content-addressed `source='current'`
+ * snapshot, ensures the committed `source='code'` baseline is indexed, records a `current_vs_baseline`
+ * comparison, and rolls up status. Idempotent: identical bytes re-run → zero new history rows.
+ *
+ * The pure-ish `syncCodeFromRun` takes an already-captured run dir (no browser), so it is integration-
+ * tested over seeded PNGs; the CLI wraps `captureAll` around it.
+ */
+
+const PREFIX = "Visual Guard studio sync";
+
+function fail(message: string): never {
+  throw new Error(`${PREFIX}: ${message}`);
+}
+
+const toPosix = (path: string): string => path.split(sep).join("/");
+const sha256 = (buf: Buffer): string => createHash("sha256").update(buf).digest("hex");
+
+/**
+ * Best-effort read of the run's `renders.json` sidecar (one dir up from `current/`) into a
+ * key → live-render-URL map. Capture writes the exact harness preview URL per render key; the sync
+ * persists it on the code variant so the Studio can offer a live-preview iframe. Absent/garbage → {}.
+ */
+function readRenderUrls(runDir: string): Record<string, string> {
+  try {
+    const parsed = JSON.parse(readFileSync(join(runDir, "renders.json"), "utf8")) as {
+      renders?: Record<string, { url?: unknown }>;
+    };
+    const out: Record<string, string> = {};
+    for (const [key, record] of Object.entries(parsed.renders ?? {})) {
+      if (record && typeof record.url === "string") {
+        out[key] = record.url;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export interface SyncCodeOptions {
+  db: DB;
+  config: Config;
+  /** The run's `current/` directory (absolute, or relative to `cwd`). */
+  currentDir: string;
+  /** Committed baseline dir (config.baselineDir). */
+  baselineDir: string;
+  /** Output root for the blob cache; defaults to ".visual-guard". */
+  outRoot?: string;
+  cwd?: string;
+}
+
+export interface SyncCodeSummary {
+  components: number;
+  currentSnapshots: number;
+  baselineSnapshots: number;
+  comparisons: number;
+  byStatus: { same: number; changed: number; regression: number; new: number; error: number };
+}
+
+/**
+ * Persist a captured code run into the DB: per render, a content-addressed `current` snapshot (copied
+ * into the blob cache), the committed `code` baseline (when present), and a `current_vs_baseline`
+ * comparison; then roll up status and mark the component `synced`. Reads only; never writes baselines.
+ */
+export async function syncCodeFromRun(options: SyncCodeOptions): Promise<SyncCodeSummary> {
+  const { db, config } = options;
+  const cwd = options.cwd ?? process.cwd();
+  const outRoot = options.outRoot ?? DEFAULT_OUT_ROOT;
+  const currentAbs = resolve(cwd, options.currentDir);
+  const baselineAbs = resolve(cwd, options.baselineDir);
+  const blobsAbs = resolve(cwd, blobsDir(outRoot));
+  mkdirSync(blobsAbs, { recursive: true });
+  // The live harness preview URL per render key (from capture's renders.json sidecar), persisted on the
+  // code variant so the Studio detail view can embed a live preview. Absent on seeded/pre-v2 runs → {}.
+  const renderUrls = readRenderUrls(dirname(currentAbs));
+
+  const touched = new Set<number>();
+  // The variant lanes each component (re)rendered this cycle — scopes the status rollup to live lanes.
+  const renderedLanes = new Map<number, Set<number | null>>();
+  // The story states each component rendered this cycle — scopes the "Used in" usages the same way, so a
+  // removed/renamed story doesn't leave a stale usage row (mirrors renderedLanes for the status rollup).
+  const renderedStates = new Map<number, Set<string>>();
+  const summary: SyncCodeSummary = {
+    components: 0,
+    currentSnapshots: 0,
+    baselineSnapshots: 0,
+    comparisons: 0,
+    byStatus: { same: 0, changed: 0, regression: 0, new: 0, error: 0 },
+  };
+
+  for (const key of walkPngFiles(currentAbs)) {
+    if (!isSafeKey(key)) {
+      continue;
+    }
+    const parsed = parseCodeBaselineKey(key);
+    if (parsed === null) {
+      continue;
+    }
+
+    const componentId = upsertComponent(db, {
+      key: codeComponentKey(parsed.instance, parsed.name),
+      name: parsed.name,
+      codeInstance: parsed.instance,
+      codeTarget: parsed.name,
+    });
+    touched.add(componentId);
+    const variantId = upsertVariant(db, {
+      componentId,
+      source: "code",
+      name: `${parsed.state}@${parsed.viewport}`,
+      renderUrl: renderUrls[key] ?? null,
+    });
+    let lanes = renderedLanes.get(componentId);
+    if (lanes === undefined) {
+      lanes = new Set();
+      renderedLanes.set(componentId, lanes);
+    }
+    lanes.add(variantId);
+    // Record where the component is used: each distinct rendered state is a story/example exercising it
+    // (the detail "Used in" panel). Idempotent on (component, kind, used_in), so re-syncs don't duplicate.
+    recordUsage(db, {
+      componentId,
+      kind: "story",
+      usedIn: parsed.state,
+      detail: parsed.instance,
+    });
+    let states = renderedStates.get(componentId);
+    if (states === undefined) {
+      states = new Set();
+      renderedStates.set(componentId, states);
+    }
+    states.add(parsed.state);
+
+    const currentBytes = readFileSync(join(currentAbs, key));
+    const currentHash = sha256(currentBytes);
+    const currentDims = readPngDimensions(currentBytes);
+    // Content-address the transient live render into the blob cache (SPEC §7).
+    const blobAbs = resolve(cwd, blobPath(currentHash, outRoot));
+    if (!existsSync(blobAbs)) {
+      copyFileSync(join(currentAbs, key), blobAbs);
+    }
+    const currentSnap = appendSnapshot(db, {
+      componentId,
+      variantId,
+      source: "current",
+      imagePath: toPosix(blobPath(currentHash, outRoot)),
+      imageHash: currentHash,
+      width: currentDims?.width ?? null,
+      height: currentDims?.height ?? null,
+      viewport: parsed.viewport,
+      approved: false,
+    });
+    if (currentSnap.inserted) {
+      summary.currentSnapshots += 1;
+    }
+
+    const baselineKeyAbs = join(baselineAbs, key);
+    let status: RegressionStatus;
+    let fromSnapshot = currentSnap.id; // self-ref for `new` (no baseline to point at)
+    let diffRatio: number | null = null;
+    let baselineInserted = false;
+    if (existsSync(baselineKeyAbs)) {
+      const baseBytes = readFileSync(baselineKeyAbs);
+      const baseDims = readPngDimensions(baseBytes);
+      const baseSnap = appendSnapshot(db, {
+        componentId,
+        variantId,
+        source: "code",
+        imagePath: `${toPosix(options.baselineDir)}/${key}`,
+        imageHash: sha256(baseBytes),
+        width: baseDims?.width ?? null,
+        height: baseDims?.height ?? null,
+        viewport: parsed.viewport,
+        approved: true,
+      });
+      baselineInserted = baseSnap.inserted;
+      if (baseSnap.inserted) {
+        summary.baselineSnapshots += 1;
+      }
+      fromSnapshot = baseSnap.id;
+      try {
+        const diff = await diffImages(baseBytes, currentBytes, config.threshold);
+        diffRatio = diff.ratio;
+        status =
+          classify(diff.ratio, diff.dimensionDelta, config.maxDiffRatio) === "fail"
+            ? "regression"
+            : diff.ratio > 0
+              ? "changed" // below the gate but not byte-identical (SPEC §7 status map)
+              : "same";
+      } catch {
+        status = "error"; // an undecodable render is reported, never aborts the sync
+      }
+    } else {
+      status = "new";
+    }
+    // Record a comparison when a snapshot changed OR the verdict differs from the latest recorded one
+    // (e.g. unchanged bytes but a tightened maxDiffRatio now reads regression). A fully-unchanged
+    // re-run with an unchanged verdict adds NO new row — the prior verdict stands (true idempotency).
+    const verdictChanged = latestLaneStatus(db, componentId, variantId) !== status;
+    if (currentSnap.inserted || baselineInserted || verdictChanged) {
+      recordComparison(db, {
+        componentId,
+        axis: "current_vs_baseline",
+        fromSnapshot,
+        toSnapshot: currentSnap.id,
+        diffRatio,
+        status,
+      });
+      summary.comparisons += 1;
+      summary.byStatus[status] += 1;
+    }
+  }
+
+  for (const id of touched) {
+    recomputeStatus(db, id, renderedLanes.get(id));
+    // Drop story usages for states no longer rendered (e.g. a renamed/removed story), keeping the panel
+    // consistent with the live render — the usages analogue of recomputeStatus's renderedLanes scoping.
+    pruneStoryUsages(db, id, [...(renderedStates.get(id) ?? [])]);
+    setSyncState(db, id, "synced");
+  }
+  // A figma-linked component with no captured design is figma-pending (resumable) — SPEC §9.5. This
+  // runs after the code sync so a code-only project (no figma links) stays fully `synced`.
+  markFigmaPending(db);
+  summary.components = touched.size;
+  return summary;
+}
+
+// --- Incremental skip (P5) -------------------------------------------------
+
+const WALK_SKIP_DIRS = new Set([
+  "node_modules",
+  ".git",
+  ".visual-guard",
+  ".visual-baselines",
+  "dist",
+  "build",
+  "coverage",
+  ".next",
+]);
+
+/**
+ * Walk `cwd` collecting UI source files (posix-relative path + mtime) that match `uiGlobs` — the inputs
+ * to the code-render fingerprint. Skips heavy/derived dirs. Dependency-free + Node-20 safe (no fs.glob).
+ */
+export function collectUiFiles(cwd: string, uiGlobs: string[]): FingerprintFile[] {
+  const out: FingerprintFile[] = [];
+  const walk = (dirAbs: string, prefix: string): void => {
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(dirAbs, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (!WALK_SKIP_DIRS.has(entry.name)) {
+          walk(join(dirAbs, entry.name), rel);
+        }
+      } else if (entry.isFile() && matchesAnyGlob(rel, uiGlobs)) {
+        try {
+          out.push({ path: rel, mtimeMs: statSync(join(dirAbs, entry.name)).mtimeMs });
+        } catch {
+          // a file vanished mid-walk — skip it
+        }
+      }
+    }
+  };
+  walk(cwd, "");
+  return out;
+}
+
+/** A stable signature of WHAT a code sync renders, so a config change busts the fingerprint. */
+export function targetSignature(config: Config): string {
+  return JSON.stringify({
+    targets: config.targets,
+    viewports: config.viewports,
+    states: config.states,
+  });
+}
+
+/** Read the stored fingerprint hash for the project, or null if none / unreadable. */
+function readStoredFingerprint(path: string): string | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as { fingerprint?: unknown };
+    return typeof parsed.fingerprint === "string" ? parsed.fingerprint : null;
+  } catch {
+    return null;
+  }
+}
+
+// --- CLI ------------------------------------------------------------------
+
+export interface SyncCliArgs {
+  config: string;
+  target?: string;
+  baselineDir?: string;
+  outRoot: string;
+  /** Re-render even when the fingerprint is unchanged (override the incremental skip). */
+  force: boolean;
+}
+
+export function parseArgs(argv: string[]): SyncCliArgs {
+  let config = "config/visual.config.json";
+  let target: string | undefined;
+  let baselineDir: string | undefined;
+  let outRoot = DEFAULT_OUT_ROOT;
+  let force = false;
+
+  const value = (index: number, flag: string): string => {
+    const next = argv[index];
+    if (next === undefined) {
+      fail(`missing value for ${flag}.`);
+    }
+    return next;
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    switch (arg) {
+      case "--config":
+        config = value(++i, "--config");
+        break;
+      case "--target":
+        target = value(++i, "--target");
+        break;
+      case "--baseline":
+        baselineDir = value(++i, "--baseline");
+        break;
+      case "--out":
+        outRoot = value(++i, "--out");
+        break;
+      case "--force":
+        force = true;
+        break;
+      default:
+        fail(`unknown argument ${JSON.stringify(arg)}.`);
+    }
+  }
+  return { config, target, baselineDir, outRoot, force };
+}
+
+async function main(argv: string[]): Promise<void> {
+  const args = parseArgs(argv);
+  const config = loadConfig(args.config);
+  const baselineDir = args.baselineDir ?? config.baselineDir;
+
+  // Incremental skip (P5): when no UI source file changed and the target config is unchanged, the code
+  // re-render is skipped entirely. Content-hash dedupe is the backstop, so this only saves cost, never
+  // correctness. A `--target` subset or `--force` bypasses the skip (it fingerprints the whole project).
+  const fingerprintPath = join(args.outRoot, "studio.fingerprint.json");
+  const fingerprint = computeCodeFingerprint({
+    targetSignature: targetSignature(config),
+    files: collectUiFiles(process.cwd(), config.uiGlobs),
+  });
+  const plan = planSync(args.target, readStoredFingerprint(fingerprintPath), fingerprint, args.force);
+  if (plan.skip) {
+    console.log(JSON.stringify({ command: "sync", skipped: true, reason: "unchanged", fingerprint }));
+    return;
+  }
+
+  // Code capture is the engine (headless). Figma capture is the agent-driven /visual-sync workflow.
+  // A managed (VG-scaffolded) harness renders auto-generated stories that can error individually — be
+  // tolerant so one bad story doesn't abort the sync (the origin is still probed up front by captureAll).
+  const failFast = managedLadleTargets(config).length === 0;
+  const capture = await captureAll(config, { target: args.target, outRoot: args.outRoot, failFast });
+
+  mkdirSync(args.outRoot, { recursive: true });
+  const db = openDb(studioDbPath(args.outRoot));
+  try {
+    const summary = await syncCodeFromRun({
+      db,
+      config,
+      currentDir: capture.currentDir,
+      baselineDir,
+      outRoot: args.outRoot,
+    });
+    // Prune at the sync tail (idempotent; bounds history + blob-cache growth; never touches baselines).
+    const pruned = pruneStudio(db, config.studio, { outRoot: args.outRoot });
+    // Record the fingerprint so the next unchanged sync can skip — but ONLY for a FULL sync (plan.stamp
+    // is false for a `--target` subset, which must not claim whole-project freshness).
+    if (plan.stamp) {
+      writeFileSync(fingerprintPath, JSON.stringify({ fingerprint, at: capture.runId }));
+    }
+    console.log(JSON.stringify({ command: "sync", runId: capture.runId, ...summary, pruned }));
+  } finally {
+    db.close();
+  }
+}
+
+const invokedDirectly =
+  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (invokedDirectly) {
+  main(process.argv.slice(2)).catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
+}

@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { extractFigmaFileKey } from "./figma/url";
 
 export type DetectMode = "auto";
 
@@ -20,7 +21,25 @@ export interface AppTarget {
   routes?: string[];
 }
 
-export type Target = StorybookTarget | AppTarget;
+/**
+ * A Ladle story explorer (the React harness Visual Guard can scaffold when a project has components but
+ * no story explorer). Like {@link StorybookTarget} but Ladle exposes its manifest at `/meta.json` and
+ * previews at `/?story=<id>&mode=preview` (see targets.ts). `managed: true` marks a Visual-Guard-scaffolded
+ * harness whose dev server `/visual-check` starts and stops around capture (it isn't expected to be
+ * already running).
+ */
+export interface LadleTarget {
+  type: "ladle";
+  url: string;
+  /** Instance label for the output/baseline path; defaults to the URL host:port (targets.ts). */
+  name?: string;
+  /** Explicit story ids to render; bypasses discovery when present (see targets.ts). */
+  stories?: string[];
+  /** When true, /visual-check starts/stops this harness's dev server around capture (VG-scaffolded). */
+  managed?: boolean;
+}
+
+export type Target = StorybookTarget | AppTarget | LadleTarget;
 
 /**
  * Token source formats. The static formats parse without executing project code; the JS-eval
@@ -57,6 +76,39 @@ export interface TokensConfig {
   allowJsEval?: boolean;
 }
 
+export interface FigmaFile {
+  /** Non-secret Figma file key (committed in config; identifies one library file). */
+  key: string;
+  /** Optional human label, surfaced as the gallery's per-library filter. */
+  label?: string;
+}
+
+/**
+ * Additive Figma linkage (D10/D11). Absent → today's code-only behavior, byte-for-byte. There is
+ * **no token here**: Figma is read through the Figma desktop MCP, so nothing secret is stored —
+ * only the non-secret file key(s) and an optional name-mapping.
+ */
+export interface FigmaConfig {
+  /** One or more Figma library files. A bare key string / `{ fileKey }` normalizes to one entry. */
+  files: FigmaFile[];
+  /** Optional Figma-name → code-name overrides for component matching (D7). */
+  componentMap?: Record<string, string>;
+}
+
+/**
+ * Component Studio retention/maintenance knobs (P5). Bounds DB + blob-cache growth for active design
+ * systems. **Committed baseline PNGs are never affected** — only gitignored history rows / cache blobs.
+ * Always present on `Config` (defaulted), so callers don't branch on its absence.
+ */
+export interface StudioConfig {
+  /** Keep at most this many snapshots per (component, variant, source) lane (default 20). */
+  retainPerSource: number;
+  /** Keep at most this many `current` (live, unapproved) renders per lane (default 3). */
+  retainCurrent: number;
+  /** Sweep unreferenced `cache/blobs/*.png` during prune (default true). */
+  pruneOrphanBlobs: boolean;
+}
+
 export interface Config {
   detect: DetectMode;
   targets: Target[];
@@ -67,6 +119,10 @@ export interface Config {
   baselineDir: string;
   uiGlobs: string[];
   tokens: TokensConfig;
+  /** Optional design-system (Figma) linkage; absent = code-only mode. */
+  figma?: FigmaConfig;
+  /** Studio retention knobs (always defaulted). */
+  studio: StudioConfig;
 }
 
 const DEFAULTS = {
@@ -77,6 +133,12 @@ const DEFAULTS = {
   maxDiffRatio: 0.01,
   baselineDir: ".visual-baselines",
   uiGlobs: ["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss}"],
+};
+
+const STUDIO_DEFAULTS: StudioConfig = {
+  retainPerSource: 20,
+  retainCurrent: 3,
+  pruneOrphanBlobs: true,
 };
 
 const DEFAULT_TOKEN_SOURCE = "src/styles/tokens.css";
@@ -159,8 +221,10 @@ function parseTarget(raw: unknown, index: number): Target {
     fail(`targets[${index}] must be an object.`);
   }
   const { type, url } = raw;
-  if (type !== "storybook" && type !== "app") {
-    fail(`targets[${index}].type must be "storybook" or "app" (got ${JSON.stringify(type)}).`);
+  if (type !== "storybook" && type !== "app" && type !== "ladle") {
+    fail(
+      `targets[${index}].type must be "storybook", "app", or "ladle" (got ${JSON.stringify(type)}).`,
+    );
   }
   const validUrl = asNonEmptyString(url, `targets[${index}].url`);
 
@@ -176,6 +240,20 @@ function parseTarget(raw: unknown, index: number): Target {
     }
     if (raw.stories !== undefined) {
       target.stories = asStringArray(raw.stories, `targets[${index}].stories`);
+    }
+    return target;
+  }
+
+  if (type === "ladle") {
+    const target: LadleTarget = { type, url: validUrl };
+    if (name !== undefined) {
+      target.name = name;
+    }
+    if (raw.stories !== undefined) {
+      target.stories = asStringArray(raw.stories, `targets[${index}].stories`);
+    }
+    if (raw.managed !== undefined) {
+      target.managed = asBoolean(raw.managed, `targets[${index}].managed`);
     }
     return target;
   }
@@ -277,6 +355,136 @@ function parseTokens(raw: unknown): TokensConfig {
 }
 
 /**
+ * Normalize a pasted Figma reference into a stored file **key**: a full Figma URL is reduced to its
+ * key, and a bare value must itself be a valid key. `extractFigmaFileKey` returns a shape-valid key
+ * (base62, 16–128) or null for *both* forms, so arbitrary input is **never** trusted verbatim — a
+ * typo or a hostile string (e.g. `../../etc/passwd`) can't become the stored key, which SPEC §7/§11
+ * later use as a filesystem path segment and a Figma deep-link href. Fails naming the field.
+ */
+function normalizeFigmaKey(value: unknown, field: string): string {
+  const str = asNonEmptyString(value, field).trim();
+  if (str.length === 0) {
+    fail(`"${field}" must be a non-empty string.`);
+  }
+  const key = extractFigmaFileKey(str);
+  if (key !== null) {
+    return key;
+  }
+  if (/figma\.(?:com|site)\//i.test(str)) {
+    fail(`"${field}" looks like a Figma URL but no valid file key could be extracted from it.`);
+  }
+  fail(`"${field}" must be a Figma file URL or a bare file key (base62, 16–128 chars).`);
+}
+
+/** Validate one Figma file entry: a bare key/URL string, or `{ key, label? }`. */
+function parseFigmaFile(raw: unknown, label: string): FigmaFile {
+  if (typeof raw === "string") {
+    return { key: normalizeFigmaKey(raw, label) };
+  }
+  if (!isObject(raw)) {
+    fail(`${label} must be a string key/URL or an object with a "key".`);
+  }
+  const file: FigmaFile = { key: normalizeFigmaKey(raw.key, `${label}.key`) };
+  if (raw.label !== undefined) {
+    file.label = asNonEmptyString(raw.label, `${label}.label`);
+  }
+  return file;
+}
+
+/** Validate the optional Figma→code name override map (every value a non-empty string). */
+function parseComponentMap(raw: unknown): Record<string, string> {
+  if (!isObject(raw)) {
+    fail(`"figma.componentMap" must be an object mapping Figma names to code names.`);
+  }
+  const map: Record<string, string> = {};
+  for (const [from, to] of Object.entries(raw)) {
+    if (from.length === 0) {
+      fail(`"figma.componentMap" keys must be non-empty strings.`);
+    }
+    if (typeof to !== "string" || to.length === 0) {
+      fail(`"figma.componentMap.${from}" must be a non-empty string.`);
+    }
+    map[from] = to;
+  }
+  return map;
+}
+
+/**
+ * Normalize `config.figma` into a {@link FigmaConfig} (mirrors {@link parseTokens}). Accepts a bare
+ * file-key/URL string, a single-file `{ fileKey }` shorthand, or the full `{ files: [...] }` form.
+ * Absent → `undefined`, so a config with no `figma` keeps today's code-only behavior byte-for-byte.
+ * **No token is ever read or written** — Figma access is via the MCP.
+ */
+export function parseFigma(raw: unknown): FigmaConfig | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (typeof raw === "string") {
+    return { files: [parseFigmaFile(raw, "figma")] };
+  }
+  if (!isObject(raw)) {
+    fail(`"figma" must be a string file key/URL or an object.`);
+  }
+
+  if (raw.fileKey !== undefined && raw.files !== undefined) {
+    fail(`"figma" must not set both "fileKey" and "files" — use one.`);
+  }
+
+  let files: FigmaFile[];
+  if (raw.files !== undefined) {
+    if (!Array.isArray(raw.files) || raw.files.length === 0) {
+      fail(`"figma.files" must be a non-empty array.`);
+    }
+    files = raw.files.map((entry, index) => parseFigmaFile(entry, `figma.files[${index}]`));
+  } else if (raw.fileKey !== undefined) {
+    files = [parseFigmaFile(raw.fileKey, "figma.fileKey")];
+  } else {
+    fail(`"figma" must set "files" (or a single "fileKey").`);
+  }
+
+  const result: FigmaConfig = { files };
+  if (raw.componentMap !== undefined) {
+    result.componentMap = parseComponentMap(raw.componentMap);
+  }
+  return result;
+}
+
+function asPositiveInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    fail(`"${field}" must be a positive integer (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+
+/**
+ * Normalize `config.studio` into a {@link StudioConfig}, field-by-field defaulted (mirrors the additive
+ * pattern of {@link parseFigma}). Absent → all defaults, so a config with no `studio` block behaves
+ * exactly as before. Each present field is validated; unknown extras are ignored.
+ */
+export function parseStudio(raw: unknown): StudioConfig {
+  if (raw === undefined) {
+    return { ...STUDIO_DEFAULTS };
+  }
+  if (!isObject(raw)) {
+    fail(`"studio" must be an object.`);
+  }
+  return {
+    retainPerSource:
+      raw.retainPerSource === undefined
+        ? STUDIO_DEFAULTS.retainPerSource
+        : asPositiveInteger(raw.retainPerSource, "studio.retainPerSource"),
+    retainCurrent:
+      raw.retainCurrent === undefined
+        ? STUDIO_DEFAULTS.retainCurrent
+        : asPositiveInteger(raw.retainCurrent, "studio.retainCurrent"),
+    pruneOrphanBlobs:
+      raw.pruneOrphanBlobs === undefined
+        ? STUDIO_DEFAULTS.pruneOrphanBlobs
+        : asBoolean(raw.pruneOrphanBlobs, "studio.pruneOrphanBlobs"),
+  };
+}
+
+/**
  * Validate a parsed config object and fill defaults. Pure — no I/O. Throws an actionable
  * error that names the offending field on any invalid or missing-required input.
  */
@@ -296,6 +504,8 @@ export function parseConfig(raw: unknown): Config {
   }
 
   const tokens = parseTokens(raw.tokens);
+  const figma = parseFigma(raw.figma);
+  const studio = parseStudio(raw.studio);
 
   return {
     detect,
@@ -318,6 +528,9 @@ export function parseConfig(raw: unknown): Config {
     uiGlobs:
       raw.uiGlobs === undefined ? [...DEFAULTS.uiGlobs] : asStringArray(raw.uiGlobs, "uiGlobs"),
     tokens,
+    // Only attach `figma` when present, so a config without it stays byte-identical to before (D10).
+    ...(figma !== undefined ? { figma } : {}),
+    studio,
   };
 }
 

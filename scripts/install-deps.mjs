@@ -18,7 +18,8 @@
  *
  * The bridge (T-12): the `/visual-check` & `/visual-baseline` commands run the engine via
  * `${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx scripts/<x>.ts`. Those scripts import bare
- * specifiers (`playwright`, `sharp`, `pngjs`, `pixelmatch`) which ESM resolves by walking up
+ * specifiers (`playwright`, `sharp`, `pngjs`, `pixelmatch`, and the Studio DB's native
+ * `better-sqlite3`) which ESM resolves by walking up
  * from the script to the nearest `node_modules` — and NODE_PATH does NOT apply to ESM. So the
  * installed deps in the data dir are unreachable from `scripts/` unless a `node_modules` sits
  * adjacent to them. `ensureBridgeLink` symlinks `${pluginRoot}/node_modules` → the data-dir
@@ -32,12 +33,14 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -49,6 +52,7 @@ const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 // `dependencies`; `tsx` (the command runner) and `typescript` (the token scanner's JSX/Tailwind
 // AST + the JS-eval child process) come from devDependencies and live here too (not committed).
 export const ENGINE_DEPS = {
+  "better-sqlite3": "12.10.1",
   culori: "4.0.2",
   pixelmatch: "5.3.0",
   playwright: "1.49.1",
@@ -209,29 +213,112 @@ export function computeInstallState(dataDir) {
   };
 }
 
+/** The plugin's own name, from the bundled plugin.json (fallback to the known name). */
+function readPluginName() {
+  try {
+    const pkg = JSON.parse(readFileSync(join(pluginRoot, ".claude-plugin", "plugin.json"), "utf8"));
+    if (typeof pkg.name === "string" && pkg.name.length > 0) {
+      return pkg.name;
+    }
+  } catch {
+    /* manifest missing/unreadable — fall through */
+  }
+  return "visual-guard";
+}
+
+/** The marketplace name, from the bundled marketplace.json, or null when it isn't present. */
+function readMarketplaceName() {
+  try {
+    const mkt = JSON.parse(readFileSync(join(pluginRoot, ".claude-plugin", "marketplace.json"), "utf8"));
+    if (typeof mkt.name === "string" && mkt.name.length > 0) {
+      return mkt.name;
+    }
+  } catch {
+    /* not bundled — fall through to discovery */
+  }
+  return null;
+}
+
+/**
+ * Resolve the plugin's data dir (where the engine deps + Chromium live). Prefers CLAUDE_PLUGIN_DATA,
+ * which the SessionStart hook injects. When it is absent — a slash command's Bash runs mid-session, or
+ * the plugin was *added* mid-session so the hook never ran — fall back to Claude Code's conventional
+ * location so a `--check` (and a consent-gated install) still works WITHOUT a session restart:
+ *
+ *   <CLAUDE_CONFIG_DIR | ~/.claude>/plugins/data/<plugin>-<marketplace>
+ *
+ * <plugin>/<marketplace> come from the bundled manifests; if marketplace.json isn't bundled we discover
+ * a single existing `<plugin>-*` data dir instead. Returns an absolute path, or null when it genuinely
+ * cannot be determined (then `--check` reports "not installed / unknown" rather than erroring).
+ */
+export function resolveDataDir(env = process.env) {
+  if (env.CLAUDE_PLUGIN_DATA) {
+    // Normalize to absolute: the bridge symlink's target must be absolute (a symlink resolves
+    // relative to the link's own directory, not cwd).
+    return resolve(env.CLAUDE_PLUGIN_DATA);
+  }
+  const configDir = env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const dataBase = join(configDir, "plugins", "data");
+  const plugin = readPluginName();
+
+  const marketplace = readMarketplaceName();
+  if (marketplace) {
+    // The convention Claude Code uses to name a plugin's data dir.
+    return join(dataBase, `${plugin}-${marketplace}`);
+  }
+  // marketplace.json wasn't bundled — fall back to a single existing <plugin>-* data dir.
+  try {
+    const matches = readdirSync(dataBase).filter((d) => d.startsWith(`${plugin}-`));
+    if (matches.length === 1) {
+      return join(dataBase, matches[0]);
+    }
+  } catch {
+    /* data base doesn't exist yet */
+  }
+  return null;
+}
+
 function main() {
   // `--check`: read-only install-state inspection for the /visual-setup consent gate. Prints the
-  // computeInstallState() JSON to STDOUT and exits 0. Installs nothing, never touches the bridge.
+  // computeInstallState() JSON to STDOUT and exits 0 — ALWAYS, even when the data dir can't be
+  // resolved — so a mid-session Bash invocation never shows a hard error. Installs nothing.
   const checkOnly = process.argv.includes("--check");
 
-  const rawDataDir = process.env.CLAUDE_PLUGIN_DATA;
-  if (!rawDataDir) {
-    // Outside a plugin runtime (e.g. a raw `node` invocation) we cannot know where to install.
-    console.error(
-      "[visual-guard] CLAUDE_PLUGIN_DATA is not set — cannot bootstrap engine deps. " +
-        "This script is meant to run from the SessionStart hook.",
-    );
-    process.exit(1);
-  }
-  // Normalize to absolute: the bridge symlink's target must be absolute (a symlink resolves
-  // relative to the link's own directory, not cwd), so a relative CLAUDE_PLUGIN_DATA would
-  // otherwise produce a link that points at the wrong place.
-  const dataDir = resolve(rawDataDir);
+  // Normally CLAUDE_PLUGIN_DATA; resolveDataDir falls back to the conventional path when it's absent
+  // (command Bash mid-session, or the plugin was added mid-session so the SessionStart hook never ran).
+  const dataDir = resolveDataDir();
 
   if (checkOnly) {
     // STDOUT (not stderr): the consent gate parses this. No install, no bridge, no fs writes.
+    if (dataDir === null) {
+      process.stdout.write(
+        JSON.stringify({
+          dataDir: null,
+          installed: false,
+          depsPresent: false,
+          browserPresent: false,
+          markerMatches: false,
+          missing: ["deps", "browser", "marker"],
+          engineDeps: ENGINE_DEPS,
+          browser: BROWSER_LABEL,
+          reason:
+            "CLAUDE_PLUGIN_DATA is not set and the data dir could not be resolved — treat as not installed.",
+        }) + "\n",
+      );
+      process.exit(0);
+    }
     process.stdout.write(JSON.stringify(computeInstallState(dataDir)) + "\n");
     process.exit(0);
+  }
+
+  if (dataDir === null) {
+    // A real install needs a target dir. If none could be resolved, guide the user rather than crash
+    // with a raw error — a fresh session lets the SessionStart hook set CLAUDE_PLUGIN_DATA and install.
+    console.error(
+      "[visual-guard] Could not resolve the plugin data dir (CLAUDE_PLUGIN_DATA is not set). " +
+        "Start a fresh session so the SessionStart hook can install the engine, or set CLAUDE_PLUGIN_DATA.",
+    );
+    process.exit(1);
   }
 
   const browsersDir = join(dataDir, "browsers");

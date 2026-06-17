@@ -1,0 +1,148 @@
+/*
+ * Component Studio design tokens (P4, SPEC §11.4). CSS custom properties only — no UI kit. A cool-neutral
+ * gray ramp + a single indigo accent + 6 status colors; system font; 14px base; 4px spacing scale; 2
+ * radii; 2 shadows. Light + dark via [data-theme] honoring prefers-color-scheme. Every text/bg pair
+ * targets WCAG AA. prefers-reduced-motion handling lives in app.css.
+ */
+
+:root {
+  /* Cool-neutral gray ramp (light surfaces → dark ink). */
+  --gray-0: #ffffff;
+  --gray-50: #f7f8fa;
+  --gray-100: #eef0f4;
+  --gray-200: #e2e5ec;
+  --gray-300: #cbd0db;
+  --gray-400: #9aa2b4;
+  --gray-500: #6b7385;
+  --gray-600: #4c5365;
+  --gray-700: #353b4a;
+  --gray-800: #232734;
+  --gray-900: #161922;
+
+  /* Single indigo accent (also the "New" status). */
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-contrast: #ffffff;
+
+  /* 6 status colors (badge dot/word + tints). Tuned for AA text on the tint. */
+  --status-green: #1a7f4b;
+  --status-green-bg: #e6f4ec;
+  --status-amber: #9a6700;
+  --status-amber-bg: #fbf0d9;
+  --status-blue: #1f6feb;
+  --status-blue-bg: #e4eefb;
+  --status-gray: #5b6373;
+  --status-gray-bg: #edeff3;
+  --status-indigo: #4f46e5;
+  --status-indigo-bg: #ecebfb;
+  --status-red: #c4314b;
+  --status-red-bg: #fbe7ea;
+
+  /* Semantic surface/text roles (remapped in dark mode). */
+  --bg: var(--gray-50);
+  --surface: var(--gray-0);
+  --surface-2: var(--gray-100);
+  --border: var(--gray-200);
+  --border-strong: var(--gray-300);
+  --text: var(--gray-900);
+  --text-muted: var(--gray-500);
+  --text-faint: var(--gray-400);
+
+  /* Type. */
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --fs-base: 14px;
+  --fs-sm: 12px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+
+  /* 4px spacing scale. */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  /* Radii + shadows. */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --shadow-rest: 0 0 0 1px var(--border);
+  --shadow-hover: 0 4px 14px rgba(20, 25, 34, 0.12), 0 0 0 1px var(--border-strong);
+
+  /* Checkerboard for transparent thumbnails. */
+  --checker: #ffffff;
+  --checker-alt: #eceef2;
+
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+}
+
+/* Explicit dark theme. */
+[data-theme="dark"] {
+  --bg: var(--gray-900);
+  --surface: var(--gray-800);
+  --surface-2: var(--gray-700);
+  --border: #2c313f;
+  --border-strong: #3a4151;
+  --text: #eef0f4;
+  --text-muted: #9aa2b4;
+  --text-faint: #6b7385;
+
+  --accent: #8b85f0;
+  --accent-hover: #a29bf5;
+  --accent-contrast: #161922;
+
+  --status-green: #5fcf93;
+  --status-green-bg: #16321f;
+  --status-amber: #e3b341;
+  --status-amber-bg: #33270b;
+  --status-blue: #6cb0ff;
+  --status-blue-bg: #11233b;
+  --status-gray: #9aa2b4;
+  --status-gray-bg: #272c38;
+  --status-indigo: #a29bf5;
+  --status-indigo-bg: #1f1d3a;
+  --status-red: #ff8095;
+  --status-red-bg: #3a1620;
+
+  --checker: #2a2f3b;
+  --checker-alt: #232734;
+
+  --shadow-rest: 0 0 0 1px var(--border);
+  --shadow-hover: 0 6px 18px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--border-strong);
+}
+
+/* Follow the OS when no explicit [data-theme] is set (empty attribute = "system"). */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: var(--gray-900);
+    --surface: var(--gray-800);
+    --surface-2: var(--gray-700);
+    --border: #2c313f;
+    --border-strong: #3a4151;
+    --text: #eef0f4;
+    --text-muted: #9aa2b4;
+    --text-faint: #6b7385;
+
+    --accent: #8b85f0;
+    --accent-hover: #a29bf5;
+    --accent-contrast: #161922;
+
+    --status-green: #5fcf93;
+    --status-green-bg: #16321f;
+    --status-amber: #e3b341;
+    --status-amber-bg: #33270b;
+    --status-blue: #6cb0ff;
+    --status-blue-bg: #11233b;
+    --status-gray: #9aa2b4;
+    --status-gray-bg: #272c38;
+    --status-indigo: #a29bf5;
+    --status-indigo-bg: #1f1d3a;
+    --status-red: #ff8095;
+    --status-red-bg: #3a1620;
+
+    --checker: #2a2f3b;
+    --checker-alt: #232734;
+  }
+}

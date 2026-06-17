@@ -529,3 +529,80 @@ describe("resolveTargets — untrusted values can't escape the path", () => {
     expect(traversal(targets[0]!.state)).toBe(true);
   });
 });
+
+// --- Ladle discovery (the React harness Visual Guard can scaffold) --------
+
+const LADLE_URL = "http://localhost:61000";
+const LADLE_META_URL = `${LADLE_URL}/meta.json`;
+const LADLE_INSTANCE = "localhost-61000";
+
+function ladleConfig(
+  opts: { stories?: string[]; viewports?: number[]; managed?: boolean } = {},
+): Config {
+  const target: Record<string, unknown> = { type: "ladle", url: LADLE_URL };
+  if (opts.stories) target.stories = opts.stories;
+  if (opts.managed !== undefined) target.managed = opts.managed;
+  return parseConfig({
+    targets: [target],
+    viewports: opts.viewports ?? [1280],
+    states: ["default"],
+  });
+}
+
+describe("resolveTargets — Ladle discovery via /meta.json", () => {
+  it("discovers stories from meta.json and expands story × viewport with preview URLs", async () => {
+    const { fetch, calls } = mockFetch({
+      [LADLE_META_URL]: {
+        body: {
+          stories: {
+            "button--primary": { name: "Primary" },
+            "button--disabled": { name: "Disabled" },
+          },
+        },
+      },
+    });
+    const renders = await resolveTargets(ladleConfig({ viewports: [375, 1280] }), fetch);
+    expect(calls).toEqual([LADLE_META_URL]);
+    expect(renders).toHaveLength(4); // 2 stories × 2 viewports
+    expect(renders[0]).toMatchObject({
+      instance: LADLE_INSTANCE,
+      name: "button",
+      state: "Primary",
+      viewport: 375,
+      url: `${LADLE_URL}/?story=button--primary&mode=preview`,
+      kind: "ladle",
+    });
+  });
+
+  it("bypasses discovery when explicit stories are listed (no network)", async () => {
+    const renders = await resolveTargets(ladleConfig({ stories: ["card--default"] }), failFetch);
+    expect(renders).toHaveLength(1);
+    expect(renders[0]).toMatchObject({
+      name: "card",
+      state: "default",
+      kind: "ladle",
+      url: `${LADLE_URL}/?story=card--default&mode=preview`,
+    });
+  });
+
+  it("preserves the managed flag through config parsing", () => {
+    const cfg = ladleConfig({ managed: true });
+    expect(cfg.targets[0]).toMatchObject({ type: "ladle", managed: true });
+  });
+
+  it("fails with an actionable error when meta.json has no stories", async () => {
+    const { fetch } = mockFetch({ [LADLE_META_URL]: { body: { notStories: {} } } });
+    await expect(resolveTargets(ladleConfig(), fetch)).rejects.toThrow(/Ladle meta .* has no "stories"/);
+  });
+
+  it("sanitizes a malicious ladle story id from meta.json", async () => {
+    const safe = (segment: string): boolean => !segment.includes("..") && !segment.includes("/");
+    const { fetch } = mockFetch({
+      // No `name` field → the state derives from the (malicious) id, exercising id sanitization.
+      [LADLE_META_URL]: { body: { stories: { "../../evil--../../state": {} } } },
+    });
+    const renders = await resolveTargets(ladleConfig(), fetch);
+    expect(safe(renders[0]!.name)).toBe(true);
+    expect(safe(renders[0]!.state)).toBe(true);
+  });
+});

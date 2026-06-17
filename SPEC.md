@@ -380,6 +380,12 @@ finding (token-auditor).
 - Enabling auto-capture on every edit (vs. the agreed checkpoint trigger) — it forces a
   running dev server and adds cost to each edit.
 - Anything that writes outside the plugin root or the consuming project's `.visual-*` dirs.
+  **Exception (explicitly consented):** the `/visual-init` harness scaffolder (`scripts/harness.ts`)
+  writes a Ladle story explorer into the user's **source tree** (`.ladle/config.mjs`, co-located
+  `*.stories.tsx`, and a `@ladle/react` devDependency it then installs) when the user has React
+  components but no story explorer. This crosses the source-tree boundary **only** after a `--dry-run`
+  preview the user approves; it is idempotent (never overwrites an existing/edited file) and
+  path-guarded (`assertScaffoldTarget` refuses `..`, `node_modules`, `.git`, `.visual-*`, `dist`, etc.).
 
 ### Never do
 - Auto-approve / overwrite baselines without an explicit `/visual-baseline` (an approved

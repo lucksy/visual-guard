@@ -16,6 +16,31 @@ is **read-only** on source (never edits a file to pass, never approves a baselin
 > (could not run). In an interactive session this command *reports* the gate result; in CI you run
 > `scripts/ci.ts` directly (see §5) so the pipeline actually fails.
 
+## Show this first — banner + plan
+
+Open your response with this banner, **printed verbatim in a code block**, before any tool call:
+
+```text
+         ▄██▄
+    ████▄████▄████
+    █████▀██▀█████     V I S U A L  G U A R D
+   ▄▄██▀██▀▀██▀██▄▄    ─────────────────────────
+  ███████ ██ ███████   Catch visual bugs before they merge
+   ▀▀██▄██▄▄██▄██▀▀    for design system teams.
+    █████▄██▄█████     CI gate + PR report
+    ████▀████▀████
+         ▀██▀
+```
+
+Then lay out the plan in plain language, so the user knows what's coming before anything runs:
+
+- **1 · Preflight** — engine ready (read-only)
+- **2 · Capture + Diff** — run the full check
+- **3 · Gate** — pass/fail from the run manifest (CI exit `0` / `1` / `2`)
+- **4 · Report** — generate the PR-comment Markdown (this command doesn't post it — your CI does)
+
+**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/4 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+
 ## 0. Preflight
 
 If `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}` are unset, this isn't an installed plugin — stop.

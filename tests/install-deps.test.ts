@@ -33,17 +33,17 @@ interface InstallState {
 }
 
 const installDepsSpecifier = "../scripts/install-deps.mjs";
-const { ensureBridgeLink, ENGINE_DEPS, computeInstallState, desiredManifest } = (await import(
-  installDepsSpecifier
-)) as {
-  ensureBridgeLink: (
-    rootNodeModules: string,
-    depsNodeModules: string,
-  ) => "created" | "repaired" | "kept-existing";
-  ENGINE_DEPS: Record<string, string>;
-  computeInstallState: (dataDir: string) => InstallState;
-  desiredManifest: () => string;
-};
+const { ensureBridgeLink, ENGINE_DEPS, computeInstallState, desiredManifest, resolveDataDir } =
+  (await import(installDepsSpecifier)) as {
+    ensureBridgeLink: (
+      rootNodeModules: string,
+      depsNodeModules: string,
+    ) => "created" | "repaired" | "kept-existing";
+    ENGINE_DEPS: Record<string, string>;
+    computeInstallState: (dataDir: string) => InstallState;
+    desiredManifest: () => string;
+    resolveDataDir: (env?: Record<string, string | undefined>) => string | null;
+  };
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -65,6 +65,7 @@ describe("install-deps engine bridge", () => {
 
   it("declares tsx (the runner), the pixel-engine deps, and the token-parser deps", () => {
     expect(Object.keys(ENGINE_DEPS).sort()).toEqual([
+      "better-sqlite3",
       "culori",
       "pixelmatch",
       "playwright",
@@ -278,5 +279,38 @@ describe("computeInstallState (--check inspection)", () => {
     expect(state.missing).toContain("deps");
     expect(state.missing).toContain("browser");
     expect(state.missing).toContain("marker");
+  });
+});
+
+describe("resolveDataDir — mid-session fallback (no CLAUDE_PLUGIN_DATA needed)", () => {
+  it("prefers CLAUDE_PLUGIN_DATA when set, normalized to absolute", () => {
+    expect(resolveDataDir({ CLAUDE_PLUGIN_DATA: "/abs/data" })).toBe("/abs/data");
+    expect(resolveDataDir({ CLAUDE_PLUGIN_DATA: "/abs/data/../data" })).toBe("/abs/data");
+  });
+
+  it("falls back to <config>/plugins/data/<plugin>-<marketplace> when the env var is absent", () => {
+    // Derived from the repo's own bundled manifests (plugin "visual-guard", marketplace "lucksy").
+    expect(resolveDataDir({ CLAUDE_CONFIG_DIR: "/tmp/cfg" })).toBe(
+      join("/tmp/cfg", "plugins", "data", "visual-guard-lucksy"),
+    );
+  });
+
+  it("`--check` exits 0 and reports not-installed even when CLAUDE_PLUGIN_DATA is unset", () => {
+    // The bug: --check used to exit 1 with a scary error when the env var wasn't set (a command's
+    // Bash mid-session). A read-only status check must never crash — it reports state and exits 0.
+    const script = join(repoRoot, "scripts", "install-deps.mjs");
+    const cfg = mkdtempSync(join(tmpdir(), "vg-cfg-"));
+    const env = { ...process.env };
+    delete env.CLAUDE_PLUGIN_DATA;
+    env.CLAUDE_CONFIG_DIR = cfg;
+    try {
+      // execFileSync throws on a non-zero exit, so a clean return already proves exit 0.
+      const out = execFileSync("node", [script, "--check"], { env, encoding: "utf8" });
+      const state = JSON.parse(out) as InstallState;
+      expect(state.installed).toBe(false);
+      expect(state.dataDir).toContain(join("plugins", "data", "visual-guard-lucksy"));
+    } finally {
+      rmSync(cfg, { recursive: true, force: true });
+    }
   });
 });

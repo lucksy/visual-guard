@@ -216,6 +216,37 @@ describe("buildManifest", () => {
     expect(manifest.version).toBe(2);
   });
 
+  it("surfaces a capture-time render error (failFast:false) as a synthetic error image", () => {
+    const renders: RendersMap = {
+      ...rendersFixture(),
+      // A render that threw during capture: in renders.json with an `error` but NO png, so it never
+      // appears in compare.results — report must inject it instead of letting it vanish silently.
+      "ui/Modal/open@1280.png": {
+        url: "http://localhost:61000/?story=modal--open&mode=preview",
+        kind: "ladle",
+        viewport: 1280,
+        currentDimensions: null,
+        error: "net::ERR_ABORTED loading story",
+      },
+    };
+    const m = buildManifest(compareFixture(), CHANGED, config, {
+      generatedAt: "2026-06-13T00:00:00.000Z",
+      runDir: RUN_DIR,
+      renders,
+    });
+    const modal = m.targets.find((t) => t.target === "Modal");
+    expect(modal?.status).toBe("error");
+    const img = modal?.images[0];
+    expect(img?.status).toBe("error");
+    expect(img?.error).toMatch(/ERR_ABORTED/);
+    expect(img?.currentDimensions).toBeNull();
+    expect(img?.renderTarget?.kind).toBe("ladle");
+    expect(img?.currentPath).toBe(`${RUN_DIR}/current/ui/Modal/open@1280.png`);
+    // Counted in the summary on top of the compare totals (icons/Star is a compare-time error).
+    expect(m.summary.error).toBe(2);
+    expect(m.summary.images).toBe(6);
+  });
+
   it("attaches per-image renderTarget + currentDimensions from renders.json (v2)", () => {
     const hover = manifest.targets
       .find((t) => t.target === "Button")

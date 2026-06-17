@@ -12,6 +12,30 @@ It writes **only** under the configured `baselineDir`; it touches nothing else.
 
 The optional target is `$ARGUMENTS` (a component name, an instance label, or `instance/name`).
 
+## Show this first — banner + plan
+
+Open your response with this banner, **printed verbatim in a code block**, before any tool call:
+
+```text
+         ▄██▄
+    ████▄████▄████
+    █████▀██▀█████     V I S U A L  G U A R D
+   ▄▄██▀██▀▀██▀██▄▄    ─────────────────────────
+  ███████ ██ ███████   Catch visual bugs before they merge
+   ▀▀██▄██▄▄██▄██▀▀    for design system teams.
+    █████▄██▄█████     approve baseline
+    ████▀████▀████
+         ▀██▀
+```
+
+Then lay out the plan in plain language, so the user knows what's coming before anything runs:
+
+- **1 · Preflight** — engine + the latest run found (read-only)
+- **2 · Review** — show exactly which renders would become the new baseline
+- **3 · Approve** — write the baseline, only on your explicit go-ahead
+
+**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/3 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+
 ## 0. Preflight (same contract as /visual-check)
 
 - If `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is unset, this isn't running as an

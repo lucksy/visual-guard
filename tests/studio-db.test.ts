@@ -1,0 +1,130 @@
+import { describe, it, expect, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import Database from "better-sqlite3";
+import { migrate, openDb, schemaVersion, SCHEMA_VERSION } from "../scripts/lib/studio/db";
+
+describe("openDb / migrate", () => {
+  it("creates the v1 schema with foreign_keys ON", () => {
+    const db = openDb(":memory:");
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+
+    const tables = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]
+    ).map((row) => row.name);
+    expect(tables).toEqual(
+      expect.arrayContaining([
+        "components",
+        "variants",
+        "component_usages",
+        "snapshots",
+        "regressions",
+      ]),
+    );
+
+    const indexes = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as { name: string }[]
+    ).map((row) => row.name);
+    expect(indexes).toEqual(
+      expect.arrayContaining([
+        "idx_snapshots_timeline",
+        "idx_snapshots_hash",
+        "idx_regressions_component_axis", // v2 — a schema.sql revert would drop this
+      ]),
+    );
+    db.close();
+  });
+
+  it("migrates a fresh (user_version 0) database up to current", () => {
+    const db = new Database(":memory:");
+    expect(schemaVersion(db)).toBe(0);
+    migrate(db);
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    db.close();
+  });
+
+  const variantColumns = (db: Database.Database): string[] =>
+    (db.pragma("table_info(variants)") as { name: string }[]).map((c) => c.name);
+
+  it("migrates a v1 DB up to current — cumulatively adds the v2 index AND the v3 render_url column", () => {
+    // Simulate a DB built by the v1 schema: drop the v2 index + v3 column and roll the marker back to 1.
+    const db = openDb(":memory:");
+    db.exec("DROP INDEX IF EXISTS idx_regressions_component_axis");
+    db.exec("ALTER TABLE variants DROP COLUMN render_url");
+    db.pragma("user_version = 1");
+    expect(schemaVersion(db)).toBe(1);
+
+    migrate(db); // must run BOTH the v1→v2 and v2→v3 steps (cumulative), not just the first
+
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    const indexes = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as { name: string }[]
+    ).map((row) => row.name);
+    expect(indexes).toContain("idx_regressions_component_axis");
+    expect(variantColumns(db)).toContain("render_url");
+    db.close();
+  });
+
+  it("migrates a v2 DB up to v3 — adds the render_url column (guarded, idempotent)", () => {
+    const db = openDb(":memory:");
+    db.exec("ALTER TABLE variants DROP COLUMN render_url");
+    db.pragma("user_version = 2");
+    expect(variantColumns(db)).not.toContain("render_url");
+
+    migrate(db);
+
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(variantColumns(db)).toContain("render_url");
+    // Re-migrating must not trip the ALTER again (columnExists guard).
+    expect(() => migrate(db)).not.toThrow();
+    db.close();
+  });
+
+  it("is idempotent — re-migrating a current DB changes nothing", () => {
+    const db = openDb(":memory:");
+    const count = () =>
+      (db.prepare("SELECT COUNT(*) AS n FROM sqlite_master").get() as { n: number }).n;
+    const before = count();
+    migrate(db);
+    migrate(db);
+    expect(count()).toBe(before);
+    db.close();
+  });
+
+  it("enforces foreign keys (a snapshot needs a real component)", () => {
+    const db = openDb(":memory:");
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO snapshots (component_id, source, image_path, image_hash, version_seq)
+           VALUES (999, 'code', 'x.png', 'h', 1)`,
+        )
+        .run(),
+    ).toThrow(/FOREIGN KEY/i);
+    db.close();
+  });
+});
+
+describe("openDb — WAL on a real file DB", () => {
+  let tmp = "";
+  afterEach(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("enables WAL journal mode (the in-memory tests can't observe this — it downgrades to 'memory')", () => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-wal-"));
+    const db = openDb(join(tmp, "studio.db"));
+    expect(db.pragma("journal_mode", { simple: true })).toBe("wal");
+    db.close();
+  });
+
+  it("creates the DB's parent directory if it doesn't exist (fresh .visual-guard/)", () => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-mkdir-"));
+    // a nested, not-yet-created path — better-sqlite3 alone would throw "directory does not exist"
+    const db = openDb(join(tmp, ".visual-guard", "studio.db"));
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    db.close();
+  });
+});

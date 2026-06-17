@@ -16,6 +16,9 @@ import {
   buildScaffoldConfig,
   candidatePorts,
   classifyTarget,
+  classifyProjectKind,
+  detectComponentLibrary,
+  detectHarness,
   detectTokenSources,
   scaffoldConfigObject,
   DEFAULT_APP_ROUTES,
@@ -29,9 +32,12 @@ import {
   parseScaffoldInput,
   runInit,
   runInitFromConfig,
+  scanDesignSystem,
   scanTokenFiles,
   type DetectionResult,
 } from "../scripts/init";
+
+const FIGMA_KEY = "AbCdEf1234567890"; // 16-char base62 — a representative Figma file key
 
 describe("candidatePorts", () => {
   it("probes Storybook 6006 first, then the common app dev-server ports", () => {
@@ -76,6 +82,122 @@ describe("classifyTarget", () => {
     expect(() => classifyTarget({ url: "http://localhost:9999", reachable: false })).toThrow(
       /9999/,
     );
+  });
+});
+
+describe("detectHarness — story explorer (component-native capture)", () => {
+  it("detects Storybook via a config dir or a @storybook/* dependency", () => {
+    expect(detectHarness({ configs: [".storybook"] })).toBe("storybook");
+    expect(detectHarness({ deps: ["@storybook/react"] })).toBe("storybook");
+    expect(detectHarness({ deps: ["storybook"] })).toBe("storybook");
+  });
+  it("detects Ladle and Histoire", () => {
+    expect(detectHarness({ configs: ["ladle.config.ts"] })).toBe("ladle");
+    expect(detectHarness({ deps: ["@ladle/react"] })).toBe("ladle");
+    expect(detectHarness({ configs: ["histoire.config.ts"] })).toBe("histoire");
+    expect(detectHarness({ deps: ["@histoire/plugin-vue"] })).toBe("histoire");
+  });
+  it("returns null when no harness is present", () => {
+    expect(detectHarness({ deps: ["react", "next"], configs: ["next.config.js"] })).toBeNull();
+    expect(detectHarness({})).toBeNull();
+  });
+});
+
+describe("detectComponentLibrary — the design-system layer", () => {
+  it("picks the most populated component dir, breaking ties toward components/ui", () => {
+    expect(
+      detectComponentLibrary([
+        { path: "src/components", fileCount: 12 },
+        { path: "src/widgets", fileCount: 40 },
+      ]),
+    ).toEqual({ dir: "src/widgets", fileCount: 40, atomic: false });
+    expect(
+      detectComponentLibrary(
+        [
+          { path: "packages/ui/components", fileCount: 8 },
+          { path: "packages/ui/src/components/ui", fileCount: 8 },
+        ],
+        true,
+      ),
+    ).toEqual({ dir: "packages/ui/src/components/ui", fileCount: 8, atomic: true });
+  });
+  it("returns null when no candidate holds component files", () => {
+    expect(detectComponentLibrary([])).toBeNull();
+    expect(detectComponentLibrary([{ path: "src/components", fileCount: 0 }])).toBeNull();
+  });
+});
+
+describe("classifyProjectKind — design system vs app", () => {
+  const lib = { dir: "src/components", fileCount: 9, atomic: false };
+  it("a harness (or reachable Storybook) → harness, even with a component library or app present", () => {
+    expect(
+      classifyProjectKind({ harness: "storybook", reachableStorybook: false, componentLibrary: lib, reachableApp: true }),
+    ).toBe("harness");
+    expect(
+      classifyProjectKind({ harness: null, reachableStorybook: true, componentLibrary: null, reachableApp: true }),
+    ).toBe("harness");
+  });
+  it("a component library with no harness → component-library (NOT app, even with a reachable app)", () => {
+    expect(
+      classifyProjectKind({ harness: null, reachableStorybook: false, componentLibrary: lib, reachableApp: true }),
+    ).toBe("component-library");
+  });
+  it("no harness, no library, reachable app → app; nothing → empty", () => {
+    expect(
+      classifyProjectKind({ harness: null, reachableStorybook: false, componentLibrary: null, reachableApp: true }),
+    ).toBe("app");
+    expect(
+      classifyProjectKind({ harness: null, reachableStorybook: false, componentLibrary: null, reachableApp: false }),
+    ).toBe("empty");
+  });
+});
+
+describe("scanDesignSystem — finds the component layer + harness in code", () => {
+  let tmp = "";
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-ds-"));
+  });
+  afterEach(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  });
+  const put = (rel: string, body = ""): void => {
+    const abs = join(tmp, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, body);
+  };
+
+  it("counts component files, finds the harness config + deps, and flags atomic folders", () => {
+    put("src/components/Button.tsx", "export const Button = () => null;");
+    put("src/components/ui/Card.tsx", "export const Card = () => null;");
+    put("src/components/atoms/Icon.tsx", "export const Icon = () => null;");
+    put(".storybook/main.ts", "export default {};");
+    put("package.json", JSON.stringify({ devDependencies: { storybook: "8.0.0" } }));
+
+    const scan = scanDesignSystem(tmp);
+    expect(scan.componentDirs.find((d) => d.path === "src/components")?.fileCount).toBe(3);
+    expect(scan.atomic).toBe(true);
+    expect(scan.harnessConfigs).toContain(".storybook");
+    expect(scan.deps).toContain("storybook");
+
+    expect(detectHarness({ configs: scan.harnessConfigs, deps: scan.deps })).toBe("storybook");
+    expect(detectComponentLibrary(scan.componentDirs, scan.atomic)).toEqual({
+      dir: "src/components",
+      fileCount: 3,
+      atomic: true,
+    });
+  });
+
+  it("a component library with NO harness classifies as component-library", () => {
+    put("src/components/ui/Button.tsx", "export const Button = () => null;");
+    put("package.json", JSON.stringify({ dependencies: { react: "18" } }));
+
+    const scan = scanDesignSystem(tmp);
+    expect(detectHarness({ configs: scan.harnessConfigs, deps: scan.deps })).toBeNull();
+    const lib = detectComponentLibrary(scan.componentDirs, scan.atomic);
+    expect(lib).not.toBeNull();
+    expect(
+      classifyProjectKind({ harness: null, reachableStorybook: false, componentLibrary: lib, reachableApp: true }),
+    ).toBe("component-library");
   });
 });
 
@@ -206,6 +328,21 @@ describe("scaffoldConfigObject — slim, valid output", () => {
     expect(scaffoldConfigObject({ targets, tokenSources })).toEqual({ targets, tokens: tokenSources });
   });
 
+  it("omits figma when none is provided (code-only back-compat)", () => {
+    expect("figma" in scaffoldConfigObject({ targets })).toBe(false);
+  });
+
+  it("includes the figma block when provided", () => {
+    const figma = { files: [{ key: FIGMA_KEY, label: "Core" }] };
+    expect(scaffoldConfigObject({ targets, figma })).toEqual({ targets, figma });
+  });
+
+  it("persists the normalized figma key when a URL was supplied (extracted on write)", () => {
+    const url = `https://www.figma.com/design/${FIGMA_KEY}/Acme?node-id=0-1`;
+    const obj = scaffoldConfigObject({ targets, figma: { files: [{ key: url }] } });
+    expect(obj.figma).toEqual({ files: [{ key: FIGMA_KEY }] });
+  });
+
   it("round-trips: the slim object re-validates via parseConfig (buildScaffoldConfig)", () => {
     const obj = scaffoldConfigObject({ targets });
     // buildScaffoldConfig over the slim object must not throw — the scaffold is always loadable.
@@ -231,6 +368,9 @@ const injectedDetection: DetectionResult = {
   targets: [{ type: "storybook", url: "http://localhost:6006" }],
   usedFallback: false,
   tokenCandidates: [],
+  projectKind: "harness", // a reachable Storybook → the design-system capture path
+  framework: "react",
+  scaffoldableHarness: "ladle",
 };
 const detect = async (): Promise<DetectionResult> => injectedDetection;
 
@@ -278,6 +418,17 @@ describe("parseScaffoldInput (wizard --stdin payload)", () => {
     const raw = JSON.stringify({ targets: [{ type: "app", url: "http://localhost:3000", routes: ["/"] }] });
     expect(parseScaffoldInput(raw)).toEqual({
       targets: [{ type: "app", url: "http://localhost:3000", routes: ["/"] }],
+    });
+  });
+
+  it("passes a figma block through to the scaffold input", () => {
+    const raw = JSON.stringify({
+      targets: [{ type: "storybook", url: "http://localhost:6006" }],
+      figma: { files: [{ key: FIGMA_KEY, label: "Core" }] },
+    });
+    expect(parseScaffoldInput(raw)).toEqual({
+      targets: [{ type: "storybook", url: "http://localhost:6006" }],
+      figma: { files: [{ key: FIGMA_KEY, label: "Core" }] },
     });
   });
 
@@ -355,6 +506,23 @@ describe("runInitFromConfig — wizard-confirmed config, same guards as auto", (
 
   it("rejects an invalid scaffold (empty targets) via parseConfig validation", () => {
     expect(() => runInitFromConfig({ targets: [] }, { cwd: tmp })).toThrow(/targets/);
+  });
+
+  it("writes a figma block, normalizing a pasted URL to its key, and it round-trips", () => {
+    const url = `https://www.figma.com/design/${FIGMA_KEY}/Acme?node-id=0-1`;
+    const result = runInitFromConfig(
+      { ...input, figma: { files: [{ key: url, label: "Core" }] } },
+      { cwd: tmp },
+    );
+    expect(result.written).toBe(true);
+    const parsed = parseConfig(JSON.parse(readFileSync(join(tmp, "visual.config.json"), "utf8")));
+    expect(parsed.figma).toEqual({ files: [{ key: FIGMA_KEY, label: "Core" }] });
+  });
+
+  it("rejects an invalid figma block (empty files) via parseConfig validation", () => {
+    expect(() => runInitFromConfig({ ...input, figma: { files: [] } }, { cwd: tmp })).toThrow(
+      /figma\.files/,
+    );
   });
 });
 

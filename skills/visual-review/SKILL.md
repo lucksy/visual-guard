@@ -11,6 +11,30 @@ bundle a workflow directly, so this skill ships the orchestration as a **script 
 (`workflow.template.js`, next to this file) and launches it for you with the Workflow tool. It is
 read-only on source and sends nothing to an external service — all capture, diff, and review is local.
 
+## Show this first — banner + plan
+
+Open your response with this banner, **printed verbatim in a code block**, before any tool call:
+
+```text
+         ▄██▄
+    ████▄████▄████
+    █████▀██▀█████     V I S U A L  G U A R D
+   ▄▄██▀██▀▀██▀██▄▄    ─────────────────────────
+  ███████ ██ ███████   Catch visual bugs before they merge
+   ▀▀██▄██▄▄██▄██▀▀    for design system teams.
+    █████▄██▄█████     fan-out review
+    ████▀████▀████
+         ▀██▀
+```
+
+Then lay out the plan in plain language, so the user knows what's coming before anything runs:
+
+- **1 · Preflight** — engine ready (read-only)
+- **2 · Review** — fan out the visual-reviewer + token-auditor subagents in parallel
+- **3 · Verify** — adversarially check every finding, then synthesize one report
+
+**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/3 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+
 ## 0. Preflight — engine check (every run)
 
 - If `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is unset, this isn't running as an installed

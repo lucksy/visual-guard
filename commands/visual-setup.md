@@ -14,6 +14,30 @@ would be installed (what / why / where / size), **asks** for your approval, and 
 Use the **AskUserQuestion** tool for the approval gate. This command installs **only** into the
 plugin's own data dir — never your project — and sends nothing external.
 
+## Show this first — banner + plan
+
+Open your response with this banner, **printed verbatim in a code block**, before any tool call:
+
+```text
+         ▄██▄
+    ████▄████▄████
+    █████▀██▀█████     V I S U A L  G U A R D
+   ▄▄██▀██▀▀██▀██▄▄    ─────────────────────────
+  ███████ ██ ███████   Catch visual bugs before they merge
+   ▀▀██▄██▄▄██▄██▀▀    for design system teams.
+    █████▄██▄█████     engine setup
+    ████▀████▀████
+         ▀██▀
+```
+
+Then lay out the plan in plain language, so the user knows what's coming before anything runs:
+
+- **1 · Detect** — check what's already installed (read-only)
+- **2 · Explain** — show exactly what would download: what · why · where · ~150 MB
+- **3 · Install** — only after you approve, into the plugin's data dir (never your project)
+
+**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/3 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+
 ## 0. Preflight
 
 - If `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is unset, this isn't running as an installed

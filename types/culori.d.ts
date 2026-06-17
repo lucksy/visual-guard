@@ -15,4 +15,9 @@ declare module "culori" {
   export function formatHex(color: Color | string | undefined): string | undefined;
   /** Format a color (or color string) as an 8-digit `#rrggbbaa` (alpha-aware). */
   export function formatHex8(color: Color | string | undefined): string | undefined;
+  /**
+   * CIEDE2000 perceptual color-difference metric factory (used by the studio conformance scorer):
+   * returns `(a, b) => deltaE`, where 0 = identical and larger = more perceptually different.
+   */
+  export function differenceCiede2000(): (a: Color, b: Color) => number;
 }

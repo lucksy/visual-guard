@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en" data-theme="">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Component Studio — Visual Guard</title>
+    <!-- Inline data-URI favicon (img-src 'self' data:) so the page issues no extra/off-origin request. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%22-50%20-50%20100%20100%22%3E%3Crect%20x%3D%22-50%22%20y%3D%22-50%22%20width%3D%22100%22%20height%3D%22100%22%20rx%3D%2224%22%20fill%3D%22%234f46e5%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23fff%22%20stroke-width%3D%225%22%20stroke-linejoin%3D%22round%22%20stroke-linecap%3D%22round%22%20transform%3D%22scale(0.8)%22%3E%3Cg%20transform%3D%22rotate(0)%22%3E%3Cpath%20d%3D%22M0%20-15%20C-14%20-25.92%20-8.68%20-38.92%200%20-41%20C8.68%20-38.92%2014%20-25.92%200%20-15%20Z%22%2F%3E%3C%2Fg%3E%3Cg%20transform%3D%22rotate(45)%22%3E%3Cpath%20d%3D%22M0%20-15%20C-14%20-25.92%20-8.68%20-38.92%200%20-41%20C8.68%20-38.92%2014%20-25.92%200%20-15%20Z%22%2F%3E%3C%2Fg%3E%3Cg%20transform%3D%22rotate(90)%22%3E%3Cpath%20d%3D%22M0%20-15%20C-14%20-25.92%20-8.68%20-38.92%200%20-41%20C8.68%20-38.92%2014%20-25.92%200%20-15%20Z%22%2F%3E%3C%2Fg%3E%3Cg%20transform%3D%22rotate(135)%22%3E%3Cpath%20d%3D%22M0%20-15%20C-14%20-25.92%20-8.68%20-38.92%200%20-41%20C8.68%20-38.92%2014%20-25.92%200%20-15%20Z%22%2F%3E%3C%2Fg%3E%3Cg%20transform%3D%22rotate(180)%22%3E%3Cpath%20d%3D%22M0%20-15%20C-14%20-25.92%20-8.68%20-38.92%200%20-41%20C8.68%20-38.92%2014%20-25.92%200%20-15%20Z%22%2F%3E%3C%2Fg%3E%3Cg%20transform%3D%22rotate(225)%22%3E%3Cpath%20d%3D%22M0%20-15%20C-14%20-25.92%20-8.68%20-38.92%200%20-41%20C8.68%20-38.92%2014%20-25.92%200%20-15%20Z%22%2F%3E%3C%2Fg%3E%3Cg%20transform%3D%22rotate(270)%22%3E%3Cpath%20d%3D%22M0%20-15%20C-14%20-25.92%20-8.68%20-38.92%200%20-41%20C8.68%20-38.92%2014%20-25.92%200%20-15%20Z%22%2F%3E%3C%2Fg%3E%3Cg%20transform%3D%22rotate(315)%22%3E%3Cpath%20d%3D%22M0%20-15%20C-14%20-25.92%20-8.68%20-38.92%200%20-41%20C8.68%20-38.92%2014%20-25.92%200%20-15%20Z%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%220%22%20cy%3D%220%22%20r%3D%2214%22%2F%3E%3Ccircle%20cx%3D%220%22%20cy%3D%220%22%20r%3D%229%22%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E"
+    />
+    <!-- Same-origin assets only. The server sends a strict CSP; the page makes zero external calls. -->
+    <link rel="stylesheet" href="./tokens.css" />
+    <link rel="stylesheet" href="./app.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div id="app" aria-busy="true"></div>
+    <!-- Live region for sync progress + status announcements (a11y). -->
+    <div id="live" class="visually-hidden" aria-live="polite" role="status"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

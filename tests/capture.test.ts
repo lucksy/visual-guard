@@ -354,6 +354,60 @@ describe("captureAll", () => {
     ).rejects.toThrow(/no targets matched/);
   });
 
+  // --- failFast tolerance (managed-harness / Studio-sync path) ---
+  // A browser whose goto throws for any URL containing `badUrlSubstring`, simulating a story that
+  // crashes on load (e.g. an auto-generated story for a prop-required component).
+  function throwingBrowser(badUrlSubstring: string): Launcher {
+    return async () => ({
+      newContext: async () => ({
+        addInitScript: async () => undefined,
+        newPage: async () => ({
+          goto: async (url: string) => {
+            if (url.includes(badUrlSubstring)) throw new Error("net::ERR_ABORTED loading story");
+            return null;
+          },
+          addStyleTag: async () => null,
+          evaluate: async () => undefined,
+          screenshot: async () => Buffer.from("PNG-BYTES"),
+          close: async () => undefined,
+        }),
+        close: async () => undefined,
+      }),
+      close: async () => undefined,
+    });
+  }
+
+  const twoLadleStories = parseConfig({
+    targets: [
+      { type: "ladle", url: "http://localhost:61000", name: "ui", stories: ["button--primary", "modal--open"] },
+    ],
+    viewports: [1280],
+    states: ["default"],
+  });
+
+  it("aborts the whole run by default (failFast) when a render fails to load", async () => {
+    await expect(
+      captureAll(twoLadleStories, { runId: "R", outRoot: ".vg-test" }, deps({ launch: throwingBrowser("modal--open") })),
+    ).rejects.toThrow(/failed to capture ui\/modal/);
+  });
+
+  it("with failFast:false records the error, writes no png for it, and finishes the run", async () => {
+    const writes: Record<string, Buffer> = {};
+    const result = await captureAll(
+      twoLadleStories,
+      { runId: "R", outRoot: ".vg-test", failFast: false },
+      deps({ launch: throwingBrowser("modal--open"), writeFile: (p, d) => void (writes[p] = d) }),
+    );
+    // The good render is written; the failed one is not.
+    expect(result.written).toEqual(["ui/button/primary@1280.png"]);
+    // renders.json records BOTH lanes; only the failed one carries an `error` + null dimensions.
+    const rendersPath = join(".vg-test", "runs", "R", "renders.json");
+    const parsed = JSON.parse(writes[rendersPath]!.toString()) as RendersFile;
+    expect(parsed.renders["ui/button/primary@1280.png"]!.error).toBeUndefined();
+    expect(parsed.renders["ui/modal/open@1280.png"]!.error).toMatch(/ERR_ABORTED/);
+    expect(parsed.renders["ui/modal/open@1280.png"]!.currentDimensions).toBeNull();
+  });
+
   it("namespaces multiple instances so same-named components don't collide", async () => {
     const config = parseConfig({
       targets: [

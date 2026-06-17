@@ -12,6 +12,30 @@ report covered cells, **gaps** (expected but unbaselined), and **orphans** (a ba
 render expects). This is **read-only** — it captures nothing, approves no baseline, and sends nothing
 to any external service.
 
+## Show this first — banner + plan
+
+Open your response with this banner, **printed verbatim in a code block**, before any tool call:
+
+```text
+         ▄██▄
+    ████▄████▄████
+    █████▀██▀█████     V I S U A L  G U A R D
+   ▄▄██▀██▀▀██▀██▄▄    ─────────────────────────
+  ███████ ██ ███████   Catch visual bugs before they merge
+   ▀▀██▄██▄▄██▄██▀▀    for design system teams.
+    █████▄██▄█████     coverage map
+    ████▀████▀████
+         ▀██▀
+```
+
+Then lay out the plan in plain language, so the user knows what's coming before anything runs:
+
+- **1 · Preflight** — engine + config found (read-only)
+- **2 · Resolve** — expand the render grid and read the baselines on disk
+- **3 · Report** — covered cells, gaps (expected but unbaselined), and orphans
+
+**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/3 · <name>` that says in plain words what it does and whether it changes anything (this command is read-only throughout) — so a permission prompt is never a surprise. Never run a raw command without that context.
+
 ## 0. Preflight
 
 - If `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is unset, this isn't running as an installed

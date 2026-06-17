@@ -11,6 +11,31 @@ JSON output. The optional target is `$ARGUMENTS` (a component name, an instance 
 `instance/name`). This command is **read-only** with respect to the user's source — never
 edit a file to "make the check pass", and never approve a baseline (that is `/visual-baseline`).
 
+## Show this first — banner + plan
+
+Open your response with this banner, **printed verbatim in a code block**, before any tool call:
+
+```text
+         ▄██▄
+    ████▄████▄████
+    █████▀██▀█████     V I S U A L  G U A R D
+   ▄▄██▀██▀▀██▀██▄▄    ─────────────────────────
+  ███████ ██ ███████   Catch visual bugs before they merge
+   ▀▀██▄██▄▄██▄██▀▀    for design system teams.
+    █████▄██▄█████     visual check
+    ████▀████▀████
+         ▀██▀
+```
+
+Then lay out the plan in plain language, so the user knows what's coming before anything runs:
+
+- **1 · Preflight** — engine ready + config found (read-only)
+- **2 · Capture** — screenshot your UI in a headless browser
+- **3 · Diff** — compare each render against its approved baseline
+- **4 · Explain** — what changed visually, and the likely cause
+
+**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/4 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+
 ## 0. Preflight (fail fast, actionably)
 
 The engine and a pinned Chromium are installed into `${CLAUDE_PLUGIN_DATA}` by the
@@ -57,12 +82,24 @@ run id. The engine writes only under `.visual-guard/runs/<id>/` (gitignored); it
 nothing else. Before capture, echo `Capturing: <target or "all targets">…`, and before the
 diff, echo `Comparing against baseline…`, so the run reads like the canonical flow.
 
+**Managed harness:** if the config has a Visual-Guard-scaffolded Ladle target (`"type": "ladle",
+"managed": true`), its dev server isn't expected to be already running — `managed-serve start` boots it,
+waits until it's reachable, and a `trap … EXIT` **always** stops it afterward (even if capture fails).
+For a project whose server you run yourself (Storybook / app), `managed-serve start` is a **no-op**, so
+the same block is safe for every config.
+
 ```bash
 RUN_ID="$(date -u +%Y%m%d-%H%M%S)"
 export PLAYWRIGHT_BROWSERS_PATH="${CLAUDE_PLUGIN_DATA}/browsers"
 RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"
 SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
 TARGET="$ARGUMENTS"
+
+# Start a managed (VG-scaffolded) harness if the config has one, and ALWAYS stop it on exit — even on
+# failure. No-op when there's no managed target. The harness is only needed during capture, so stopping
+# at the end of this shell is correct (compare/report don't need it).
+trap '"$RUNNER" "$SCRIPTS/managed-serve.ts" stop --config "$CONFIG" --cwd "$PWD" >/dev/null 2>&1 || true' EXIT
+"$RUNNER" "$SCRIPTS/managed-serve.ts" start --config "$CONFIG" --cwd "$PWD"
 
 "$RUNNER" "$SCRIPTS/capture.ts" --config "$CONFIG" --run "$RUN_ID" ${TARGET:+--target "$TARGET"}
 "$RUNNER" "$SCRIPTS/compare.ts" --config "$CONFIG" --run "$RUN_ID"
@@ -73,10 +110,17 @@ TARGET="$ARGUMENTS"
 node "${CLAUDE_PLUGIN_ROOT}/scripts/detect-ui-change.mjs" --clear
 ```
 
+- If `managed-serve.ts start` fails with **"did not become reachable"** or **"exited before becoming
+  ready"**, the scaffolded harness couldn't boot — relay its message and suggest the user run their
+  package manager's install (so `@ladle/react` is present) and retry. Stop.
 - If `capture.ts` fails with **"could not reach …"**, relay its message verbatim — the dev
-  server / Storybook isn't running on that port. Stop; do not fabricate results.
+  server / Storybook isn't running on that port (a non-managed target you start yourself). Stop; do
+  not fabricate results.
 - If capture reports **"no targets matched"**, tell the user the target didn't match any
   configured story/route and list a few valid ones from the config. Stop.
+- A **managed** harness run is render-error-tolerant: an auto-generated story that fails to render is
+  recorded as an `error`-status image (surfaced in §4) instead of aborting the whole run — so one
+  prop-required component can't block the rest.
 
 ## 3. Review — structured verdict via the `visual-reviewer` subagent (Phase 1)
 

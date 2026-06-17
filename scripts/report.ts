@@ -104,8 +104,8 @@ export const VERDICT_REPORT_KEYS: readonly (keyof VerdictReport)[] = Object.keys
 export interface RenderInfo {
   /** Fully-resolved URL the render was captured from. */
   url: string;
-  kind: "storybook" | "app";
-  /** Storybook story id (parsed from the iframe URL), or null for an app route. */
+  kind: RenderRecord["kind"];
+  /** Storybook story id (parsed from the iframe URL), or null for an app/ladle route. */
   storyId: string | null;
   /** Viewport width the render was captured at. */
   viewport: number;
@@ -188,13 +188,29 @@ export function storyIdFromUrl(url: string): string | null {
   }
 }
 
+/** Extract a Ladle story id from a capture URL (`…/?story=<id>&mode=preview`), else null. */
+function ladleStoryIdFromUrl(url: string): string | null {
+  try {
+    return new URL(url).searchParams.get("story");
+  } catch {
+    return null;
+  }
+}
+
 /** Build the manifest's per-image `renderTarget` from a persisted render record. */
 function renderInfoOf(record: RenderRecord): RenderInfo {
+  // A story explorer carries a story id (Storybook `?id=`, Ladle `?story=`) so the reviewer can
+  // re-render it; an app route never does.
+  const storyId =
+    record.kind === "storybook"
+      ? storyIdFromUrl(record.url)
+      : record.kind === "ladle"
+        ? ladleStoryIdFromUrl(record.url)
+        : null;
   return {
     url: record.url,
     kind: record.kind,
-    // Only a Storybook render carries a story id; an app route never does.
-    storyId: record.kind === "storybook" ? storyIdFromUrl(record.url) : null,
+    storyId,
     viewport: record.viewport,
   };
 }
@@ -319,6 +335,41 @@ export function buildManifest(
     });
   }
 
+  // Surface capture-time failures (failFast:false): a render that threw wrote NO png, so it never
+  // reaches compare — inject a synthetic `error` image from renders.json so the failure is visible
+  // and counted, instead of silently vanishing from the manifest.
+  const comparedKeys = new Set(compare.results.map((result) => result.key));
+  let captureErrors = 0;
+  for (const [key, record] of Object.entries(renders)) {
+    if (record.error === undefined || comparedKeys.has(key)) {
+      continue;
+    }
+    const { instance, target, state, viewport } = parseKey(key);
+    const groupKey = `${instance} ${target}`;
+    let group = groups.get(groupKey);
+    if (group === undefined) {
+      group = { instance, target, images: [] };
+      groups.set(groupKey, group);
+    }
+    group.images.push({
+      state,
+      viewport,
+      status: "error",
+      ratio: null,
+      dimensionDelta: null,
+      regions: [],
+      baselinePath: null,
+      // No png was written; this is the path it WOULD occupy (run-root-relative, like other images).
+      currentPath: posixJoin(meta.runDir, posixJoin("current", key)),
+      diffPath: null,
+      error: record.error,
+      verdict: null,
+      renderTarget: renderInfoOf(record),
+      currentDimensions: null,
+    });
+    captureErrors += 1;
+  }
+
   const targets: ManifestTarget[] = [...groups.values()].map((group) => ({
     instance: group.instance,
     target: group.target,
@@ -336,11 +387,11 @@ export function buildManifest(
     changedFiles,
     summary: {
       targets: targets.length,
-      images: compare.results.length,
+      images: compare.results.length + captureErrors,
       pass: compare.summary.passed,
       fail: compare.summary.failed,
       new: compare.summary.added,
-      error: compare.summary.errored,
+      error: compare.summary.errored + captureErrors,
     },
     targets,
   };
