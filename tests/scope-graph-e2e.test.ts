@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, symlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createResolver } from "../scripts/lib/graph/resolver";
@@ -234,5 +235,75 @@ describe("Phase 3 end-to-end: a CSS @import chain reaches the story", () => {
     });
     expect(decision.mode).toBe("scoped");
     expect(decision.storyIds).toEqual(["a--primary"]);
+  });
+});
+
+describe("Phase 3: graph cache (incremental, never-stale)", () => {
+  let dir = "";
+  const read = (p: string): string => readFileSync(p, "utf8");
+  const targets: RenderTarget[] = [target({ name: "A", storyId: "a--primary", storyFile: "src/A/A.stories.tsx" })];
+  const write = (rel: string, body: string): void => {
+    mkdirSync(join(dir, rel, ".."), { recursive: true });
+    writeFileSync(join(dir, rel), body);
+  };
+  const cachePath = (): string => join(dir, ".visual-guard", "graph.json");
+  const cacheKey = (): string => JSON.parse(readFileSync(cachePath(), "utf8")).key as string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "vg-gcache-"));
+    write(".gitignore", ".visual-guard/\n"); // so the cache file isn't itself a tree change
+    write("tsconfig.json", JSON.stringify({ compilerOptions: { moduleResolution: "node" }, include: ["."] }));
+    write("src/Shared/Shared.tsx", "export const Shared = 1;\n");
+    write("src/Other/Other.tsx", "export const Other = 2;\n");
+    write("src/A/A.stories.tsx", `import { Shared } from "../Shared/Shared";\nexport const Primary = Shared;\n`);
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["config", "user.email", "t@t.dev"], { cwd: dir });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: dir });
+    execFileSync("git", ["add", "-A"], { cwd: dir });
+    execFileSync("git", ["commit", "-qm", "init"], { cwd: dir });
+  });
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("writes a cache and a second build (same tree) yields the same graph with a stable key", () => {
+    const g1 = buildProjectGraph(dir, targets, read);
+    expect(g1?.fileToStoryFiles.has("src/shared/shared.tsx")).toBe(true);
+    const key1 = cacheKey();
+    const g2 = buildProjectGraph(dir, targets, read);
+    expect(cacheKey()).toBe(key1); // tree + options unchanged → cache reused, key stable
+    expect(g2?.fileToStoryFiles.has("src/shared/shared.tsx")).toBe(true);
+  });
+
+  it("a CONTENT change (stable tree) re-parses — the cache never serves a stale edge", () => {
+    const g1 = buildProjectGraph(dir, targets, read);
+    expect(g1?.fileToStoryFiles.has("src/shared/shared.tsx")).toBe(true);
+    expect(g1?.fileToStoryFiles.has("src/other/other.tsx")).toBe(false);
+
+    // Switch the story to import a DIFFERENT already-existing component — no file added/removed, so
+    // the tree fingerprint is stable; only A.stories' content hash changes.
+    write("src/A/A.stories.tsx", `import { Other } from "../Other/Other";\nexport const Primary = Other;\n`);
+    const g2 = buildProjectGraph(dir, targets, read);
+    expect(cacheKey()).toBe(cacheKey()); // (key derives from the tree, which didn't change)
+    expect(g2?.fileToStoryFiles.has("src/other/other.tsx")).toBe(true); // fresh edge
+    expect(g2?.fileToStoryFiles.has("src/shared/shared.tsx")).toBe(false); // stale edge gone
+  });
+
+  it("invalidates the cache key when the file tree changes (a file is added)", () => {
+    buildProjectGraph(dir, targets, read);
+    const key1 = cacheKey();
+    write("src/New.tsx", "export const New = 3;\n"); // untracked add → ls-files --others changes
+    buildProjectGraph(dir, targets, read);
+    expect(cacheKey()).not.toBe(key1);
+  });
+
+  it("invalidates the cache when a tracked file is deleted from the working tree (UNSTAGED)", () => {
+    // `git ls-files` still lists an unstaged-deleted file, so this blind spot must be closed via
+    // `--deleted` — otherwise a stale edge could be served (the file's resolution may have shifted).
+    buildProjectGraph(dir, targets, read);
+    const key1 = cacheKey();
+    rmSync(join(dir, "src/Other/Other.tsx")); // working-tree deletion, not staged
+    buildProjectGraph(dir, targets, read);
+    expect(cacheKey()).not.toBe(key1);
   });
 });

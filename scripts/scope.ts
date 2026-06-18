@@ -6,6 +6,7 @@ import { loadConfig } from "./lib/config";
 import { resolveTargets, type RenderTarget } from "./lib/targets";
 import { buildImportGraph, graphComplete, type ImportGraph } from "./lib/graph/import-graph";
 import { createResolver } from "./lib/graph/resolver";
+import { loadGraphCache, saveGraphCache, sha1, withCache } from "./lib/graph/cache";
 
 /**
  * Change-scoped capture — the decision engine (Phase 0).
@@ -660,7 +661,30 @@ export function buildProjectGraph(
       }
       roots.push(abs);
     }
-    return buildImportGraph(cwd, roots, resolver);
+    // Persistent cache: reuse unchanged files' edges across runs. The key folds in the resolution
+    // options AND a tree fingerprint (the git file list), because an add/delete/rename can shift an
+    // extensionless import's resolution WITHOUT changing any importer's content — so the whole cache
+    // must drop on a tree change. No git tree → skip the cache and build fresh, never risk staleness.
+    const tracked = git(cwd, ["ls-files"]);
+    const untracked = git(cwd, ["ls-files", "--others", "--exclude-standard"]);
+    // `--deleted` lists tracked files removed from the working tree but NOT yet staged — `ls-files`
+    // still reports them, so without this an unstaged deletion would leave the tree fingerprint
+    // unchanged and the cache could serve a stale edge (defense-in-depth: the missing file would also
+    // trip the incompleteness→full-sweep fallback, but we close the blind spot directly).
+    const deleted = git(cwd, ["ls-files", "--deleted"]);
+    const treeFingerprint =
+      tracked !== null && untracked !== null && deleted !== null
+        ? sha1(`${tracked}\n${untracked}\n${deleted}`)
+        : null;
+    if (treeFingerprint === null) {
+      return buildImportGraph(cwd, roots, resolver); // uncached
+    }
+    const cacheKey = `${resolver.optionsHash}:${treeFingerprint}`;
+    const cachePath = join(cwd, ".visual-guard", "graph.json");
+    const cache = loadGraphCache(cachePath, cacheKey);
+    const graph = buildImportGraph(cwd, roots, withCache(resolver, cache, readFile));
+    saveGraphCache(cachePath, cacheKey, cache);
+    return graph;
   } catch {
     return undefined; // any graph build failure → Phase-0 fallback, never block the run
   }

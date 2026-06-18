@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { dirname, join, normalize, resolve, sep } from "node:path";
 import ts from "typescript";
@@ -70,6 +71,9 @@ export interface Resolver {
   extractImports(absFile: string): FileImports;
   /** Whether a tsconfig was found for the project (false → the caller should not trust the graph). */
   tsconfigFound: boolean;
+  /** Fingerprint of the resolution-affecting compiler options (tsconfig paths/baseUrl/moduleResolution
+   *  + its `extends` chain). Used as the graph cache key — a change here invalidates ALL cached edges. */
+  optionsHash: string;
 }
 
 /** Does the resolved file live inside a node_modules dir — a true third-party boundary? */
@@ -286,5 +290,9 @@ export function createResolver(
     return { resolved, unresolvedOrDynamic };
   };
 
-  return { extractImports, tsconfigFound: tsconfigPath !== undefined };
+  // Resolution-affecting config fingerprint (paths/baseUrl/moduleResolution come via parsed options,
+  // which already fold in the `extends` chain) — the graph cache key.
+  const optionsHash = createHash("sha1").update(JSON.stringify(options)).digest("hex");
+
+  return { extractImports, tsconfigFound: tsconfigPath !== undefined, optionsHash };
 }

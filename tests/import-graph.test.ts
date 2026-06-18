@@ -6,6 +6,7 @@ import type { FileImports, Resolver } from "../scripts/lib/graph/resolver";
 function fakeResolver(edges: Record<string, FileImports>): Resolver {
   return {
     tsconfigFound: true,
+    optionsHash: "test",
     extractImports: (abs): FileImports => edges[abs] ?? { resolved: [], unresolvedOrDynamic: false },
   };
 }
