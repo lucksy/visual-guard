@@ -1,6 +1,6 @@
 ---
-description: Capture a UI target (or all configured targets), pixel-diff against the baseline, and explain what changed.
-argument-hint: "[target]"
+description: Capture the UI a change affects (or all targets), pixel-diff against the baseline, and explain what changed.
+argument-hint: "[target] [--all] [--since <ref>]"
 ---
 
 # /visual-check — capture → pixel-diff → explain a UI change
@@ -30,11 +30,12 @@ Open your response with this banner, **printed verbatim in a code block**, befor
 Then lay out the plan in plain language, so the user knows what's coming before anything runs:
 
 - **1 · Preflight** — engine ready + config found (read-only)
-- **2 · Capture** — screenshot your UI in a headless browser
-- **3 · Diff** — compare each render against its approved baseline
-- **4 · Explain** — what changed visually, and the likely cause
+- **2 · Scope** — decide what to capture: only the components your change affects (default), or everything (`--all`)
+- **3 · Capture** — screenshot the in-scope UI in a headless browser
+- **4 · Diff** — compare each render against its approved baseline
+- **5 · Explain** — what changed visually, and the likely cause
 
-**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/4 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/5 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
 
 ## 0. Preflight (fail fast, actionably)
 
@@ -63,17 +64,21 @@ and browser live. Before running anything:
   `config/visual.config.json`, else the bundled default
   `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`. Call it `$CONFIG`.
 
-## 1. Gather
+## 1. Gather — parse the arguments into a scope intent
 
-- Surface the changed UI files as context (the banner the user expects). Run
-  `git diff --name-only HEAD` and `git ls-files --others --exclude-standard`, then keep the
-  ones matching the config's `uiGlobs`. Show them, e.g. `Changed UI files: Button.tsx · button.css`.
-- Decide scope: if `$ARGUMENTS` is non-empty, pass it as `--target`. If it is empty, capture
-  **all configured targets**. The `PostToolUse` hook (`detect-ui-change.mjs`) records edited UI
-  files in `.visual-guard/pending.json`, but this command still captures every configured target
-  rather than narrowing to that set — the report tags each target with the changed files that
-  relate to it, so a real regression is never skipped by a target-name guess. (Narrowing the
-  capture to the pending set is a later-phase optimization.)
+Read `$ARGUMENTS` and set three shell-ready values for §2 (default them to empty):
+
+- A bare word (no leading `--`, e.g. `Button` or `components/Button`) → **`EXPLICIT`** = that word.
+  An explicit target is captured directly and is **never** change-scoped.
+- `--all` present → **`ALL`** = `1` (full sweep — the source of truth; what CI uses).
+- `--since <ref>` present → **`SINCE`** = `<ref>` (scope the change against that git base instead of
+  `HEAD`).
+- Nothing (the common case) → all three empty → **change-scoped** vs `HEAD`.
+
+Then surface the changed UI files as context: run `git diff --name-only HEAD` and
+`git ls-files --others --exclude-standard`, keep the ones matching the config's `uiGlobs`, and show
+them, e.g. `Changed UI files: Button.tsx · button.css`. (The actual scope decision is made
+deterministically by `scope.ts` in §2 — this is just the human-facing banner.)
 
 ## 2. Act — capture → compare → report
 
@@ -88,20 +93,48 @@ waits until it's reachable, and a `trap … EXIT` **always** stops it afterward 
 For a project whose server you run yourself (Storybook / app), `managed-serve start` is a **no-op**, so
 the same block is safe for every config.
 
+Substitute the `EXPLICIT` / `ALL` / `SINCE` you derived in §1 into the marked lines (leave a value
+empty if it doesn't apply). The branch is deterministic — `scope.ts` decides, capture obeys.
+
 ```bash
 RUN_ID="$(date -u +%Y%m%d-%H%M%S)"
 export PLAYWRIGHT_BROWSERS_PATH="${CLAUDE_PLUGIN_DATA}/browsers"
 RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"
 SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
-TARGET="$ARGUMENTS"
+SCOPE_FILE="$PWD/.visual-guard/scope.json"
+
+EXPLICIT=""   # <- §1: a bare component target, or empty
+ALL=""        # <- §1: "1" if --all, else empty
+SINCE=""      # <- §1: a git ref if --since <ref>, else empty
 
 # Start a managed (VG-scaffolded) harness if the config has one, and ALWAYS stop it on exit — even on
-# failure. No-op when there's no managed target. The harness is only needed during capture, so stopping
-# at the end of this shell is correct (compare/report don't need it).
+# failure. No-op when there's no managed target. The harness is only needed during capture/scope.
 trap '"$RUNNER" "$SCRIPTS/managed-serve.ts" stop --config "$CONFIG" --cwd "$PWD" >/dev/null 2>&1 || true' EXIT
 "$RUNNER" "$SCRIPTS/managed-serve.ts" start --config "$CONFIG" --cwd "$PWD"
 
-"$RUNNER" "$SCRIPTS/capture.ts" --config "$CONFIG" --run "$RUN_ID" ${TARGET:+--target "$TARGET"}
+# Build args in "$@" via positional params so each flag/value is a DISTINCT argv element under BOTH
+# bash and zsh. (zsh does NOT word-split an unquoted "$VAR", so never stash flags in a string and
+# re-expand — that would arrive as one combined argument and the scripts would reject it.)
+if [ -n "$EXPLICIT" ]; then
+  set -- --target "$EXPLICIT"               # explicit component → no change-scoping
+else
+  rm -f "$SCOPE_FILE"                        # never read a stale decision from a prior run
+  set -- --config "$CONFIG" --cwd "$PWD"
+  [ -n "$ALL" ]   && set -- "$@" --all
+  [ -n "$SINCE" ] && set -- "$@" --since "$SINCE"
+  # scope.ts writes .visual-guard/scope.json + prints a summary. It NEVER fails the run; on ANY
+  # uncertainty (bad ref, server down, parse error) it writes mode "all" (full sweep).
+  "$RUNNER" "$SCRIPTS/scope.ts" "$@"
+  MODE="$(node -e 'try{process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).mode)}catch(e){process.stdout.write("all")}' "$SCOPE_FILE")"
+  if [ "$MODE" = "none" ]; then
+    echo "No UI changes since base — nothing to check. Run /visual-check --all to sweep everything."
+    exit 0   # the trap stops the managed harness
+  fi
+  set --                                     # reset, then build the capture args
+  [ "$MODE" = "scoped" ] && set -- --scope-file "$SCOPE_FILE"   # mode "all" → no flag → full sweep
+fi
+
+"$RUNNER" "$SCRIPTS/capture.ts" --config "$CONFIG" --run "$RUN_ID" "$@"
 "$RUNNER" "$SCRIPTS/compare.ts" --config "$CONFIG" --run "$RUN_ID"
 "$RUNNER" "$SCRIPTS/report.ts"  --config "$CONFIG" --run "$RUN_ID"
 
@@ -109,6 +142,12 @@ trap '"$RUNNER" "$SCRIPTS/managed-serve.ts" stop --config "$CONFIG" --cwd "$PWD"
 # Stop-hook nudge resets. Runs only after the three steps above succeed.
 node "${CLAUDE_PLUGIN_ROOT}/scripts/detect-ui-change.mjs" --clear
 ```
+
+**Surface the scope, always (the honest contract).** Echo `scope.ts`'s summary line so the user knows
+exactly what was and wasn't checked — e.g. `Scoped — 2 components, 6 of 55,200 renders (55,194 out of
+scope). Full sweep: /visual-check --all.` A scoped pass means "everything **in scope** passed," never
+"everything is fine." The full sweep (`--all`, and CI) is the source of truth; the Phase-0 heuristic
+can miss a component whose file is imported by another, and `--all` is the backstop.
 
 - If `managed-serve.ts start` fails with **"did not become reachable"** or **"exited before becoming
   ready"**, the scaffolded harness couldn't boot — relay its message and suggest the user run their

@@ -11,7 +11,7 @@
       "source": ".",
       "displayName": "Visual Guard",
       "description": "AI visual regression reviewer: capture, pixel-diff, and explain UI changes before they merge.",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "author": {
         "name": "lucksy",
         "email": "lucksy@gmail.com"

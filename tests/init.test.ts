@@ -284,7 +284,7 @@ describe("buildScaffoldConfig — uses the repo's exact DEFAULTS", () => {
     expect(cfg.threshold).toBe(0.1);
     expect(cfg.maxDiffRatio).toBe(0.01);
     expect(cfg.baselineDir).toBe(".visual-baselines");
-    expect(cfg.uiGlobs).toEqual(["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss}"]);
+    expect(cfg.uiGlobs).toEqual(["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss,sass,less,styl,pcss}"]);
   });
 
   it("defaults tokens to src/styles/tokens.css when none were detected", () => {

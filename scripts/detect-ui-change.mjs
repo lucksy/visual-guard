@@ -31,7 +31,7 @@ import { pathToFileURL } from "node:url";
  * scripts/lib/config.ts — this hook runs no-dep under a bare `node` and cannot import the TS
  * config loader, so the value is duplicated by necessity. (resolveUiGlobs prefers a real config.)
  */
-export const DEFAULT_UI_GLOBS = ["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss}"];
+export const DEFAULT_UI_GLOBS = ["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss,sass,less,styl,pcss}"];
 const PENDING_VERSION = 1;
 const NUDGE_FLAG = "--nudge";
 const CLEAR_FLAG = "--clear";

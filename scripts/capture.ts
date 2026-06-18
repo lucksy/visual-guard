@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { availableParallelism, cpus } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -44,14 +44,17 @@ export interface CliArgs {
   runId?: string;
   /** Capture pool size override (`--concurrency N`); falls back to config, then auto. */
   concurrency?: number;
+  /** Path to a `.visual-guard/scope.json` (`--scope-file`); restricts capture to the scoped set. */
+  scopeFile?: string;
 }
 
-/** Parse `--config <path> --target <name> --run <id> --concurrency <n>`; unknown flags / missing values throw. */
+/** Parse `--config <path> --target <name> --run <id> --concurrency <n> --scope-file <path>`; unknown flags / missing values throw. */
 export function parseArgs(argv: string[]): CliArgs {
   let config = "config/visual.config.json";
   let target: string | undefined;
   let runId: string | undefined;
   let concurrency: number | undefined;
+  let scopeFile: string | undefined;
 
   const value = (index: number, flag: string): string => {
     const next = argv[index];
@@ -82,12 +85,69 @@ export function parseArgs(argv: string[]): CliArgs {
         concurrency = parsed;
         break;
       }
+      case "--scope-file":
+        scopeFile = value(++i, "--scope-file");
+        break;
       default:
         fail(`unknown argument ${JSON.stringify(arg)}.`);
     }
   }
 
-  return { config, target, runId, concurrency };
+  return { config, target, runId, concurrency, scopeFile };
+}
+
+/** A capture scope: components and/or exact story ids to keep (the change-scoped subset). */
+export interface CaptureScope {
+  components: string[];
+  storyIds: string[];
+}
+
+/**
+ * Restrict renders to the change-scoped subset: keep a render whose component `name` is in
+ * `scope.components` (case-insensitive) OR whose `storyId` is in `scope.storyIds`. An empty scope
+ * keeps nothing — callers only apply this for a `mode: "scoped"` decision (never for "all").
+ */
+export function filterByScope(targets: RenderTarget[], scope: CaptureScope): RenderTarget[] {
+  const names = new Set(scope.components.map((name) => name.toLowerCase()));
+  const ids = new Set(scope.storyIds);
+  return targets.filter(
+    (target) =>
+      names.has(target.name.toLowerCase()) ||
+      (target.storyId !== undefined && ids.has(target.storyId)),
+  );
+}
+
+/**
+ * Read a `scope.json` and return the {@link CaptureScope} to apply, or null when capture must NOT
+ * narrow (mode "all"/"none", a missing/malformed file, or an empty scoped set). Best-effort: any
+ * read/parse error returns null → a full sweep, upholding the never-narrow-on-uncertainty invariant.
+ */
+export function readScopeFile(
+  path: string,
+  read: (p: string) => string = (p) => readFileSync(p, "utf8"),
+): CaptureScope | null {
+  try {
+    const parsed = JSON.parse(read(path)) as {
+      mode?: unknown;
+      components?: unknown;
+      storyIds?: unknown;
+    };
+    if (parsed.mode !== "scoped") {
+      return null; // "all"/"none"/unknown → no narrowing
+    }
+    const components = Array.isArray(parsed.components)
+      ? parsed.components.filter((c): c is string => typeof c === "string")
+      : [];
+    const storyIds = Array.isArray(parsed.storyIds)
+      ? parsed.storyIds.filter((s): s is string => typeof s === "string")
+      : [];
+    if (components.length === 0 && storyIds.length === 0) {
+      return null; // a "scoped" decision with nothing to keep → fall back to full (never capture 0)
+    }
+    return { components, storyIds };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -221,6 +281,11 @@ export interface CaptureOptions {
    * pool size never changes a single render's pixels — only how many render in parallel.
    */
   concurrency?: number;
+  /**
+   * Change-scoped subset to capture (from a `scope.json`, mode "scoped"). Absent → capture all
+   * resolved renders (a full sweep). Applied AFTER the `--target` filter.
+   */
+  scope?: CaptureScope;
 }
 
 export interface CaptureDeps {
@@ -295,12 +360,17 @@ export async function captureAll(
   options: CaptureOptions = {},
   deps: CaptureDeps = defaultDeps,
 ): Promise<CaptureResult> {
-  const targets = filterTargets(await resolveTargets(config, deps.fetch), options.target);
+  let targets = filterTargets(await resolveTargets(config, deps.fetch), options.target);
+  if (options.scope !== undefined) {
+    targets = filterByScope(targets, options.scope);
+  }
   if (targets.length === 0) {
     fail(
-      options.target === undefined
-        ? `no render targets resolved from config.`
-        : `no targets matched ${JSON.stringify(options.target)}.`,
+      options.scope !== undefined
+        ? `no renders matched the change scope (${options.scope.components.join(", ") || "none"}).`
+        : options.target === undefined
+          ? `no render targets resolved from config.`
+          : `no targets matched ${JSON.stringify(options.target)}.`,
     );
   }
 
@@ -457,12 +527,16 @@ async function main(argv: string[]): Promise<void> {
   // A managed (VG-scaffolded) harness renders auto-generated stories that can error individually — be
   // tolerant so one bad story can't abort the whole run. A user's own server stays fail-fast (loud).
   const failFast = managedLadleTargets(config).length === 0;
+  // `--scope-file` narrows to the change-scoped subset (mode "scoped"); "all"/"none"/missing → null
+  // → a full sweep, so an absent or non-scoped file never silently drops renders.
+  const scope = args.scopeFile !== undefined ? (readScopeFile(args.scopeFile) ?? undefined) : undefined;
   const result = await captureAll(config, {
     target: args.target,
     runId: args.runId,
     failFast,
     // `--concurrency` overrides the persisted config knob; both fall back to the cores-based default.
     concurrency: args.concurrency ?? config.concurrency,
+    scope,
   });
   console.log(`${PREFIX}: wrote ${result.written.length} render(s) -> ${result.currentDir}`);
 }

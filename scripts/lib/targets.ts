@@ -29,6 +29,11 @@ export interface RenderTarget {
   url: string;
   /** Origin of this target — tells capture how to realize the state. */
   kind: "storybook" | "app" | "ladle";
+  /**
+   * The story id (Storybook/Ladle) this render came from, for exact change-scope filtering.
+   * Absent for app routes (which have no story id). The component grouping is `name`.
+   */
+  storyId?: string;
 }
 
 /** Minimal structural subset of the DOM `Response` that this module needs. */
@@ -279,6 +284,7 @@ async function expandStorybook(
         viewport,
         url: iframeUrl(target.url, ref.id),
         kind: "storybook",
+        storyId: ref.id,
       });
     }
   }
@@ -366,6 +372,7 @@ async function expandLadle(
         viewport,
         url: ladlePreviewUrl(target.url, ref.id),
         kind: "ladle",
+        storyId: ref.id,
       });
     }
   }

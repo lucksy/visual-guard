@@ -4,11 +4,13 @@ import { parseConfig } from "../scripts/lib/config";
 import type { FetchLike, RenderTarget } from "../scripts/lib/targets";
 import {
   captureAll,
+  filterByScope,
   filterTargets,
   makeRunId,
   parseArgs,
   probeOrigins,
   readPngDimensions,
+  readScopeFile,
   renderRelPath,
   resolveConcurrency,
   type CaptureDeps,
@@ -57,6 +59,64 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--concurrency", "0"])).toThrow(/positive integer/);
     expect(() => parseArgs(["--concurrency", "2.5"])).toThrow(/positive integer/);
     expect(() => parseArgs(["--concurrency", "x"])).toThrow(/positive integer/);
+  });
+
+  it("reads --scope-file", () => {
+    expect(parseArgs(["--scope-file", ".visual-guard/scope.json"]).scopeFile).toBe(
+      ".visual-guard/scope.json",
+    );
+  });
+});
+
+describe("filterByScope", () => {
+  const targets = [
+    render({ name: "Button", storyId: "button--primary" }),
+    render({ name: "Card", storyId: "card--default" }),
+    render({ name: "Input", storyId: "input--default" }),
+  ];
+
+  it("keeps renders by component name (case-insensitive)", () => {
+    expect(filterByScope(targets, { components: ["button", "card"], storyIds: [] }).map((t) => t.name)).toEqual(
+      ["Button", "Card"],
+    );
+  });
+
+  it("keeps renders by exact story id", () => {
+    expect(
+      filterByScope(targets, { components: [], storyIds: ["input--default"] }).map((t) => t.name),
+    ).toEqual(["Input"]);
+  });
+
+  it("keeps nothing for an empty scope (callers only apply for mode 'scoped')", () => {
+    expect(filterByScope(targets, { components: [], storyIds: [] })).toEqual([]);
+  });
+});
+
+describe("readScopeFile (never narrows on uncertainty)", () => {
+  const reads = (content: string) => (): string => content;
+
+  it("returns the scope for a 'scoped' decision", () => {
+    expect(
+      readScopeFile("x", reads(JSON.stringify({ mode: "scoped", components: ["Button"], storyIds: [] }))),
+    ).toEqual({ components: ["Button"], storyIds: [] });
+  });
+
+  it("returns null for mode 'all' or 'none' (→ full sweep)", () => {
+    expect(readScopeFile("x", reads(JSON.stringify({ mode: "all" })))).toBeNull();
+    expect(readScopeFile("x", reads(JSON.stringify({ mode: "none" })))).toBeNull();
+  });
+
+  it("returns null for a 'scoped' decision with nothing to keep (never capture 0)", () => {
+    expect(readScopeFile("x", reads(JSON.stringify({ mode: "scoped", components: [], storyIds: [] })))).toBeNull();
+  });
+
+  it("returns null on a malformed/unreadable file (→ full sweep, never narrow on error)", () => {
+    expect(readScopeFile("x", reads("not json"))).toBeNull();
+    expect(
+      readScopeFile("x", () => {
+        throw new Error("ENOENT");
+      }),
+    ).toBeNull();
   });
 });
 
@@ -494,6 +554,64 @@ describe("captureAll", () => {
       "components/c/x@1280.png",
       "components/d/x@1280.png",
     ]);
+  });
+
+  it("captures only the scoped components when options.scope is set", async () => {
+    const config = parseConfig({
+      targets: [
+        {
+          type: "storybook",
+          url: "http://localhost:6006",
+          name: "components",
+          stories: ["button--primary", "card--default", "input--default"],
+        },
+      ],
+      viewports: [1280],
+      states: ["default"],
+    });
+    const { launch, calls } = fakeBrowser();
+    const result = await captureAll(
+      config,
+      { runId: "R", outRoot: ".vg-test", scope: { components: ["button"], storyIds: [] } },
+      deps({ launch }),
+    );
+    expect(result.written).toEqual(["components/button/primary@1280.png"]);
+    expect(calls.screenshots).toBe(1);
+  });
+
+  it("captures the matching subset when a scope names a known + an unknown component (partial match)", async () => {
+    const config = parseConfig({
+      targets: [
+        {
+          type: "storybook",
+          url: "http://localhost:6006",
+          name: "components",
+          stories: ["button--primary", "card--default"],
+        },
+      ],
+      viewports: [1280],
+      states: ["default"],
+    });
+    const { launch, calls } = fakeBrowser();
+    const result = await captureAll(
+      config,
+      // "ghost" has no render (e.g. its stories were filtered out) — must NOT error, just capture button.
+      { runId: "R", outRoot: ".vg-test", scope: { components: ["button", "ghost"], storyIds: [] } },
+      deps({ launch }),
+    );
+    expect(result.written).toEqual(["components/button/primary@1280.png"]);
+    expect(calls.screenshots).toBe(1);
+  });
+
+  it("fails with an actionable message when the scope matches no render", async () => {
+    const config = parseConfig({
+      targets: [{ type: "storybook", url: "http://localhost:6006", stories: ["button--primary"] }],
+      viewports: [1280],
+      states: ["default"],
+    });
+    await expect(
+      captureAll(config, { scope: { components: ["nonexistent"], storyIds: [] } }, deps({})),
+    ).rejects.toThrow(/no renders matched the change scope/);
   });
 
   it("sanitizes a malicious --run id so the run dir cannot escape outRoot", async () => {

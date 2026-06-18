@@ -112,6 +112,7 @@ describe("resolveTargets — Storybook discovery via /index.json", () => {
       viewport: 375,
       kind: "storybook",
       url: "http://localhost:6006/iframe.html?id=example-button--primary&viewMode=story",
+      storyId: "example-button--primary",
     });
     expect(targets).toContainEqual({
       instance: SB_INSTANCE,
@@ -120,6 +121,7 @@ describe("resolveTargets — Storybook discovery via /index.json", () => {
       viewport: 1280,
       kind: "storybook",
       url: "http://localhost:6006/iframe.html?id=example-button--disabled&viewMode=story",
+      storyId: "example-button--disabled",
     });
     expect(targets.some((t) => t.state === "Docs")).toBe(false);
   });
@@ -197,6 +199,7 @@ describe("resolveTargets — /stories.json fallback and Storybook < 7", () => {
         viewport: 1280,
         kind: "storybook",
         url: "http://localhost:6006/iframe.html?id=card--default&viewMode=story",
+        storyId: "card--default",
       },
     ]);
   });
@@ -285,6 +288,7 @@ describe("resolveTargets — explicit story list bypasses discovery", () => {
       viewport: 375,
       kind: "storybook",
       url: "http://localhost:6006/iframe.html?id=example-button--primary&viewMode=story",
+      storyId: "example-button--primary",
     });
     // An id with no "--" separator falls back to a "default" state.
     expect(targets).toContainEqual({
@@ -294,6 +298,7 @@ describe("resolveTargets — explicit story list bypasses discovery", () => {
       viewport: 1280,
       kind: "storybook",
       url: "http://localhost:6006/iframe.html?id=standalone&viewMode=story",
+      storyId: "standalone",
     });
   });
 });

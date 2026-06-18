@@ -20,7 +20,7 @@ describe("parseConfig — defaults", () => {
     expect(cfg.threshold).toBe(0.1);
     expect(cfg.maxDiffRatio).toBe(0.01);
     expect(cfg.baselineDir).toBe(".visual-baselines");
-    expect(cfg.uiGlobs).toEqual(["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss}"]);
+    expect(cfg.uiGlobs).toEqual(["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss,sass,less,styl,pcss}"]);
     expect(cfg.tokens).toEqual({
       sources: [{ source: "src/styles/tokens.css", format: "auto" }],
     });

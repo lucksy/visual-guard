@@ -137,7 +137,7 @@ const DEFAULTS = {
   threshold: 0.1,
   maxDiffRatio: 0.01,
   baselineDir: ".visual-baselines",
-  uiGlobs: ["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss}"],
+  uiGlobs: ["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss,sass,less,styl,pcss}"],
 };
 
 const STUDIO_DEFAULTS: StudioConfig = {

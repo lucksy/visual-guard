@@ -1,0 +1,325 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { RenderTarget } from "../scripts/lib/targets";
+import {
+  candidateComponentNames,
+  collectChangedFiles,
+  decideScope,
+  isGlobalFile,
+  matchesAnyGlob,
+  parseScopeArgs,
+  summarize,
+  DEFAULT_GLOBAL_GLOBS,
+  type DecideInput,
+} from "../scripts/scope";
+import { filterByScope, readScopeFile } from "../scripts/capture";
+
+const UI_GLOBS = ["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss,sass,less,styl,pcss}"];
+const TOKEN_GLOBS = ["src/styles/tokens.css"];
+
+const render = (name: string, state = "default", viewport = 1280): RenderTarget => ({
+  instance: "components",
+  name,
+  state,
+  viewport,
+  kind: "storybook",
+  url: `http://localhost:6006/iframe.html?id=${name.toLowerCase()}--${state}&viewMode=story`,
+  storyId: `${name.toLowerCase()}--${state}`,
+});
+
+// A small known universe: Button (2 renders), Card (1), Input (1).
+const TARGETS: RenderTarget[] = [
+  render("Button", "primary"),
+  render("Button", "secondary"),
+  render("Card"),
+  render("Input"),
+];
+
+const base = (over: Partial<DecideInput>): DecideInput => ({
+  changedFiles: [],
+  gitResolved: true,
+  forceAll: false,
+  uiGlobs: UI_GLOBS,
+  tokenGlobs: TOKEN_GLOBS,
+  globalGlobs: DEFAULT_GLOBAL_GLOBS,
+  targets: TARGETS,
+  ...over,
+});
+
+describe("candidateComponentNames", () => {
+  it("returns basename and parent dir, stripping story/test suffixes", () => {
+    expect(candidateComponentNames("src/components/Button/Button.css")).toEqual(["Button"]);
+    expect(candidateComponentNames("src/components/Button/Button.stories.tsx")).toEqual(["Button"]);
+    expect(candidateComponentNames("src/components/Button/index.tsx").sort()).toEqual([
+      "Button",
+      "index",
+    ]);
+    expect(candidateComponentNames("Button.tsx")).toEqual(["Button"]);
+    expect(candidateComponentNames("src/lib/format.ts").sort()).toEqual(["format", "lib"]);
+  });
+});
+
+describe("matchesAnyGlob / isGlobalFile", () => {
+  it("matches brace + ** globs", () => {
+    expect(matchesAnyGlob("src/a/Button.tsx", UI_GLOBS)).toBe(true);
+    expect(matchesAnyGlob("src/a/Button.css", UI_GLOBS)).toBe(true);
+    expect(matchesAnyGlob("README.md", UI_GLOBS)).toBe(false);
+  });
+
+  it("flags global files: tokens, .storybook, global css, lockfiles", () => {
+    expect(isGlobalFile("src/styles/tokens.css", DEFAULT_GLOBAL_GLOBS, TOKEN_GLOBS)).toBe(true);
+    expect(isGlobalFile(".storybook/preview.ts", DEFAULT_GLOBAL_GLOBS, TOKEN_GLOBS)).toBe(true);
+    expect(isGlobalFile("src/styles/global.css", DEFAULT_GLOBAL_GLOBS, TOKEN_GLOBS)).toBe(true);
+    expect(isGlobalFile("package-lock.json", DEFAULT_GLOBAL_GLOBS, TOKEN_GLOBS)).toBe(true);
+    expect(isGlobalFile("src/components/Button/Button.css", DEFAULT_GLOBAL_GLOBS, TOKEN_GLOBS)).toBe(
+      false,
+    );
+  });
+});
+
+describe("decideScope — the cardinal invariant (uncertainty always widens to a full sweep)", () => {
+  it("--all → full sweep", () => {
+    const d = decideScope(base({ forceAll: true, changedFiles: ["src/components/Button/Button.css"] }));
+    expect(d.mode).toBe("all");
+    expect(d.totalRenders).toBe(4);
+  });
+
+  it("no relevant changes with a resolved git state → none (trustworthy empty)", () => {
+    const d = decideScope(base({ changedFiles: ["README.md", "docs/x.md"], gitResolved: true }));
+    expect(d.mode).toBe("none");
+    expect(d.scopedRenders).toBe(0);
+  });
+
+  it("no relevant changes but git could NOT be resolved → full sweep (untrustworthy empty)", () => {
+    const d = decideScope(base({ changedFiles: [], gitResolved: false }));
+    expect(d.mode).toBe("all");
+    expect(d.reasons[0]).toMatch(/could not determine/);
+  });
+
+  it("a token change → full sweep", () => {
+    const d = decideScope(base({ changedFiles: ["src/styles/tokens.css"] }));
+    expect(d.mode).toBe("all");
+    expect(d.reasons[0]).toMatch(/global change: src\/styles\/tokens\.css/);
+  });
+
+  it("a Storybook-config change → full sweep", () => {
+    const d = decideScope(base({ changedFiles: [".storybook/preview.ts"] }));
+    expect(d.mode).toBe("all");
+  });
+
+  it("a UI change the heuristic can't map to a known story → full sweep", () => {
+    const d = decideScope(base({ changedFiles: ["src/lib/format.ts"] }));
+    // format.ts → candidates {format, lib}; neither is a known component → conservative full sweep.
+    expect(d.mode).toBe("all");
+    expect(d.reasons[0]).toMatch(/unmapped change/);
+  });
+
+  it("a mix of mapped + unmapped → full sweep (one miss is enough)", () => {
+    const d = decideScope(
+      base({ changedFiles: ["src/components/Button/Button.css", "src/lib/format.ts"] }),
+    );
+    expect(d.mode).toBe("all");
+  });
+
+  it("every changed UI file maps cleanly → scoped, with the right components + render count", () => {
+    const d = decideScope(
+      base({
+        changedFiles: ["src/components/Button/Button.css", "src/components/Card/Card.tsx"],
+      }),
+    );
+    expect(d.mode).toBe("scoped");
+    expect(d.components).toEqual(["Button", "Card"]);
+    // Button has 2 renders + Card 1 = 3 of 4 total.
+    expect(d.scopedRenders).toBe(3);
+    expect(d.totalRenders).toBe(4);
+  });
+
+  it("maps case-insensitively and via the parent directory", () => {
+    const d = decideScope(base({ changedFiles: ["src/components/Button/index.tsx"] }));
+    expect(d.mode).toBe("scoped");
+    expect(d.components).toEqual(["Button"]);
+  });
+});
+
+describe("decideScope — audit regressions (uncertainty must NEVER narrow)", () => {
+  it("a CASE-VARIANT token file (tokens.CSS) still fans out to a full sweep", () => {
+    // Was a critical hole: case-sensitive globs dropped tokens.CSS before the global check.
+    const d = decideScope(
+      base({ changedFiles: ["src/styles/tokens.CSS", "src/components/Button/Button.css"] }),
+    );
+    expect(d.mode).toBe("all");
+  });
+
+  it("an unrecognized, non-ignorable changed file forces a full sweep (never silently dropped)", () => {
+    // A positive include-filter used to make these vanish → mode 'none'/'scoped'. Now they widen.
+    expect(decideScope(base({ changedFiles: ["src/data/items.json"] })).mode).toBe("all");
+    expect(
+      decideScope(base({ changedFiles: ["src/components/Button/Button.css", "config/weird.toml"] }))
+        .mode,
+    ).toBe("all");
+  });
+
+  it("gitResolved:false ALWAYS widens, even when mappable UI files are present (bad --since)", () => {
+    // The guard now sits at the TOP, before the relevant filter: an untracked-only set off a failed
+    // `git diff` must not produce a scoped run.
+    const d = decideScope(
+      base({ changedFiles: ["src/components/Button/Button.tsx"], gitResolved: false }),
+    );
+    expect(d.mode).toBe("all");
+    expect(d.reasons[0]).toMatch(/could not determine/);
+  });
+
+  it("drives non-UI global files (lockfile, .storybook/main, postcss config) through to a full sweep", () => {
+    for (const file of ["pnpm-lock.yaml", "yarn.lock", ".storybook/main.ts", "postcss.config.js"]) {
+      expect(decideScope(base({ changedFiles: [file] })).mode).toBe("all");
+    }
+  });
+
+  it("a GLOB token source overlapping the UI .css glob wins as global (not scoped to a component)", () => {
+    const d = decideScope(
+      base({ changedFiles: ["src/theme/colors.css"], tokenGlobs: ["**/theme/*.css"] }),
+    );
+    expect(d.mode).toBe("all"); // global check runs BEFORE component mapping
+  });
+
+  it("a component-scoped .less edit now maps (broadened default uiGlobs)", () => {
+    const d = decideScope(base({ changedFiles: ["src/components/Card/Card.less"] }));
+    expect(d.mode).toBe("scoped");
+    expect(d.components).toEqual(["Card"]);
+  });
+
+  it("ignorable-only changes (docs, tests) are 'none'", () => {
+    expect(decideScope(base({ changedFiles: ["README.md", "src/Button.test.tsx"] })).mode).toBe(
+      "none",
+    );
+  });
+
+  it("a renderable file under an ignorable directory is NOT swallowed (story/.tsx stays in scope)", () => {
+    // A story discovered via the live index can live anywhere; a broad `<dir>/**` ignore must not
+    // drop it. `.stories.*` is structurally protected; a component .tsx under .github isn't ignored.
+    expect(
+      decideScope(base({ changedFiles: ["src/components/Button/__tests__/Button.stories.tsx"] }))
+        .mode,
+    ).toBe("scoped");
+    expect(decideScope(base({ changedFiles: [".github/ui/Card.tsx"] })).mode).toBe("scoped");
+    // A genuinely non-rendering file under those dirs is still ignored.
+    expect(decideScope(base({ changedFiles: [".github/workflows/ci.yml"] })).mode).toBe("none");
+  });
+});
+
+describe("scope.json round-trip: scope.ts decision → capture.ts consumption", () => {
+  it("a scoped decision serializes and re-applies to the exact same renders", () => {
+    const decision = decideScope(
+      base({ changedFiles: ["src/components/Button/Button.css", "src/components/Card/Card.tsx"] }),
+    );
+    expect(decision.mode).toBe("scoped");
+    // Serialize exactly as scope.ts main() does, then read it back via the capture-side reader.
+    const serialized = `${JSON.stringify(decision, null, 2)}\n`;
+    const scope = readScopeFile("scope.json", () => serialized);
+    expect(scope).not.toBeNull();
+    const kept = filterByScope(TARGETS, scope!);
+    // Button (2 renders) + Card (1) — the exact set decideScope chose, by component-name casing.
+    expect(kept.map((t) => `${t.name}/${t.state}`).sort()).toEqual([
+      "Button/primary",
+      "Button/secondary",
+      "Card/default",
+    ]);
+    expect(kept.length).toBe(decision.scopedRenders);
+  });
+});
+
+describe("parseScopeArgs", () => {
+  it("parses --all / --since / --config / --cwd and derives the default out path", () => {
+    expect(parseScopeArgs(["--all"], "/proj").all).toBe(true);
+    expect(parseScopeArgs(["--since", "main"], "/proj").since).toBe("main");
+    expect(parseScopeArgs([], "/proj").out).toBe("/proj/.visual-guard/scope.json");
+    const a = parseScopeArgs(["--config", "c.json", "--cwd", "/x", "--out", "/o/s.json"], "/proj");
+    expect(a).toEqual({ config: "c.json", cwd: "/x", out: "/o/s.json", since: undefined, all: false });
+  });
+
+  it("throws on an unknown flag or a missing value", () => {
+    expect(() => parseScopeArgs(["--nope"], "/proj")).toThrow(/unknown argument/);
+    expect(() => parseScopeArgs(["--since"], "/proj")).toThrow(/missing value/);
+  });
+});
+
+describe("summarize", () => {
+  it("describes each mode for the user", () => {
+    expect(summarize(decideScope(base({ changedFiles: ["README.md"] })))).toMatch(/nothing to check/);
+    expect(summarize(decideScope(base({ forceAll: true })))).toMatch(/full sweep — 4 renders/);
+    const scoped = decideScope(base({ changedFiles: ["src/components/Card/Card.tsx"] }));
+    expect(summarize(scoped)).toMatch(/scoped — 1 component\(s\), 1 of 4 renders \(3 out of scope\)/);
+  });
+});
+
+describe("collectChangedFiles — git diff + untracked + pending (gitResolved flag)", () => {
+  let tmp = "";
+  const gitInit = (dir: string): void => {
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["config", "user.email", "t@t.dev"], { cwd: dir });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: dir });
+  };
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-scope-"));
+  });
+  afterEach(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("reports gitResolved:true and surfaces tracked + untracked + pending files", () => {
+    gitInit(tmp);
+    mkdirSync(join(tmp, "src"), { recursive: true });
+    // Commit a .gitignore so .visual-guard/ (and the gitignore) aren't counted as untracked noise —
+    // mirrors a real project where run artifacts are ignored.
+    writeFileSync(join(tmp, ".gitignore"), ".visual-guard/\n");
+    writeFileSync(join(tmp, "src", "Button.tsx"), "export const Button = 1;\n");
+    execFileSync("git", ["add", "-A"], { cwd: tmp });
+    execFileSync("git", ["commit", "-qm", "init"], { cwd: tmp });
+    // modify a tracked file + add an untracked one + a pending marker
+    writeFileSync(join(tmp, "src", "Button.tsx"), "export const Button = 2;\n");
+    writeFileSync(join(tmp, "src", "Card.tsx"), "export const Card = 1;\n");
+    mkdirSync(join(tmp, ".visual-guard"), { recursive: true });
+    writeFileSync(
+      join(tmp, ".visual-guard", "pending.json"),
+      JSON.stringify({ version: 1, files: ["src/Input.tsx"] }),
+    );
+
+    const { files, gitResolved } = collectChangedFiles(tmp, undefined);
+    expect(gitResolved).toBe(true);
+    expect(files.sort()).toEqual(["src/Button.tsx", "src/Card.tsx", "src/Input.tsx"]);
+  });
+
+  it("reports gitResolved:false outside a git repo (so empty can't be trusted)", () => {
+    const { files, gitResolved } = collectChangedFiles(tmp, undefined);
+    expect(gitResolved).toBe(false);
+    expect(files).toEqual([]);
+  });
+
+  it("diffs against an explicit --since base (HEAD~1) across commits", () => {
+    gitInit(tmp);
+    writeFileSync(join(tmp, ".gitignore"), ".visual-guard/\n");
+    mkdirSync(join(tmp, "src"), { recursive: true });
+    writeFileSync(join(tmp, "src", "Button.tsx"), "1\n");
+    execFileSync("git", ["add", "-A"], { cwd: tmp });
+    execFileSync("git", ["commit", "-qm", "c1"], { cwd: tmp });
+    writeFileSync(join(tmp, "src", "Button.tsx"), "2\n"); // change in the 2nd commit
+    execFileSync("git", ["commit", "-aqm", "c2"], { cwd: tmp });
+
+    const { files, gitResolved } = collectChangedFiles(tmp, "HEAD~1");
+    expect(gitResolved).toBe(true);
+    expect(files).toContain("src/Button.tsx");
+  });
+
+  it("reports gitResolved:false for a bad --since ref (git diff exits non-zero)", () => {
+    gitInit(tmp);
+    writeFileSync(join(tmp, "a.txt"), "x\n");
+    execFileSync("git", ["add", "-A"], { cwd: tmp });
+    execFileSync("git", ["commit", "-qm", "c1"], { cwd: tmp });
+    const { gitResolved } = collectChangedFiles(tmp, "no-such-ref-xyz");
+    expect(gitResolved).toBe(false); // → decideScope widens to a full sweep
+  });
+});
