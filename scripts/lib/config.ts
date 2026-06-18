@@ -109,6 +109,21 @@ export interface StudioConfig {
   pruneOrphanBlobs: boolean;
 }
 
+/**
+ * Change-scoped capture knobs (Phase 3). Always present on `Config` (defaulted), so callers never
+ * branch on absence. `globalGlobs` is merged with the engine's built-in global patterns — a change
+ * to one forces a full sweep (use it to mark a project-specific global file, e.g. a theme provider
+ * applied via a Storybook decorator that no story closure reaches).
+ */
+export interface ScopeConfig {
+  /** Fraction of stories above which a changed file is a fan-out barrel → full sweep (0..1, default 0.4). */
+  fanoutThreshold: number;
+  /** Minimum library size (story count) before fan-out applies (default 8 — tiny libs always scope precisely). */
+  fanoutMinStories: number;
+  /** Extra "global" globs merged with the engine defaults; a change matching one forces a full sweep. */
+  globalGlobs: string[];
+}
+
 export interface Config {
   detect: DetectMode;
   targets: Target[];
@@ -123,6 +138,8 @@ export interface Config {
   figma?: FigmaConfig;
   /** Studio retention knobs (always defaulted). */
   studio: StudioConfig;
+  /** Change-scoped capture knobs (always defaulted). */
+  scope: ScopeConfig;
   /**
    * Capture-pool worker count. Absent → auto (cores-based). Raise it for large design systems to
    * capture more renders in parallel; the engine clamps it to the number of renders in a run.
@@ -144,6 +161,12 @@ const STUDIO_DEFAULTS: StudioConfig = {
   retainPerSource: 20,
   retainCurrent: 3,
   pruneOrphanBlobs: true,
+};
+
+const SCOPE_DEFAULTS: ScopeConfig = {
+  fanoutThreshold: 0.4,
+  fanoutMinStories: 8,
+  globalGlobs: [],
 };
 
 const DEFAULT_TOKEN_SOURCE = "src/styles/tokens.css";
@@ -490,6 +513,34 @@ export function parseStudio(raw: unknown): StudioConfig {
 }
 
 /**
+ * Normalize `config.scope` into a {@link ScopeConfig}, field-by-field defaulted (additive — absent
+ * → all defaults, so today's behavior is unchanged). Each present field is validated; unknown extras
+ * are ignored.
+ */
+export function parseScope(raw: unknown): ScopeConfig {
+  if (raw === undefined) {
+    return { ...SCOPE_DEFAULTS };
+  }
+  if (!isObject(raw)) {
+    fail(`"scope" must be an object.`);
+  }
+  return {
+    fanoutThreshold:
+      raw.fanoutThreshold === undefined
+        ? SCOPE_DEFAULTS.fanoutThreshold
+        : asRatio(raw.fanoutThreshold, "scope.fanoutThreshold"),
+    fanoutMinStories:
+      raw.fanoutMinStories === undefined
+        ? SCOPE_DEFAULTS.fanoutMinStories
+        : asPositiveInteger(raw.fanoutMinStories, "scope.fanoutMinStories"),
+    globalGlobs:
+      raw.globalGlobs === undefined
+        ? []
+        : asStringArray(raw.globalGlobs, "scope.globalGlobs"),
+  };
+}
+
+/**
  * Validate a parsed config object and fill defaults. Pure — no I/O. Throws an actionable
  * error that names the offending field on any invalid or missing-required input.
  */
@@ -511,6 +562,7 @@ export function parseConfig(raw: unknown): Config {
   const tokens = parseTokens(raw.tokens);
   const figma = parseFigma(raw.figma);
   const studio = parseStudio(raw.studio);
+  const scope = parseScope(raw.scope);
   const concurrency =
     raw.concurrency === undefined ? undefined : asPositiveInteger(raw.concurrency, "concurrency");
 
@@ -538,6 +590,7 @@ export function parseConfig(raw: unknown): Config {
     // Only attach `figma` when present, so a config without it stays byte-identical to before (D10).
     ...(figma !== undefined ? { figma } : {}),
     studio,
+    scope,
     // Likewise additive: absent `concurrency` keeps the config shape unchanged (engine auto-sizes).
     ...(concurrency !== undefined ? { concurrency } : {}),
   };

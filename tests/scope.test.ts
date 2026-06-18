@@ -340,6 +340,41 @@ describe("decideScope — Phase 1 import graph (closes the cross-import gap)", (
     expect(d.mode).toBe("scoped");
     expect(d.components).toEqual(["Button", "Card"]);
   });
+
+  it("honors a configured fanoutThreshold (a lower threshold fans out at a smaller fraction)", () => {
+    const graph: ImportGraph = {
+      built: true,
+      fileToStoryFiles: new Map([["src/lib/x.ts", new Set(manyKeys.slice(0, 3))]]), // 3/10 = 30%
+      storyIncomplete: new Map(manyKeys.map((k) => [k, false])),
+    };
+    // Default threshold 0.4 → 30% is not a fan-out → scoped.
+    expect(decideScope(base({ changedFiles: ["src/lib/x.ts"], targets: manyTargets, graph })).mode).toBe(
+      "scoped",
+    );
+    // Configured threshold 0.2 → 30% > 20% → fan-out → full sweep.
+    expect(
+      decideScope(base({ changedFiles: ["src/lib/x.ts"], targets: manyTargets, graph, fanoutThreshold: 0.2 })).mode,
+    ).toBe("all");
+  });
+
+  it("a configured extra global glob forces a full sweep (mark a project-specific global file)", () => {
+    const graph: ImportGraph = {
+      built: true,
+      fileToStoryFiles: new Map([["src/theme/provider.tsx", new Set([BTN])]]),
+      storyIncomplete: new Map([[BTN, false]]),
+    };
+    // The graph would otherwise scope it to Button; the extra global glob makes it a full sweep.
+    expect(
+      decideScope(
+        base({
+          changedFiles: ["src/theme/Provider.tsx"],
+          targets: TG,
+          graph,
+          globalGlobs: [...DEFAULT_GLOBAL_GLOBS, "**/theme/**"],
+        }),
+      ).mode,
+    ).toBe("all");
+  });
 });
 
 describe("scope.json round-trip: scope.ts decision → capture.ts consumption", () => {

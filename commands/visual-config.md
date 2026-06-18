@@ -60,6 +60,13 @@ words what it does and whether it changes anything (read-only vs writes).
   (`storybook`/`ladle`) or per-page (`app`).
 - **Tokens** — the `tokens.sources` paths (or "engine default" if absent).
 - **Figma** — the linked `figma.files` (by `label`/key), or "not linked — code-only".
+- **Scope & performance** — `concurrency` (capture-pool size, "auto" if absent) and the `scope` block
+  (`fanoutThreshold` · `fanoutMinStories` · `scope.globalGlobs`), or "engine defaults" if absent.
+- **Matrix size** — multiply discovered stories × `viewports` (× `states` for app targets) and state
+  the full-sweep size, e.g. *"4,800 stories × 3 viewports = 14,400 renders. A full sweep; `/visual-check`
+  is change-scoped by default and captures only what a change affects; `--all` sweeps everything."* If
+  that's large (> ~2,000 renders), suggest setting `concurrency` (and a static `build-storybook` target
+  for `--all`).
 
 ## 2. Choose what to change
 
@@ -71,6 +78,11 @@ Ask with **AskUserQuestion** (multi-select) which changes to make. Offer the opt
 - **Regenerate stories** — for a project with a scaffolded Ladle harness, re-run the scaffolder to add
   stories for components created since (idempotent — never overwrites edited stories).
 - **Change preferences** — `viewports`, `states`, `threshold`, `maxDiffRatio`.
+- **Scope & performance** — set `concurrency` (parallel capture), and tune change-scoping via the
+  `scope` block: `fanoutThreshold` (0–1, default 0.4 — a changed file imported by more than this
+  fraction of the library widens to a full sweep), `fanoutMinStories` (default 8), and
+  `scope.globalGlobs` (extra globs that force a full sweep — use it to mark a project-specific global
+  file, e.g. a theme provider applied via a Storybook decorator that no story closure reaches).
 
 Then gather the details for each chosen change:
 
@@ -118,6 +130,7 @@ JSON
 - Include `figma` **only** when the user wants it linked (omit the key entirely to remove it).
 - Include `tokens` only when a token source is configured; omit `viewports`/`states`/etc. unless the
   user changed them (so the engine defaults keep applying to the rest).
+- Include `scope` and/or `concurrency` **only** when the user set them (omit to keep engine defaults).
 - Confirm success from the result JSON (`written: true`, the `configPath`).
 
 ## 5. What's next

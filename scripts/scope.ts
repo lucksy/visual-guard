@@ -236,6 +236,10 @@ export interface DecideInput {
    * shell (main) and injected, so decideScope stays unit-testable.
    */
   graph?: ImportGraph;
+  /** Fan-out fraction (config `scope.fanoutThreshold`); default {@link FANOUT_THRESHOLD}. */
+  fanoutThreshold?: number;
+  /** Fan-out min library size (config `scope.fanoutMinStories`); default {@link FANOUT_MIN_STORIES}. */
+  fanoutMinStories?: number;
 }
 
 /**
@@ -330,6 +334,8 @@ const FANOUT_MIN_STORIES = 8;
  */
 function phase1Map(input: DecideInput, considered: string[], totalRenders: number): ScopeDecision {
   const graph = input.graph as ImportGraph;
+  const fanoutThreshold = input.fanoutThreshold ?? FANOUT_THRESHOLD;
+  const fanoutMinStories = input.fanoutMinStories ?? FANOUT_MIN_STORIES;
   const totalStoryFiles = graph.storyIncomplete.size; // every rooted story is in this map
   const inScopeStoryFiles = new Set<string>(); // lowercased story-file rel-posix
   const reasons: string[] = [];
@@ -338,10 +344,7 @@ function phase1Map(input: DecideInput, considered: string[], totalRenders: numbe
     if (stories !== undefined && stories.size > 0) {
       // Phase 2 fan-out: a barrel/primitive imported by most of a non-trivial library → full sweep,
       // not a huge scoped set. (Widening only — invariant-safe by construction.)
-      if (
-        totalStoryFiles >= FANOUT_MIN_STORIES &&
-        stories.size / totalStoryFiles > FANOUT_THRESHOLD
-      ) {
+      if (totalStoryFiles >= fanoutMinStories && stories.size / totalStoryFiles > fanoutThreshold) {
         const pct = Math.round((stories.size / totalStoryFiles) * 100);
         return makeDecision(
           totalRenders,
@@ -686,9 +689,12 @@ async function main(argv: string[]): Promise<void> {
       forceAll: args.all,
       uiGlobs: config.uiGlobs,
       tokenGlobs,
-      globalGlobs: DEFAULT_GLOBAL_GLOBS,
+      // Config `scope.globalGlobs` extends the built-ins (a project-specific global file → full sweep).
+      globalGlobs: [...DEFAULT_GLOBAL_GLOBS, ...config.scope.globalGlobs],
       targets,
       graph,
+      fanoutThreshold: config.scope.fanoutThreshold,
+      fanoutMinStories: config.scope.fanoutMinStories,
     });
   } catch (err) {
     // The invariant under failure: never narrow. Any error → full sweep, capture proceeds normally.

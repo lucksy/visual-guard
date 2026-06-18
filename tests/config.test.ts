@@ -141,6 +141,31 @@ describe("parseConfig — validation (actionable, names the field)", () => {
   });
 });
 
+describe("parseConfig — scope block (change-scoped knobs)", () => {
+  it("defaults the scope block when absent", () => {
+    expect(parseConfig(minimal).scope).toEqual({
+      fanoutThreshold: 0.4,
+      fanoutMinStories: 8,
+      globalGlobs: [],
+    });
+  });
+
+  it("parses fanoutThreshold / fanoutMinStories / globalGlobs", () => {
+    const cfg = parseConfig({
+      ...minimal,
+      scope: { fanoutThreshold: 0.6, fanoutMinStories: 20, globalGlobs: ["**/theme/**"] },
+    });
+    expect(cfg.scope).toEqual({ fanoutThreshold: 0.6, fanoutMinStories: 20, globalGlobs: ["**/theme/**"] });
+  });
+
+  it("validates scope fields, naming the offender", () => {
+    expect(() => parseConfig({ ...minimal, scope: { fanoutThreshold: 2 } })).toThrow(/scope\.fanoutThreshold/);
+    expect(() => parseConfig({ ...minimal, scope: { fanoutMinStories: 0 } })).toThrow(/scope\.fanoutMinStories/);
+    expect(() => parseConfig({ ...minimal, scope: { globalGlobs: "x" } })).toThrow(/scope\.globalGlobs/);
+    expect(() => parseConfig({ ...minimal, scope: "nope" })).toThrow(/scope/);
+  });
+});
+
 describe("parseConfig — tokens (multi-format, back-compat)", () => {
   it("normalizes a bare string path to one auto-detected source", () => {
     const cfg = parseConfig({ ...minimal, tokens: "src/theme.css" });
@@ -254,6 +279,7 @@ describe("parseConfig — figma (additive, backward-compatible, no token)", () =
       "baselineDir",
       "detect",
       "maxDiffRatio",
+      "scope", // always defaulted (Phase 3)
       "states",
       "studio", // always defaulted (P5)
       "targets",
