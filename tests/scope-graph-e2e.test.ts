@@ -64,6 +64,16 @@ describe("resolver hardening (audit fixes) — real TS resolution", () => {
     expect(out.unresolvedOrDynamic).toBe(true); // would otherwise silently drop the edge
   });
 
+  it("resolves a non-dotted relative CSS @import as a sibling edge, not an external package", () => {
+    write("src/styles/foo/bar.css", ".b {}\n");
+    write("src/styles/A.css", `@import "foo/bar.css";\n@import "normalize.css";\n.a {}\n`);
+    const out = createResolver(dir, (p) => readFileSync(p, "utf8")).extractImports(join(dir, "src/styles/A.css"));
+    expect(out.unresolvedOrDynamic).toBe(false);
+    const rels = out.resolved.map((p) => p.slice(dir.length + 1).split("\\").join("/"));
+    // The path-shaped sibling is a real edge; the single-word npm package stays an external boundary.
+    expect(rels).toEqual(["src/styles/foo/bar.css"]);
+  });
+
   it("follows a workspace package SYMLINKED into node_modules as a first-party edge (not external)", () => {
     // pnpm/npm/yarn workspace layout: node_modules/mylib → packages/mylib (a symlink). TS may flag
     // the import isExternalLibraryImport even though it resolves to a tracked in-repo file.
@@ -181,5 +191,48 @@ describe("Phase 1 end-to-end: real graph → decideScope → scope.json → filt
     expect(scope).not.toBeNull();
     const kept = filterByScope(targets, scope!);
     expect(kept.map((t) => t.storyId).sort()).toEqual(["a--primary", "b--primary"]);
+  });
+});
+
+describe("Phase 3 end-to-end: a CSS @import chain reaches the story", () => {
+  let dir = "";
+  const write = (rel: string, body: string): void => {
+    mkdirSync(join(dir, rel, ".."), { recursive: true });
+    writeFileSync(join(dir, rel), body);
+  };
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "vg-css-"));
+    write("tsconfig.json", JSON.stringify({ compilerOptions: { moduleResolution: "node" }, include: ["."] }));
+    // shared.css is reached ONLY via a CSS @import — invisible to the JS/TS extractor.
+    write("src/Shared/shared.css", ".shared { color: red }\n");
+    write("src/A/A.css", `@import "../Shared/shared.css";\n.a { color: blue }\n`);
+    write("src/A/A.tsx", `import "./A.css";\nexport const A = 1;\n`);
+    write("src/A/A.stories.tsx", `import { A } from "./A";\nexport const Primary = A;\n`);
+  });
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("editing a stylesheet reached only via @import scopes the importing story", () => {
+    const targets: RenderTarget[] = [
+      target({ name: "A", storyId: "a--primary", storyFile: "src/A/A.stories.tsx" }),
+    ];
+    const graph = buildProjectGraph(dir, targets, (p) => readFileSync(p, "utf8"));
+    expect(graph?.built).toBe(true);
+    // The CSS @import edge put shared.css into A's story closure.
+    expect(graph?.fileToStoryFiles.has("src/shared/shared.css")).toBe(true);
+
+    const decision = decideScope({
+      changedFiles: ["src/Shared/shared.css"],
+      gitResolved: true,
+      forceAll: false,
+      uiGlobs: UI_GLOBS,
+      tokenGlobs: [],
+      globalGlobs: [],
+      targets,
+      graph,
+    });
+    expect(decision.mode).toBe("scoped");
+    expect(decision.storyIds).toEqual(["a--primary"]);
   });
 });

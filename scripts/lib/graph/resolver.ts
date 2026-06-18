@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 import { dirname, join, normalize, resolve, sep } from "node:path";
 import ts from "typescript";
+import { extractCssSpecifiers, isCssFile } from "./css-imports";
 
 /** Extensions probed when a specifier resolves to a file the TS resolver can't see (CSS/assets) or
  *  an extensionless path. Ordered TS-first so a real `.ts` wins over a same-named asset. */
@@ -9,6 +10,9 @@ const PROBE_EXTENSIONS = [
   ".css", ".scss", ".sass", ".less", ".styl", ".pcss",
   ".json", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif",
 ];
+
+/** CSS-first probe order for a stylesheet `@import` target (so `@import './x'` prefers x.css). */
+const CSS_PROBE_EXTENSIONS = [".css", ".scss", ".sass", ".less", ".styl", ".pcss"];
 
 function isFile(path: string): boolean {
   try {
@@ -24,12 +28,12 @@ function isFile(path: string): boolean {
  * Returns the normalized file path, or null. This is what makes `./Button.css` / `@/styles/theme`
  * real graph edges instead of silent holes.
  */
-function probeAsset(base: string): string | null {
+function probeAsset(base: string, extensions: string[] = PROBE_EXTENSIONS): string | null {
   if (isFile(base)) return normalize(base);
-  for (const ext of PROBE_EXTENSIONS) {
+  for (const ext of extensions) {
     if (isFile(base + ext)) return normalize(base + ext);
   }
-  for (const ext of PROBE_EXTENSIONS) {
+  for (const ext of extensions) {
     const indexFile = join(base, `index${ext}`);
     if (isFile(indexFile)) return normalize(indexFile);
   }
@@ -178,6 +182,46 @@ export function createResolver(
     return aliased.file !== null ? { kind: "edge", file: aliased.file } : { kind: "unresolved" };
   };
 
+  /**
+   * Resolve a CSS `@import` / `@use` / `composes-from` specifier. Relative → fs-probe (CSS extensions
+   * first, so `@import './x'` prefers x.css over a same-named x.ts); an aliased first-party path →
+   * edge, or incomplete on a miss; a bare specifier → an npm/SCSS-builtin stylesheet (boundary).
+   * `~pkg` is webpack's node_modules convention.
+   */
+  const resolveCssSpec = (spec: string, fromFile: string): SpecResult => {
+    const value = spec.startsWith("~") ? spec.slice(1) : spec;
+    if (value.startsWith(".") || value.startsWith("/")) {
+      const file = probeAsset(resolve(dirname(fromFile), value), CSS_PROBE_EXTENSIONS);
+      return file !== null ? { kind: "edge", file } : { kind: "unresolved" };
+    }
+    const aliased = pathsFallback(value);
+    if (aliased.file !== null) return { kind: "edge", file: aliased.file };
+    if (aliased.matched) return { kind: "unresolved" }; // first-party alias that didn't resolve
+    // A non-dotted value: plain CSS / postcss-import resolve it relative to the stylesheet FIRST, so
+    // fs-probe a sibling before treating it as a package (matches the JS branch's conservatism). A
+    // path-shaped value (has a `/`) that still doesn't resolve is first-party-ish → incomplete, never
+    // a silent drop. Only a single bare word (`normalize.css`, `sass:math`) is a real npm/builtin
+    // boundary.
+    const sibling = probeAsset(resolve(dirname(fromFile), value), CSS_PROBE_EXTENSIONS);
+    if (sibling !== null) return { kind: "edge", file: sibling };
+    return value.includes("/") ? { kind: "unresolved" } : { kind: "external" };
+  };
+
+  /** Extract + resolve a stylesheet's `@import`/`@use`/`@forward`/`composes` edges. */
+  const extractCssImports = (absFile: string, text: string): FileImports => {
+    const dot = absFile.lastIndexOf(".");
+    const ext = dot >= 0 ? absFile.slice(dot) : "";
+    const { specifiers, dynamic } = extractCssSpecifiers(text, ext);
+    const resolved: string[] = [];
+    let unresolvedOrDynamic = dynamic;
+    for (const spec of specifiers) {
+      const result = resolveCssSpec(spec, absFile);
+      if (result.kind === "edge") resolved.push(result.file);
+      else if (result.kind === "unresolved") unresolvedOrDynamic = true;
+    }
+    return { resolved, unresolvedOrDynamic };
+  };
+
   /** A cheap AST visit that flags computed `import(expr)` / `require(expr)` — the cases
    *  preProcessFile silently omits. Gated behind a string pre-check so the ~majority of files
    *  with no dynamic syntax skip the second parse. */
@@ -225,6 +269,10 @@ export function createResolver(
     } catch {
       // Can't read the file (deleted/permission) → can't trust its imports → incomplete.
       return { resolved: [], unresolvedOrDynamic: true };
+    }
+    // A stylesheet's edges (@import / @use / composes) are invisible to the TS extractor — parse CSS.
+    if (isCssFile(absFile)) {
+      return extractCssImports(absFile, text);
     }
     const info = ts.preProcessFile(text, /* readImportFiles */ true, /* detectJavaScriptImports */ true);
     const resolved: string[] = [];
