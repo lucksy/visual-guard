@@ -34,6 +34,12 @@ export interface RenderTarget {
    * Absent for app routes (which have no story id). The component grouping is `name`.
    */
   storyId?: string;
+  /**
+   * The story's SOURCE file (project-relative posix), the change-scope import-graph root. Present
+   * only for discovered Storybook stories (an index `importPath`); absent for explicit story lists,
+   * Ladle, and app routes — those fall back to the Phase-0 filename heuristic.
+   */
+  storyFile?: string;
 }
 
 /** Minimal structural subset of the DOM `Response` that this module needs. */
@@ -95,16 +101,36 @@ interface StoryRef {
   id: string;
   component: string;
   state: string;
+  /** Story SOURCE file (project-relative posix), from the index `importPath` — the change-scope
+   *  graph root. Present only for discovered stories (an index entry); absent for explicit lists. */
+  storyFile?: string;
 }
 
-function refFromEntry(id: string, title: string | undefined, name: string | undefined): StoryRef {
+/** Normalize an index `importPath` ("./src/.../X.stories.tsx") to git-diff space ("src/.../X.stories.tsx"). */
+function normalizeImportPath(value: string): string {
+  return value.split("\\").join("/").replace(/^\.\//, "");
+}
+
+function refFromEntry(
+  id: string,
+  title: string | undefined,
+  name: string | undefined,
+  importPath?: string,
+): StoryRef {
   // `component` and `state` become path segments and derive from untrusted story metadata,
   // so they are sanitized here at the single point both discovered and explicit refs pass through.
+  // `storyFile` is NOT a path segment we write — it's matched against git paths + used as a graph
+  // root — so it's normalized, not sanitized.
+  const storyFile =
+    typeof importPath === "string" && importPath.trim().length > 0
+      ? { storyFile: normalizeImportPath(importPath) }
+      : {};
   if (title !== undefined) {
     return {
       id,
       component: sanitizePathSegment(componentFromTitle(title)),
       state: sanitizePathSegment(name ?? "default"),
+      ...storyFile,
     };
   }
   const parsed = parseStoryId(id);
@@ -112,6 +138,7 @@ function refFromEntry(id: string, title: string | undefined, name: string | unde
     id,
     component: sanitizePathSegment(parsed.name),
     state: sanitizePathSegment(name ?? parsed.state),
+    ...storyFile,
   };
 }
 
@@ -210,7 +237,9 @@ function parseStoryIndex(payload: unknown, sourceUrl: string, base: string): Sto
     if (id === undefined) continue;
     const title = typeof value.title === "string" ? value.title : undefined;
     const name = typeof value.name === "string" ? value.name : undefined;
-    refs.push(refFromEntry(id, title, name));
+    // `importPath` (SB7+ index) is the story's source file — the change-scope graph root.
+    const importPath = typeof value.importPath === "string" ? value.importPath : undefined;
+    refs.push(refFromEntry(id, title, name, importPath));
   }
   return refs;
 }
@@ -285,6 +314,7 @@ async function expandStorybook(
         url: iframeUrl(target.url, ref.id),
         kind: "storybook",
         storyId: ref.id,
+        ...(ref.storyFile !== undefined ? { storyFile: ref.storyFile } : {}),
       });
     }
   }

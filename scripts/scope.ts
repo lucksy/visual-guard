@@ -1,9 +1,11 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadConfig } from "./lib/config";
 import { resolveTargets, type RenderTarget } from "./lib/targets";
+import { buildImportGraph, graphComplete, type ImportGraph } from "./lib/graph/import-graph";
+import { createResolver } from "./lib/graph/resolver";
 
 /**
  * Change-scoped capture — the decision engine (Phase 0).
@@ -227,6 +229,13 @@ export interface DecideInput {
   globalGlobs: string[];
   /** The resolved render list — supplies the known-component universe and the render counts. */
   targets: RenderTarget[];
+  /**
+   * Phase-1 import graph (built from story-file roots). When present and `built`, decideScope maps
+   * changed files to stories via real imports instead of the filename heuristic. Absent / not built
+   * → the Phase-0 heuristic runs (the conservative fallback). Pure: the graph is built by the I/O
+   * shell (main) and injected, so decideScope stays unit-testable.
+   */
+  graph?: ImportGraph;
 }
 
 /**
@@ -234,80 +243,35 @@ export interface DecideInput {
  * is when EVERY relevant changed file maps cleanly to a known story component and nothing global
  * changed. Everything else widens to `"all"` (the invariant).
  */
-export function decideScope(input: DecideInput): ScopeDecision {
-  const totalRenders = input.targets.length;
-  const make = (
-    mode: ScopeMode,
-    components: string[],
-    reasons: string[],
-    changedFiles: string[],
-    scopedRenders: number,
-  ): ScopeDecision => ({
+/** Assemble a {@link ScopeDecision}; `storyIds` defaults empty (set only on the Phase-1 scoped path). */
+function makeDecision(
+  totalRenders: number,
+  mode: ScopeMode,
+  components: string[],
+  reasons: string[],
+  changedFiles: string[],
+  scopedRenders: number,
+  storyIds: string[] = [],
+): ScopeDecision {
+  return {
     version: SCOPE_VERSION,
     mode,
     components,
-    storyIds: [],
+    storyIds,
     reasons,
     changedFiles,
     totalRenders,
     scopedRenders,
-  });
+  };
+}
 
-  if (input.forceAll) {
-    return make("all", [], ["--all requested → full sweep"], input.changedFiles, totalRenders);
-  }
-
-  // (Invariant) If we could not even establish the changed set — not a git repo, a bad `--since`
-  // ref, git unavailable — an empty OR partial list can't be trusted. Widen to a full sweep BEFORE
-  // any narrowing logic, so a successful `git ls-files` (untracked) can't produce a scoped run off
-  // a change set that's missing the whole `git diff`.
-  if (!input.gitResolved) {
-    return make(
-      "all",
-      [],
-      ["could not determine changed files (no git diff / not a git repo / bad base) → full sweep"],
-      input.changedFiles,
-      totalRenders,
-    );
-  }
-
-  // Classify by EXCLUSION, not inclusion. A file is "considered" unless it is provably ignorable
-  // (docs, tests, editor/CI config, our own artifacts). This is the invariant's backbone: an
-  // UNRECOGNIZED changed file must never silently vanish — it stays "considered" and, failing to
-  // map cleanly below, forces a full sweep. (A positive include-filter would silently drop anything
-  // it didn't recognize — e.g. `Button.less`, `tokens.CSS` — the exact under-capture we guard.)
-  // A story-defining or global file is ALWAYS protected from the ignore rule (structural backstop
-  // against an over-broad ignorable matching a renderable file, e.g. a `.stories.tsx` under tests).
-  const isProtected = (file: string): boolean =>
-    matchesAnyGlob(file, STORY_FILE_GLOBS) ||
-    isGlobalFile(file, input.globalGlobs, input.tokenGlobs);
-  const considered = input.changedFiles.filter(
-    (file) => isProtected(file) || !matchesAnyGlob(file, IGNORABLE_GLOBS),
-  );
-
-  if (considered.length === 0) {
-    return make("none", [], ["no rendering-relevant files changed since base"], [], 0);
-  }
-
-  // Any global change (tokens, global CSS, Storybook/build config, a lockfile) can affect every
-  // render → full sweep.
-  const globalHits = considered.filter((file) =>
-    isGlobalFile(file, input.globalGlobs, input.tokenGlobs),
-  );
-  if (globalHits.length > 0) {
-    return make(
-      "all",
-      [],
-      globalHits.map((file) => `global change: ${file} → full sweep`),
-      considered,
-      totalRenders,
-    );
-  }
-
-  // Map each considered file to a KNOWN story component. ONLY a UI file (a component's own
-  // .tsx/.css) is eligible; any other considered file (a shared .ts, an imported asset, an
-  // unrecognized config) is "unmapped" → full sweep, because filename can't prove it affects one
-  // component. Component matching is case-insensitive.
+/**
+ * Phase-0 mapping (the conservative fallback): filename heuristic. ONLY a UI file maps — to a known
+ * component by name; any other considered file is "unmapped" → full sweep, because a filename can't
+ * prove it affects one component. Used when there is no import graph (app/ladle-only runs, explicit
+ * story lists, no tsconfig, or a failed/over-budget graph build).
+ */
+function phase0Map(input: DecideInput, considered: string[], totalRenders: number): ScopeDecision {
   const byLowerName = new Map<string, string>();
   for (const target of input.targets) {
     byLowerName.set(target.name.toLowerCase(), target.name);
@@ -330,9 +294,9 @@ export function decideScope(input: DecideInput): ScopeDecision {
       reasons.push(`changed: ${file} → ${matched.join(", ")}`);
     }
   }
-
   if (unmapped.length > 0) {
-    return make(
+    return makeDecision(
+      totalRenders,
       "all",
       [],
       unmapped.map((file) => `unmapped change: ${file} (couldn't tie it to one story) → full sweep`),
@@ -340,10 +304,139 @@ export function decideScope(input: DecideInput): ScopeDecision {
       totalRenders,
     );
   }
-
   const components = [...inScope].sort();
   const scopedRenders = input.targets.filter((target) => inScope.has(target.name)).length;
-  return make("scoped", components, reasons, considered, scopedRenders);
+  return makeDecision(totalRenders, "scoped", components, reasons, considered, scopedRenders);
+}
+
+/**
+ * Phase-1 mapping: real import graph. Maps each considered file to the story FILES whose transitive
+ * import closure reaches it (closing Phase-0's cross-import gap — a file imported by N components
+ * scopes to all N). A file reaching ZERO stories may contribute "none" ONLY when the graph is
+ * provably complete; otherwise it widens to a full sweep (it could sit in an unmapped subtree).
+ * Every graph-incomplete story (an untrustworthy closure) is captured in EVERY scoped run.
+ */
+function phase1Map(input: DecideInput, considered: string[], totalRenders: number): ScopeDecision {
+  const graph = input.graph as ImportGraph;
+  const inScopeStoryFiles = new Set<string>(); // lowercased story-file rel-posix
+  const reasons: string[] = [];
+  for (const file of considered) {
+    const stories = graph.fileToStoryFiles.get(file.toLowerCase());
+    if (stories !== undefined && stories.size > 0) {
+      for (const storyFile of stories) {
+        inScopeStoryFiles.add(storyFile);
+      }
+      reasons.push(`changed: ${file} → ${stories.size} story file(s)`);
+    } else if (graphComplete(graph)) {
+      // Provably affects no story (graph fully resolved) — contributes nothing.
+      reasons.push(`changed: ${file} → affects no story (graph complete)`);
+    } else {
+      // Zero-resolution under an incomplete graph: could be an unmapped subtree → full sweep.
+      return makeDecision(
+        totalRenders,
+        "all",
+        [],
+        [...reasons, `unmapped change: ${file} (graph incomplete — may be used unmapped) → full sweep`],
+        considered,
+        totalRenders,
+      );
+    }
+  }
+
+  // Invariant: a story whose import closure isn't fully trustworthy is captured in EVERY scoped run.
+  for (const [storyFile, incomplete] of graph.storyIncomplete) {
+    if (incomplete) {
+      inScopeStoryFiles.add(storyFile);
+    }
+  }
+
+  // Expand the in-scope story FILES → storyIds + component names via the index data on `targets`.
+  const storyIds = new Set<string>();
+  const components = new Set<string>();
+  for (const target of input.targets) {
+    if (
+      target.storyId !== undefined &&
+      target.storyFile !== undefined &&
+      inScopeStoryFiles.has(target.storyFile.toLowerCase())
+    ) {
+      storyIds.add(target.storyId);
+      components.add(target.name);
+    }
+  }
+  if (storyIds.size === 0) {
+    return makeDecision(totalRenders, "none", [], ["no story affected since base (import graph)"], [], 0);
+  }
+  const scopedRenders = input.targets.filter(
+    (target) => target.storyId !== undefined && storyIds.has(target.storyId),
+  ).length;
+  return makeDecision(
+    totalRenders,
+    "scoped",
+    [...components].sort(),
+    reasons,
+    considered,
+    scopedRenders,
+    [...storyIds].sort(),
+  );
+}
+
+export function decideScope(input: DecideInput): ScopeDecision {
+  const totalRenders = input.targets.length;
+
+  if (input.forceAll) {
+    return makeDecision(totalRenders, "all", [], ["--all requested → full sweep"], input.changedFiles, totalRenders);
+  }
+
+  // (Invariant) If we could not even establish the changed set — not a git repo, a bad `--since`
+  // ref, git unavailable — an empty OR partial list can't be trusted. Widen to a full sweep BEFORE
+  // any narrowing, so a successful `git ls-files` (untracked) can't yield a scoped run off a set
+  // that's missing the whole `git diff`.
+  if (!input.gitResolved) {
+    return makeDecision(
+      totalRenders,
+      "all",
+      [],
+      ["could not determine changed files (no git diff / not a git repo / bad base) → full sweep"],
+      input.changedFiles,
+      totalRenders,
+    );
+  }
+
+  // Classify by EXCLUSION, not inclusion: a file is "considered" unless it is provably ignorable
+  // (docs, tests, editor/CI config, our artifacts). An unrecognized changed file must never silently
+  // vanish — it stays "considered" and, failing to map, forces a full sweep. Story-defining + global
+  // files are ALWAYS protected from the ignore rule (a `.stories.tsx` under tests, a `tokens.CSS`).
+  const isProtected = (file: string): boolean =>
+    matchesAnyGlob(file, STORY_FILE_GLOBS) || isGlobalFile(file, input.globalGlobs, input.tokenGlobs);
+  const considered = input.changedFiles.filter(
+    (file) => isProtected(file) || !matchesAnyGlob(file, IGNORABLE_GLOBS),
+  );
+
+  if (considered.length === 0) {
+    return makeDecision(totalRenders, "none", [], ["no rendering-relevant files changed since base"], [], 0);
+  }
+
+  // Any global change (tokens, global CSS, Storybook/build config, a lockfile) → full sweep.
+  const globalHits = considered.filter((file) =>
+    isGlobalFile(file, input.globalGlobs, input.tokenGlobs),
+  );
+  if (globalHits.length > 0) {
+    return makeDecision(
+      totalRenders,
+      "all",
+      [],
+      globalHits.map((file) => `global change: ${file} → full sweep`),
+      considered,
+      totalRenders,
+    );
+  }
+
+  // Phase 1 (import graph) when available + built; otherwise the Phase-0 filename heuristic. Both
+  // honor the SAME early exits above; the graph only ever finds MORE stories per file, never fewer,
+  // so Phase 1 strictly improves precision without ever under-capturing.
+  return input.graph !== undefined && input.graph.built
+    ? phase1Map(input, considered, totalRenders)
+    : phase0Map(input, considered, totalRenders);
 }
 
 /** A one-line, human-readable summary of a decision (the command surfaces this to the user). */
@@ -484,6 +577,63 @@ export function collectChangedFiles(cwd: string, since: string | undefined): {
   return { files: [...set], gitResolved };
 }
 
+/**
+ * Build the Phase-1 import graph for a run, or undefined to fall back to the Phase-0 heuristic. The
+ * graph is used ONLY when it can cover the ENTIRE render universe with cwd-internal roots, because
+ * `graphComplete` only attests to the ROOTED stories' closures: if any target is NOT rooted (Ladle,
+ * app routes, explicit story lists — no `storyFile`) or a root escapes cwd (so its keys can never
+ * match git `--relative` paths), a zero-resolution change would falsely read as "affects no story"
+ * and silently drop that render. So EVERY target must carry a cwd-internal `storyFile`, else we
+ * return undefined (full Phase-0 fallback). No tsconfig or any build error → undefined too. Never
+ * throws. `readFile` is injectable for tests.
+ */
+export function buildProjectGraph(
+  cwd: string,
+  targets: RenderTarget[],
+  readFile: (path: string) => string = (path) => readFileSync(path, "utf8"),
+): ImportGraph | undefined {
+  if (targets.length === 0) {
+    return undefined;
+  }
+  // Coverage + path-space alignment: EVERY target must be rooted by a cwd-internal posix story file.
+  const storyFileSet = new Set<string>();
+  for (const target of targets) {
+    const file = target.storyFile;
+    // Require BOTH a storyId and a cwd-internal storyFile on EVERY target: phase1Map expands story
+    // files → storyIds via (storyId, storyFile), so a target missing either can't be graph-modeled
+    // and must force the Phase-0 fallback rather than be silently dropped.
+    if (
+      target.storyId === undefined ||
+      file === undefined ||
+      file.length === 0 ||
+      file.startsWith("/") ||
+      file.split("/").includes("..")
+    ) {
+      return undefined;
+    }
+    storyFileSet.add(file);
+  }
+  try {
+    const resolver = createResolver(cwd, readFile);
+    if (!resolver.tsconfigFound) {
+      return undefined; // no tsconfig → can't trust alias resolution → Phase-0 fallback (CS-D2)
+    }
+    const cwdResolved = resolve(cwd);
+    const roots: string[] = [];
+    for (const file of storyFileSet) {
+      const abs = resolve(cwd, file);
+      // Defensive: a root must stay under cwd so its lowercased-rel-posix keys match git paths.
+      if (abs !== cwdResolved && !abs.startsWith(cwdResolved + sep)) {
+        return undefined;
+      }
+      roots.push(abs);
+    }
+    return buildImportGraph(cwd, roots, resolver);
+  } catch {
+    return undefined; // any graph build failure → Phase-0 fallback, never block the run
+  }
+}
+
 async function main(argv: string[]): Promise<void> {
   // The default out path matches what /visual-check reads, so even if ARG PARSING itself throws
   // (a mis-quoted `--since <ref>` arriving as one token under zsh) we still leave a conservative
@@ -499,6 +649,8 @@ async function main(argv: string[]): Promise<void> {
     // resolveTargets needs the dev server / Storybook; if it's down this throws and we fall back to
     // a full sweep below — capture is the authority on server reachability (it probes + errors).
     const targets = await resolveTargets(config);
+    // Phase 1: build the import graph from story-file roots (undefined → Phase-0 heuristic).
+    const graph = buildProjectGraph(args.cwd, targets);
     decision = decideScope({
       changedFiles: files,
       gitResolved,
@@ -507,6 +659,7 @@ async function main(argv: string[]): Promise<void> {
       tokenGlobs,
       globalGlobs: DEFAULT_GLOBAL_GLOBS,
       targets,
+      graph,
     });
   } catch (err) {
     // The invariant under failure: never narrow. Any error → full sweep, capture proceeds normally.

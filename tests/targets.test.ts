@@ -146,6 +146,44 @@ describe("resolveTargets — Storybook discovery via /index.json", () => {
     expect(targets[0]?.name).toBe("Input");
   });
 
+  it("threads index importPath into RenderTarget.storyFile (the graph root), normalized to project-relative posix", async () => {
+    const { fetch } = mockFetch({
+      [INDEX_URL]: {
+        body: {
+          v: 5,
+          entries: {
+            "button--primary": {
+              id: "button--primary",
+              title: "Button",
+              name: "Primary",
+              type: "story",
+              importPath: "./src/components/Button/Button.stories.tsx",
+            },
+            "back--default": {
+              id: "back--default",
+              title: "Back",
+              name: "Default",
+              type: "story",
+              importPath: ".\\src\\components\\Back\\Back.stories.tsx", // backslashes
+            },
+            "plain--default": {
+              id: "plain--default",
+              title: "Plain",
+              name: "Default",
+              type: "story", // no importPath at all
+            },
+          },
+        },
+      },
+    });
+    const targets = await resolveTargets(storybookConfig(), fetch);
+    const storyFileOf = (id: string): string | undefined =>
+      targets.find((t) => t.storyId === id)?.storyFile;
+    expect(storyFileOf("button--primary")).toBe("src/components/Button/Button.stories.tsx"); // ./ stripped
+    expect(storyFileOf("back--default")).toBe("src/components/Back/Back.stories.tsx"); // \\ → /
+    expect(storyFileOf("plain--default")).toBeUndefined(); // no importPath → Phase-0 fallback
+  });
+
   it("tolerates a trailing slash on the Storybook url", async () => {
     const { fetch } = mockFetch({
       [INDEX_URL]: {

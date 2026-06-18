@@ -16,6 +16,7 @@ import {
   type DecideInput,
 } from "../scripts/scope";
 import { filterByScope, readScopeFile } from "../scripts/capture";
+import type { ImportGraph } from "../scripts/lib/graph/import-graph";
 
 const UI_GLOBS = ["**/*.{tsx,jsx,vue,svelte}", "**/*.{css,scss,sass,less,styl,pcss}"];
 const TOKEN_GLOBS = ["src/styles/tokens.css"];
@@ -207,6 +208,95 @@ describe("decideScope — audit regressions (uncertainty must NEVER narrow)", ()
     expect(decideScope(base({ changedFiles: [".github/ui/Card.tsx"] })).mode).toBe("scoped");
     // A genuinely non-rendering file under those dirs is still ignored.
     expect(decideScope(base({ changedFiles: [".github/workflows/ci.yml"] })).mode).toBe("none");
+  });
+});
+
+describe("decideScope — Phase 1 import graph (closes the cross-import gap)", () => {
+  const t = (name: string, state: string, storyId: string, storyFile: string): RenderTarget => ({
+    instance: "components",
+    name,
+    state,
+    viewport: 1280,
+    kind: "storybook",
+    url: `http://localhost:6006/iframe.html?id=${storyId}&viewMode=story`,
+    storyId,
+    storyFile,
+  });
+  const TG: RenderTarget[] = [
+    t("Button", "primary", "button--primary", "src/components/Button/Button.stories.tsx"),
+    t("Card", "default", "card--default", "src/components/Card/Card.stories.tsx"),
+  ];
+  const BTN = "src/components/button/button.stories.tsx"; // lowercased graph keys
+  const CARD = "src/components/card/card.stories.tsx";
+
+  it("scopes a shared component to EVERY story that imports it (Phase 0 would give only one)", () => {
+    const graph: ImportGraph = {
+      built: true,
+      fileToStoryFiles: new Map([["src/components/button/button.tsx", new Set([BTN, CARD])]]),
+      storyIncomplete: new Map([
+        [BTN, false],
+        [CARD, false],
+      ]),
+    };
+    const d = decideScope(base({ changedFiles: ["src/components/Button/Button.tsx"], targets: TG, graph }));
+    expect(d.mode).toBe("scoped");
+    expect(d.components).toEqual(["Button", "Card"]);
+    expect(d.storyIds).toEqual(["button--primary", "card--default"]);
+  });
+
+  it("a file reaching no story is 'none' WHEN the graph is complete", () => {
+    const graph: ImportGraph = {
+      built: true,
+      fileToStoryFiles: new Map(),
+      storyIncomplete: new Map([[BTN, false]]),
+    };
+    expect(decideScope(base({ changedFiles: ["src/utils/helper.ts"], targets: TG, graph })).mode).toBe(
+      "none",
+    );
+  });
+
+  it("a file reaching no story WIDENS to all when the graph is incomplete", () => {
+    const graph: ImportGraph = {
+      built: true,
+      fileToStoryFiles: new Map(),
+      storyIncomplete: new Map([[BTN, true]]),
+    };
+    expect(decideScope(base({ changedFiles: ["src/utils/helper.ts"], targets: TG, graph })).mode).toBe(
+      "all",
+    );
+  });
+
+  it("an incomplete story is captured in EVERY scoped run, regardless of what changed", () => {
+    const graph: ImportGraph = {
+      built: true,
+      fileToStoryFiles: new Map([["src/components/button/button.tsx", new Set([BTN])]]),
+      storyIncomplete: new Map([
+        [BTN, false],
+        [CARD, true], // Card's closure is untrustworthy → always captured
+      ]),
+    };
+    const d = decideScope(base({ changedFiles: ["src/components/Button/Button.tsx"], targets: TG, graph }));
+    expect(d.mode).toBe("scoped");
+    expect(d.components).toEqual(["Button", "Card"]);
+  });
+
+  it("falls back to the Phase-0 filename heuristic when the graph isn't built", () => {
+    const graph: ImportGraph = { built: false, fileToStoryFiles: new Map(), storyIncomplete: new Map() };
+    const d = decideScope(base({ changedFiles: ["src/components/Button/Button.css"], targets: TG, graph }));
+    expect(d.mode).toBe("scoped");
+    expect(d.components).toEqual(["Button"]); // no cross-import in the fallback
+  });
+
+  it("global + early-exit checks still run BEFORE the graph path", () => {
+    const graph: ImportGraph = {
+      built: true,
+      fileToStoryFiles: new Map([["src/styles/tokens.css", new Set([BTN])]]),
+      storyIncomplete: new Map([[BTN, false]]),
+    };
+    // tokens.css is a token source → global → full sweep, never graph-scoped to one story.
+    expect(decideScope(base({ changedFiles: ["src/styles/tokens.css"], targets: TG, graph })).mode).toBe(
+      "all",
+    );
   });
 });
 
