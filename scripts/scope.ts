@@ -310,19 +310,48 @@ function phase0Map(input: DecideInput, considered: string[], totalRenders: numbe
 }
 
 /**
+ * Phase 2 — a changed file imported by more than this fraction of all stories is treated as a
+ * fan-out barrel (a shared primitive / barrel re-export): scoping to ~the whole library is pointless
+ * and noisy, so widen to a full sweep instead. Only applied above a minimum library size, so a tiny
+ * library (where one component importing another is trivially a high fraction — the headline
+ * cross-import case) still scopes precisely. This can only WIDEN (capture more), so it never
+ * threatens the invariant. (Config knob deferred to Phase 3 / `/visual-config`.)
+ */
+const FANOUT_THRESHOLD = 0.4;
+const FANOUT_MIN_STORIES = 8;
+
+/**
  * Phase-1 mapping: real import graph. Maps each considered file to the story FILES whose transitive
  * import closure reaches it (closing Phase-0's cross-import gap — a file imported by N components
  * scopes to all N). A file reaching ZERO stories may contribute "none" ONLY when the graph is
  * provably complete; otherwise it widens to a full sweep (it could sit in an unmapped subtree).
- * Every graph-incomplete story (an untrustworthy closure) is captured in EVERY scoped run.
+ * A file reaching MOST stories is a fan-out barrel → full sweep (Phase 2). Every graph-incomplete
+ * story (an untrustworthy closure) is captured in EVERY scoped run.
  */
 function phase1Map(input: DecideInput, considered: string[], totalRenders: number): ScopeDecision {
   const graph = input.graph as ImportGraph;
+  const totalStoryFiles = graph.storyIncomplete.size; // every rooted story is in this map
   const inScopeStoryFiles = new Set<string>(); // lowercased story-file rel-posix
   const reasons: string[] = [];
   for (const file of considered) {
     const stories = graph.fileToStoryFiles.get(file.toLowerCase());
     if (stories !== undefined && stories.size > 0) {
+      // Phase 2 fan-out: a barrel/primitive imported by most of a non-trivial library → full sweep,
+      // not a huge scoped set. (Widening only — invariant-safe by construction.)
+      if (
+        totalStoryFiles >= FANOUT_MIN_STORIES &&
+        stories.size / totalStoryFiles > FANOUT_THRESHOLD
+      ) {
+        const pct = Math.round((stories.size / totalStoryFiles) * 100);
+        return makeDecision(
+          totalRenders,
+          "all",
+          [],
+          [...reasons, `fan-out: ${file} reaches ${stories.size}/${totalStoryFiles} stories (${pct}%) → full sweep`],
+          considered,
+          totalRenders,
+        );
+      }
       for (const storyFile of stories) {
         inScopeStoryFiles.add(storyFile);
       }

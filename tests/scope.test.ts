@@ -298,6 +298,48 @@ describe("decideScope — Phase 1 import graph (closes the cross-import gap)", (
       "all",
     );
   });
+
+  // --- Phase 2: fan-out-barrel detection (only above the min-library-size floor) ---
+  const many = "abcdefghij".split(""); // 10 stories (>= FANOUT_MIN_STORIES)
+  const manyTargets = many.map((s) => t(s.toUpperCase(), "default", `${s}--default`, `src/${s}/${s}.stories.tsx`));
+  const manyKeys = many.map((s) => `src/${s}/${s}.stories.tsx`); // lowercased graph keys
+
+  it("a fan-out barrel (reaches > 40% of a non-trivial library) WIDENS to a full sweep", () => {
+    const graph: ImportGraph = {
+      built: true,
+      fileToStoryFiles: new Map([["src/lib/barrel.ts", new Set(manyKeys.slice(0, 6))]]), // 6/10 = 60%
+      storyIncomplete: new Map(manyKeys.map((k) => [k, false])),
+    };
+    const d = decideScope(base({ changedFiles: ["src/lib/barrel.ts"], targets: manyTargets, graph }));
+    expect(d.mode).toBe("all");
+    expect(d.reasons.some((r) => /fan-out/.test(r))).toBe(true);
+  });
+
+  it("a file reaching only a minority of stories stays scoped (no fan-out)", () => {
+    const graph: ImportGraph = {
+      built: true,
+      fileToStoryFiles: new Map([["src/a/a.tsx", new Set(manyKeys.slice(0, 1))]]), // 1/10 = 10%
+      storyIncomplete: new Map(manyKeys.map((k) => [k, false])),
+    };
+    const d = decideScope(base({ changedFiles: ["src/A/A.tsx"], targets: manyTargets, graph }));
+    expect(d.mode).toBe("scoped");
+    expect(d.components).toEqual(["A"]);
+  });
+
+  it("does NOT fan-out a tiny library (the cross-import headline still scopes precisely)", () => {
+    // 2-story library: Button imported by Card is 100%, but below the floor → scoped, not a sweep.
+    const graph: ImportGraph = {
+      built: true,
+      fileToStoryFiles: new Map([["src/components/button/button.tsx", new Set([BTN, CARD])]]),
+      storyIncomplete: new Map([
+        [BTN, false],
+        [CARD, false],
+      ]),
+    };
+    const d = decideScope(base({ changedFiles: ["src/components/Button/Button.tsx"], targets: TG, graph }));
+    expect(d.mode).toBe("scoped");
+    expect(d.components).toEqual(["Button", "Card"]);
+  });
 });
 
 describe("scope.json round-trip: scope.ts decision → capture.ts consumption", () => {
