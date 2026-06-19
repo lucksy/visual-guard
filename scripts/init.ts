@@ -667,14 +667,21 @@ export interface InitCliArgs {
   dryRun: boolean;
   /** Read a confirmed `{ targets, tokens? }` config from stdin instead of auto-detecting (wizard). */
   stdin: boolean;
+  /**
+   * Read the confirmed config from a FILE instead of stdin — same payload/validation as `--stdin`,
+   * but lets the command write the JSON with the `Write` tool and invoke init.ts as one
+   * statically-analyzable command (no heredoc, which the permission engine can't analyze).
+   */
+  fromFile?: string;
 }
 
-/** Parse `--config <path> --force --dry-run --stdin`; unknown flags / missing values throw (baseline.ts idiom). */
+/** Parse `--config <path> --force --dry-run --stdin --from-file <path>`; unknown flags / missing values throw (baseline.ts idiom). */
 export function parseArgs(argv: string[]): InitCliArgs {
   let configPath: string | undefined;
   let force = false;
   let dryRun = false;
   let stdin = false;
+  let fromFile: string | undefined;
 
   const value = (index: number, flag: string): string => {
     const next = argv[index];
@@ -699,20 +706,26 @@ export function parseArgs(argv: string[]): InitCliArgs {
       case "--stdin":
         stdin = true;
         break;
+      case "--from-file":
+        fromFile = value(++i, "--from-file");
+        break;
       default:
         fail(`unknown argument ${JSON.stringify(arg)}.`);
     }
   }
 
-  return { configPath, force, dryRun, stdin };
+  return { configPath, force, dryRun, stdin, fromFile };
 }
 
 async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
 
-  // Wizard write path: the /visual-init command pipes the user-confirmed config in on stdin.
-  if (args.stdin) {
-    const input = parseScaffoldInput(await readStdin());
+  // Wizard write path: the /visual-init & /visual-config commands hand init.ts the user-confirmed
+  // config — either piped on stdin (--stdin) or written to a file with the Write tool (--from-file).
+  // Both go through the SAME parseScaffoldInput validation (incl. the JS-eval boundary guard).
+  if (args.fromFile !== undefined || args.stdin) {
+    const raw = args.fromFile !== undefined ? readFileSync(args.fromFile, "utf8") : await readStdin();
+    const input = parseScaffoldInput(raw);
     const result = runInitFromConfig(input, {
       configPath: args.configPath,
       force: args.force,

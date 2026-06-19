@@ -260,18 +260,16 @@ already exists. Confirm explicitly — *"Overwrite the existing config at `<exis
   `--force` needed for a fresh path), so the user still gets a scaffold without losing their file.
 - **No — cancel** → change nothing; point them at the existing file to edit by hand.
 
-Write the confirmed config by piping it to the engine on stdin (it validates the config round-trips
-through the same `parseConfig` the rest of Visual Guard loads with, and re-checks the no-clobber and
-project-root guards):
+Write the confirmed config to `.visual-guard/pending-config.json` with the **`Write` tool**, then hand
+it to the engine with `--from-file`. (Writing the file + one `--from-file` command — instead of a
+heredoc the permission engine can't analyze — is what keeps this to a single prompt.) The engine still
+validates the config round-trips through the same `parseConfig` the rest of Visual Guard loads with,
+and re-checks the no-clobber and project-root guards.
 
-```bash
-RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"
-SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
+The JSON to `Write` — include the `figma` block **only when the user connected Figma** (drop it for
+code-only setups); a pasted Figma **URL** is fine in `files[].key`, the engine extracts the bare key:
 
-# FORCE is "--force" only when the user approved an overwrite; CONFIG is "--config <path>" only when
-# they chose to write elsewhere. Both expand to nothing when not applicable (harmless extra spaces).
-# Substitute the confirmed config between the heredoc markers.
-"$RUNNER" "$SCRIPTS/init.ts" --stdin ${FORCE} ${CONFIG} <<'JSON'
+```json
 {
   "targets": [{ "type": "storybook", "url": "http://localhost:6006" }],
   "figma": {
@@ -280,11 +278,14 @@ SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
     ]
   }
 }
-JSON
 ```
 
-The `figma` block is **included only when the user connected Figma** — drop it for code-only setups.
-A pasted Figma **URL** is fine in `files[].key`; the engine extracts and stores the bare file key.
+Then run — append `--force` **only** when the user approved an overwrite, and `--config <path>` **only**
+when they chose to write elsewhere:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx" "${CLAUDE_PLUGIN_ROOT}/scripts/init.ts" --from-file .visual-guard/pending-config.json
+```
 
 Confirm success from the result JSON (`written: true`, the `configPath`).
 

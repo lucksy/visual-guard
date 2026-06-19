@@ -381,6 +381,7 @@ describe("parseArgs (init CLI)", () => {
       force: false,
       dryRun: false,
       stdin: false,
+      fromFile: undefined,
     });
   });
 
@@ -390,6 +391,17 @@ describe("parseArgs (init CLI)", () => {
       force: true,
       dryRun: true,
       stdin: true,
+      fromFile: undefined,
+    });
+  });
+
+  it("parses --from-file <path> (the heredoc-free wizard write path)", () => {
+    expect(parseArgs(["--from-file", ".visual-guard/pending-config.json", "--force"])).toEqual({
+      configPath: undefined,
+      force: true,
+      dryRun: false,
+      stdin: false,
+      fromFile: ".visual-guard/pending-config.json",
     });
   });
 
@@ -399,6 +411,10 @@ describe("parseArgs (init CLI)", () => {
 
   it("throws when --config is missing its value", () => {
     expect(() => parseArgs(["--config"])).toThrow(/missing value/);
+  });
+
+  it("throws when --from-file is missing its value", () => {
+    expect(() => parseArgs(["--from-file"])).toThrow(/missing value/);
   });
 });
 

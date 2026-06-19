@@ -64,51 +64,50 @@ exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed
 Resolve `$CONFIG` as the first of `visual.config.json`, `config/visual.config.json`, else
 `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`.
 
-## 1. Capture → compare → report
+## 1. Run the gate (one engine command)
 
-From the **project root**, tied together by one run id (the engine writes only under
-`.visual-guard/runs/<id>/`, gitignored):
+From the **project root**, run the whole gate as a **single command**. `ci-run.ts` captures → diffs →
+reports → runs the CI gate → writes the PR-comment markdown under one run id (the engine writes only
+under `.visual-guard/runs/<id>/`, gitignored). Doing it in one analyzable command — no `$(date)`/
+`export`/`$?` in the prompt — is also what keeps this to a single permission prompt.
+
+Append `--target <name>` if `$ARGUMENTS` named one; add `--allow-new` / `--allow-error` only to relax
+the gate for a first-baseline bootstrap. Echo `▸ Step 2/4 · Capture + Diff + Gate — render, compare to baseline, decide pass/fail (writes only under .visual-guard/).` then run:
 
 ```bash
-RUN_ID="$(date -u +%Y%m%d-%H%M%S)"
-export PLAYWRIGHT_BROWSERS_PATH="${CLAUDE_PLUGIN_DATA}/browsers"
-RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"
-SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
-TARGET="$ARGUMENTS"
-
-"$RUNNER" "$SCRIPTS/capture.ts" --config "$CONFIG" --run "$RUN_ID" ${TARGET:+--target "$TARGET"}
-"$RUNNER" "$SCRIPTS/compare.ts" --config "$CONFIG" --run "$RUN_ID"
-"$RUNNER" "$SCRIPTS/report.ts"  --config "$CONFIG" --run "$RUN_ID"
+"${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx" "${CLAUDE_PLUGIN_ROOT}/scripts/ci-run.ts" --config "$CONFIG" --cwd "$PWD"
 ```
 
-If `capture.ts` reports **"could not reach …"**, relay it and stop (the dev server / Storybook isn't
-up). Optionally invoke `visual-reviewer` per flagged target and `report.ts --apply-verdicts` (as in
-`/visual-check` §3) so the PR report carries structured verdicts, not just pixels.
+`Read` **`.visual-guard/last-ci.json`** — `{ runId, ranGate, gateExit, manifestPath, prCommentPath, error }`:
 
-## 2. Gate — the pass/fail decision (exit code)
+- `error` set (command exits non-zero) → relay the streamed message **verbatim** (e.g. capture *"could
+  not reach …"* — the dev server / Storybook isn't up) and **stop**.
+- otherwise the gate ran: `gateExit` is the verdict for §2, and `manifestPath` / `prCommentPath` feed §2–§3.
+
+Optionally, before presenting, invoke `visual-reviewer` per flagged target and
+`tsx report.ts --run <runId> --apply-verdicts` (as in `/visual-check` §3), then re-run pr-report so the
+PR report carries structured verdicts — or just present the pixel evidence.
+
+## 2. Gate — the pass/fail decision
+
+Present the verdict from `gateExit`:
+
+- **`0`** — clean (no blocking targets).
+- **`1`** — blocked: a `fail` target, or (unless relaxed) a `new` (no-baseline) / `error` (undecodable)
+  target. `Read` the run's `manifest.json` and list each blocking `instance/target`.
+- **`2`** — the gate could not run (no manifest). Surface that; do **not** treat it as "clean".
+
+> This command *reports* the gate. The pipeline's authoritative non-zero exit comes from running
+> `scripts/ci.ts` directly (see §5).
+
+## 3. PR comment — show the Markdown (don't post it)
+
+`Read` the `prCommentPath` from the result (`.visual-guard/runs/<runId>/pr-comment.md`) and show the
+rendered Markdown (evidence-then-verdict per flagged target). It is a local run artifact — **Visual
+Guard never posts it**; tell the user to post it from their CI with the GitHub CLI:
 
 ```bash
-"$RUNNER" "$SCRIPTS/ci.ts" --run "$RUN_ID" --json
-echo "gate exit: $?"
-```
-
-- The gate **blocks** (exit 1) on any `fail` target; `new` (no baseline = unapproved) and `error`
-  (undecodable) also block by default — add `--allow-new` / `--allow-error` to relax them for a
-  first-baseline bootstrap. Exit `2` means it couldn't run (no manifest) — surface that, don't treat
-  it as "clean".
-- Present the gate verdict plainly: the summary line and each blocking `instance/target`.
-
-## 3. PR comment — generate the Markdown (don't post it)
-
-```bash
-"$RUNNER" "$SCRIPTS/pr-report.ts" --run "$RUN_ID"   # writes .visual-guard/runs/$RUN_ID/pr-comment.md
-```
-
-Show the rendered Markdown (evidence-then-verdict per flagged target). It is a local run artifact —
-**Visual Guard never posts it**; tell the user to post it from their CI with the GitHub CLI:
-
-```bash
-gh pr comment "$PR_NUMBER" -F .visual-guard/runs/$RUN_ID/pr-comment.md
+gh pr comment "$PR_NUMBER" -F .visual-guard/runs/<runId>/pr-comment.md
 ```
 
 ## 4. Present

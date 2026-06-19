@@ -120,20 +120,23 @@ Removing Figma is always safe (code-only is byte-compatible).
 Assemble the **full** updated config object — start from the current `$CONFIG`, apply the chosen
 changes, and keep everything else unchanged. Show it and ask for a **final yes**.
 
-Write it through the engine (same validated, no-clobber writer as `/visual-init`; `--force` because a
-config already exists, `--config` only if the existing file isn't at the default path):
+`Write` the **full** updated config object to `.visual-guard/pending-config.json` with the `Write`
+tool, then hand it to the engine with `--from-file` (the same validated, no-clobber writer as
+`/visual-init`; no heredoc, so it stays a single analyzable command). The JSON shape:
 
-```bash
-RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"
-SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
-
-"$RUNNER" "$SCRIPTS/init.ts" --stdin --force ${CONFIG_FLAG} <<'JSON'
+```json
 {
   "targets": [ ... the full, confirmed targets ... ],
   "figma": { "files": [ ... ] },
   "tokens": { "sources": [ ... ] }
 }
-JSON
+```
+
+Then run — `--force` because a config already exists, and `--config <path>` **only** if the existing
+file isn't at the default path:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx" "${CLAUDE_PLUGIN_ROOT}/scripts/init.ts" --from-file .visual-guard/pending-config.json --force
 ```
 
 - Include `figma` **only** when the user wants it linked (omit the key entirely to remove it).
