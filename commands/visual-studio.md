@@ -56,37 +56,26 @@ Then lay out the plan in plain language, so the user knows what's coming before 
 
 ## 1. Launch the server (backgrounded) and read its URL
 
-From the **project root**, start the server detached so it survives this turn, then read the URL it
-writes to its pidfile:
+From the **project root**, run the launcher as a **single command**. `studio-launch.ts` starts the
+server **detached** (so it outlives this turn), waits for it to write its pidfile, and prints that
+pidfile's JSON — replacing the old `nohup … & disown` + poll-loop shell (which the permission engine
+couldn't statically analyze), so this is one analyzable prompt:
 
 ```bash
-mkdir -p .visual-guard
-RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"
-SERVE="${CLAUDE_PLUGIN_ROOT}/scripts/studio/serve.ts"
-
-# Detached: nohup + background + disown so the long-lived server is not tied to this turn.
-nohup "$RUNNER" "$SERVE" --config "$CONFIG" >/dev/null 2>&1 &
-disown
-
-# The server writes .visual-guard/studio.pid (with its loopback URL) once it is listening.
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  [ -f .visual-guard/studio.pid ] && break
-  sleep 0.25
-done
-cat .visual-guard/studio.pid
+"${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx" "${CLAUDE_PLUGIN_ROOT}/scripts/studio-launch.ts" --config "$CONFIG" --cwd "$PWD"
 ```
 
-`Read` the pidfile JSON (`{ pid, port, url, startedAt }`). The server binds **`127.0.0.1`** on an
-OS-chosen port and **opens the browser itself**. If the pidfile never appears within ~5s, the server
-failed to start — tell the user to run the serve command in the foreground to see the error:
-`"$RUNNER" "$SERVE" --config "$CONFIG" --no-open`.
+`Read` the printed pidfile JSON (`{ pid, port, url, startedAt }`) — or `Read`
+`.visual-guard/studio.pid`. The server binds **`127.0.0.1`** on an OS-chosen port and **opens the
+browser itself**. If the launcher reports the server did not start within ~5s (it exits non-zero), it
+prints the exact foreground command to run to see the error — relay that and stop.
 
 ## 2. Present
 
 Tell the user the studio is open at the `url` from the pidfile (the browser was opened automatically;
 they can also paste the URL). Mention the next steps: **`/visual-sync`** to (re)populate Figma↔code
 parity, and the in-app **Sync** button which re-runs the **code** capture only (Figma capture needs
-the desktop MCP, so it stays in `/visual-sync`). To stop the server: `kill $(…pid from the pidfile)`.
+the desktop MCP, so it stays in `/visual-sync`). To stop the server, `kill` the `pid` from the pidfile.
 
 ## Boundaries
 

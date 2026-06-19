@@ -66,7 +66,7 @@ and browser live. Before running anything:
 
 ## 1. Gather — parse the arguments into a scope intent
 
-Read `$ARGUMENTS` and set three shell-ready values for §2 (default them to empty):
+Read `$ARGUMENTS` and decide the scope intent below — in §2 you turn it into `check.ts` flags:
 
 - A bare word (no leading `--`, e.g. `Button` or `components/Button`) → **`EXPLICIT`** = that word.
   An explicit target is captured directly and is **never** change-scoped.
@@ -85,102 +85,52 @@ Then surface the changed UI files as context: run `git diff --name-only HEAD` an
 them, e.g. `Changed UI files: Button.tsx · button.css`. (The actual scope decision is made
 deterministically by `scope.ts` in §2 — this is just the human-facing banner.)
 
-## 2. Act — capture → compare → report
+## 2. Act — capture → diff → report (one engine command)
 
-Run all three from the **project root** (the current working directory), tied together by one
-run id. The engine writes only under `.visual-guard/runs/<id>/` (gitignored); it writes
-nothing else. Before capture, echo `Capturing: <target or "all targets">…`, and before the
-diff, echo `Comparing against baseline…`, so the run reads like the canonical flow.
+Run the whole pipeline as a **single command** from the **project root**. The `check.ts` orchestrator
+does the coordination that used to live in shell — it starts a managed harness if the config has one
+and **always** stops it afterward (even on failure), resolves scope, captures (explicit/scoped/all),
+diffs against the baseline, writes the report, and clears the pending-review marker — and the engine
+writes nothing outside `.visual-guard/` (gitignored). Generating the whole run from one analyzable
+command (no `trap`/`$( )`/branching in the prompt) is also what keeps the permission prompt to one.
 
-**Managed harness:** if the config has a Visual-Guard-scaffolded Ladle target (`"type": "ladle",
-"managed": true`), its dev server isn't expected to be already running — `managed-serve start` boots it,
-waits until it's reachable, and a `trap … EXIT` **always** stops it afterward (even if capture fails).
-For a project whose server you run yourself (Storybook / app), `managed-serve start` is a **no-op**, so
-the same block is safe for every config.
+From §1's intent, append **only the flags that apply** (each is a literal flag, not a shell variable):
 
-Substitute the `EXPLICIT` / `ALL` / `SINCE` you derived in §1 into the marked lines (leave a value
-empty if it doesn't apply). The branch is deterministic — `scope.ts` decides, capture obeys.
+- explicit target → `--target <name>`
+- `--all` → `--all`
+- `--since <ref>` → `--since <ref>`
+- `--skip-unchanged` → `--skip-unchanged`
+
+Echo `▸ Step 2/5 · Capture + Diff — screenshot the in-scope UI and compare to baseline (writes only under .visual-guard/).` then run (append the §1 flags to this command):
 
 ```bash
-RUN_ID="$(date -u +%Y%m%d-%H%M%S)"
-export PLAYWRIGHT_BROWSERS_PATH="${CLAUDE_PLUGIN_DATA}/browsers"
-RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"
-SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
-SCOPE_FILE="$PWD/.visual-guard/scope.json"
-FP_FILE="$PWD/.visual-guard/fingerprints-current.json"
-
-EXPLICIT=""   # <- §1: a bare component target, or empty
-ALL=""        # <- §1: "1" if --all, else empty
-SINCE=""      # <- §1: a git ref if --since <ref>, else empty
-SKIP=""       # <- §1: "1" if --skip-unchanged, else empty
-
-# Start a managed (VG-scaffolded) harness if the config has one, and ALWAYS stop it on exit — even on
-# failure. No-op when there's no managed target. The harness is only needed during capture/scope.
-trap '"$RUNNER" "$SCRIPTS/managed-serve.ts" stop --config "$CONFIG" --cwd "$PWD" >/dev/null 2>&1 || true' EXIT
-"$RUNNER" "$SCRIPTS/managed-serve.ts" start --config "$CONFIG" --cwd "$PWD"
-
-# Build args in "$@" via positional params so each flag/value is a DISTINCT argv element under BOTH
-# bash and zsh. (zsh does NOT word-split an unquoted "$VAR", so never stash flags in a string and
-# re-expand — that would arrive as one combined argument and the scripts would reject it.)
-if [ -n "$EXPLICIT" ]; then
-  set -- --target "$EXPLICIT"               # explicit component → no change-scoping
-else
-  rm -f "$SCOPE_FILE" "$FP_FILE"             # never read a stale scope decision OR stale fingerprints from a prior run
-  set -- --config "$CONFIG" --cwd "$PWD"
-  [ -n "$ALL" ]   && set -- "$@" --all
-  [ -n "$SINCE" ] && set -- "$@" --since "$SINCE"
-  # scope.ts writes .visual-guard/scope.json + prints a summary. It NEVER fails the run; on ANY
-  # uncertainty (bad ref, server down, parse error) it writes mode "all" (full sweep).
-  "$RUNNER" "$SCRIPTS/scope.ts" "$@"
-  MODE="$(node -e 'try{process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).mode)}catch(e){process.stdout.write("all")}' "$SCOPE_FILE")"
-  if [ "$MODE" = "none" ]; then
-    echo "No UI changes since base — nothing to check. Run /visual-check --all to sweep everything."
-    exit 0   # the trap stops the managed harness
-  fi
-  set --                                     # reset, then build the capture args
-  [ "$MODE" = "scoped" ] && set -- --scope-file "$SCOPE_FILE"   # mode "all" → no flag → full sweep
-  # Fingerprint-skip: ALWAYS hand capture the scope-emitted fingerprints (so it persists them
-  # run-scoped for /visual-baseline to record the approved fp↔PNG pairing — enabling FUTURE skips),
-  # but only ENABLE skipping when opted in. scope.fingerprintSkip enables it for a scoped run; a full
-  # `--all` sweep skips ONLY with an explicit `--skip-unchanged` (the plain `--all` backstop is never
-  # silently weakened). Capture treats an absent/empty fingerprints file as "skip nothing".
-  [ -f "$FP_FILE" ] && set -- "$@" --fingerprints "$FP_FILE"
-  CFG_SKIP="$(node -e 'try{process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).scope?.fingerprintSkip===true))}catch(e){process.stdout.write("false")}' "$CONFIG")"
-  if [ -n "$SKIP" ] || { [ "$CFG_SKIP" = "true" ] && [ "$MODE" = "scoped" ]; }; then
-    set -- "$@" --skip-unchanged
-  fi
-fi
-
-"$RUNNER" "$SCRIPTS/capture.ts" --config "$CONFIG" --run "$RUN_ID" "$@"
-"$RUNNER" "$SCRIPTS/compare.ts" --config "$CONFIG" --run "$RUN_ID"
-"$RUNNER" "$SCRIPTS/report.ts"  --config "$CONFIG" --run "$RUN_ID"
-
-# Checkpoint complete — clear the pending-review markers (no-dep, never fails the run) so the
-# Stop-hook nudge resets. Runs only after the three steps above succeed.
-node "${CLAUDE_PLUGIN_ROOT}/scripts/detect-ui-change.mjs" --clear
+"${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx" "${CLAUDE_PLUGIN_ROOT}/scripts/check.ts" \
+  --config "$CONFIG" --cwd "$PWD"
 ```
 
-**Surface the scope, always (the honest contract).** Echo `scope.ts`'s summary line so the user knows
-exactly what was and wasn't checked — e.g. `Scoped — 2 components, 6 of 55,200 renders (55,194 out of
-scope). Full sweep: /visual-check --all.` A scoped pass means "everything **in scope** passed," never
-"everything is fine." The full sweep (`--all`, and CI) is the source of truth; the Phase-0 heuristic
-can miss a component whose file is imported by another, and `--all` is the backstop.
+`scope.ts`'s scope summary and any engine errors stream to your output as it runs. When it finishes,
+`Read` **`.visual-guard/last-check.json`** — `{ runId, mode, ranCapture, manifestPath, error }`:
 
-- If `managed-serve.ts start` fails with **"did not become reachable"** or **"exited before becoming
-  ready"**, the scaffolded harness couldn't boot — relay its message and suggest the user run their
-  package manager's install (so `@ladle/react` is present) and retry. Stop.
-- If `capture.ts` fails with **"could not reach …"**, relay its message verbatim — the dev
-  server / Storybook isn't running on that port (a non-managed target you start yourself). Stop; do
-  not fabricate results.
-- If capture reports **"no targets matched"**, tell the user the target didn't match any
-  configured story/route and list a few valid ones from the config. Stop.
-- A **managed** harness run is render-error-tolerant: an auto-generated story that fails to render is
-  recorded as an `error`-status image (surfaced in §4) instead of aborting the whole run — so one
-  prop-required component can't block the rest.
+- `mode` is **`"none"`** → no UI changed since the base. Tell the user *"No UI changes since base —
+  nothing to check. Run `/visual-check --all` to sweep everything."* and **stop** (the harness was
+  already stopped).
+- **`error` is set** (the command also exits non-zero) → relay the message the engine streamed above
+  **verbatim** and **stop** — never fabricate results. Common cases: a managed harness that *"did not
+  become reachable"* (suggest the user run their package manager's install so `@ladle/react` is
+  present, then retry); capture *"could not reach …"* (a non-managed Storybook/app isn't running on
+  that port); *"no targets matched"* (list a few valid stories/routes from the config).
+- otherwise → keep `runId` + `manifestPath` for §3–§4.
+
+**Surface the scope honestly.** Echo the `scope.ts` summary that streamed above — e.g. `Scoped —
+2 components, 6 of 55,200 renders (55,194 out of scope). Full sweep: /visual-check --all.` A scoped
+pass means "everything **in scope** passed," never "everything is fine." The full sweep (`--all`, and
+CI) is the source of truth; the Phase-0 heuristic can miss a component imported by another, and
+`--all` is the backstop. A **managed** harness run is render-error-tolerant: an auto-generated story
+that fails to render is recorded as an `error`-status image (surfaced in §4), not a whole-run abort.
 
 ## 3. Review — structured verdict via the `visual-reviewer` subagent (Phase 1)
 
-`Read` `.visual-guard/runs/$RUN_ID/manifest.json` (its paths are relative to the project root).
+`Read` `.visual-guard/runs/<runId>/manifest.json` (the `runId` from `.visual-guard/last-check.json`; its paths are relative to the project root).
 For every **flagged** target — one whose `status` is `fail`, `new`, or `error` (a `pass` target
 needs no review) — invoke the read-only **`visual-reviewer`** subagent once, passing that target's
 manifest entry (its `images` with `currentPath`/`baselinePath`/`diffPath`, pixel evidence,
@@ -189,17 +139,14 @@ manifest entry (its `images` with `currentPath`/`baselinePath`/`diffPath`, pixel
 `line`/`cause`/`impact`/`fix`).
 
 Collect every verdict object from every target into one array, write it to
-`.visual-guard/runs/$RUN_ID/verdicts.json`, then merge it into the manifest with the tested engine
-helper (it routes each verdict to its image by `target`/`state`/`viewport` and stores the verdict —
-never hand-edit `manifest.json`). Re-establish the runner here (a fresh shell does not inherit §2's
-variables) and reuse the **same** `$RUN_ID` from §2:
+`.visual-guard/runs/<runId>/verdicts.json` (the `runId` from `.visual-guard/last-check.json`), then
+merge it into the manifest with the tested engine helper (it routes each verdict to its image by
+`target`/`state`/`viewport` and stores the verdict — never hand-edit `manifest.json`). Substitute that
+same `runId` for `<runId>` below (`--apply-verdicts` merges `verdicts.json` into the existing
+`manifest.json`; it reads no config, so none is passed):
 
 ```bash
-RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"
-SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
-# Reuse the same $RUN_ID from §2. (--apply-verdicts merges verdicts.json into the existing
-# manifest.json; it reads no config, so none is passed.)
-"$RUNNER" "$SCRIPTS/report.ts" --run "$RUN_ID" --apply-verdicts
+"${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx" "${CLAUDE_PLUGIN_ROOT}/scripts/report.ts" --run "<runId>" --apply-verdicts
 ```
 
 - **Fallback:** if the `visual-reviewer` subagent is unavailable (not found / errors), skip this
