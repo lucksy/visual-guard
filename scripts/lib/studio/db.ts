@@ -34,7 +34,16 @@ export function openDb(path: string): DB {
   if (path !== ":memory:") {
     mkdirSync(dirname(path), { recursive: true });
   }
-  const db = new Database(path);
+  let db: DB;
+  try {
+    db = new Database(path);
+  } catch (err) {
+    // The one failure that isn't about `path`: better-sqlite3's native `.node` binding didn't load
+    // (missing prebuilt, or built for a different Node ABI after a Node upgrade). Turn the raw
+    // `ERR_DLOPEN_FAILED`/bindings stack into an actionable message — the engine self-repairs on a
+    // fresh session, so point there rather than leaving the user with a cryptic crash.
+    throw mapNativeLoadError(err);
+  }
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   migrate(db);
@@ -89,4 +98,39 @@ export function migrate(db: DB): void {
     db.pragma(`user_version = ${SCHEMA_VERSION}`);
   });
   apply();
+}
+
+/**
+ * Recognize the signatures of a failed native-addon load (as opposed to a normal SQLite error like a
+ * bad path or a locked file): the dynamic-loader code, the V8 ABI-mismatch message, or the
+ * `bindings`-package "couldn't find the .node" message.
+ */
+function isNativeLoadError(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code;
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    code === "ERR_DLOPEN_FAILED" ||
+    /NODE_MODULE_VERSION|compiled against a different Node\.js version|Could not locate the bindings file|dlopen|invalid ELF header|not a valid Win32 application/i.test(
+      message,
+    )
+  );
+}
+
+/**
+ * Wrap a native-load failure with a message that tells the user how to recover; pass any other error
+ * through unchanged so genuine SQLite errors keep their original text. Exported for {@link openDb}'s
+ * error mapping and its unit tests.
+ */
+export function mapNativeLoadError(err: unknown): Error {
+  if (!isNativeLoadError(err)) {
+    return err instanceof Error ? err : new Error(String(err));
+  }
+  const original = err instanceof Error ? err.message : String(err);
+  return new Error(
+    `Visual Guard: the native SQLite binding (better-sqlite3) failed to load for Node ${process.version} ` +
+      `(ABI ${process.versions.modules}, ${process.platform}/${process.arch}). Its prebuilt binary is missing ` +
+      `or was built for a different Node version. Recover by starting a fresh Claude Code session — the ` +
+      `SessionStart hook rebuilds the engine for your current Node — or run \`/visual-setup\` to reinstall.` +
+      `\nOriginal error: ${original}`,
+  );
 }

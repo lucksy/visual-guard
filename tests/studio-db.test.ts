@@ -3,7 +3,40 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
-import { migrate, openDb, schemaVersion, SCHEMA_VERSION } from "../scripts/lib/studio/db";
+import {
+  mapNativeLoadError,
+  migrate,
+  openDb,
+  schemaVersion,
+  SCHEMA_VERSION,
+} from "../scripts/lib/studio/db";
+
+describe("mapNativeLoadError — actionable message when the native binding can't load", () => {
+  it("wraps a dlopen failure with recovery guidance and preserves the original text", () => {
+    const raw = Object.assign(new Error("dlopen(better_sqlite3.node): symbol not found"), {
+      code: "ERR_DLOPEN_FAILED",
+    });
+    const mapped = mapNativeLoadError(raw);
+    expect(mapped).toBeInstanceOf(Error);
+    expect(mapped.message).toMatch(/native SQLite binding/i);
+    expect(mapped.message).toMatch(/\/visual-setup|fresh Claude Code session/);
+    expect(mapped.message).toContain(process.versions.modules); // names the current ABI
+    expect(mapped.message).toContain("dlopen(better_sqlite3.node)"); // original preserved
+  });
+
+  it("recognizes the V8 ABI-mismatch message (no code property)", () => {
+    const raw = new Error(
+      "The module was compiled against a different Node.js version using NODE_MODULE_VERSION 115.",
+    );
+    expect(mapNativeLoadError(raw).message).toMatch(/native SQLite binding/i);
+  });
+
+  it("passes a normal SQLite error through unchanged (not every error is a native-load error)", () => {
+    const raw = new Error("SQLITE_CANTOPEN: unable to open database file");
+    const mapped = mapNativeLoadError(raw);
+    expect(mapped).toBe(raw); // same instance — untouched
+  });
+});
 
 describe("openDb / migrate", () => {
   it("creates the v1 schema with foreign_keys ON", () => {

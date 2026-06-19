@@ -21,6 +21,12 @@ import { fileURLToPath } from "node:url";
  * here. The specifier is held in a variable so `tsc` does not try to resolve the un-typed
  * `.mjs` (which would break `npm run typecheck`); vitest resolves it at runtime.
  */
+interface NativeRuntime {
+  abi: string;
+  platform: string;
+  arch: string;
+  libc: string | null;
+}
 interface InstallState {
   dataDir: string;
   installed: boolean;
@@ -29,27 +35,53 @@ interface InstallState {
   markerMatches: boolean;
   missing: string[];
   engineDeps: Record<string, string>;
+  nativeRuntime: NativeRuntime;
   browser: string;
 }
 
 const installDepsSpecifier = "../scripts/install-deps.mjs";
-const { ensureBridgeLink, ENGINE_DEPS, computeInstallState, desiredManifest, resolveDataDir, runStep } =
-  (await import(installDepsSpecifier)) as {
-    ensureBridgeLink: (
-      rootNodeModules: string,
-      depsNodeModules: string,
-    ) => "created" | "repaired" | "kept-existing";
-    ENGINE_DEPS: Record<string, string>;
-    computeInstallState: (dataDir: string) => InstallState;
-    desiredManifest: () => string;
-    resolveDataDir: (env?: Record<string, string | undefined>) => string | null;
-    runStep: (
-      label: string,
-      command: string,
-      args: string[],
-      opts: { cwd: string; env: NodeJS.ProcessEnv },
-    ) => Promise<void>;
-  };
+const {
+  ensureBridgeLink,
+  ENGINE_DEPS,
+  NATIVE_MODULES,
+  computeInstallState,
+  desiredManifest,
+  nativeRuntime,
+  detectLibc,
+  resolveNpm,
+  verifyNativeModules,
+  acquireInstallLock,
+  releaseInstallLock,
+  bridgeReachable,
+  resolveDataDir,
+  runStep,
+} = (await import(installDepsSpecifier)) as {
+  ensureBridgeLink: (
+    rootNodeModules: string,
+    depsNodeModules: string,
+  ) => "created" | "repaired" | "kept-existing";
+  ENGINE_DEPS: Record<string, string>;
+  NATIVE_MODULES: string[];
+  computeInstallState: (dataDir: string) => InstallState;
+  desiredManifest: () => string;
+  nativeRuntime: (proc?: unknown) => NativeRuntime;
+  detectLibc: (proc?: unknown) => string | null;
+  resolveNpm: (
+    execPath?: string,
+    platform?: string,
+  ) => { command: string; prefix: string[] };
+  verifyNativeModules: (dataDir: string, env: NodeJS.ProcessEnv) => string[];
+  acquireInstallLock: (dataDir: string) => string | boolean;
+  releaseInstallLock: (lock: string | boolean) => void;
+  bridgeReachable: (rootNodeModules: string, depsNodeModules: string) => boolean;
+  resolveDataDir: (env?: Record<string, string | undefined>) => string | null;
+  runStep: (
+    label: string,
+    command: string,
+    args: string[],
+    opts: { cwd: string; env: NodeJS.ProcessEnv },
+  ) => Promise<void>;
+};
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -98,6 +130,44 @@ describe("install-deps engine bridge", () => {
       tsx: pkg.devDependencies.tsx,
       typescript: pkg.devDependencies.typescript,
     });
+  });
+
+  it("declares the runtime native addons that must be load-verified", () => {
+    // better-sqlite3 (ABI-keyed) + sharp (platform/arch-keyed) are the addons npm can leave broken
+    // after an exit-0 install; the rest of ENGINE_DEPS is pure JS.
+    expect([...NATIVE_MODULES].sort()).toEqual(["better-sqlite3", "sharp"]);
+    // Every declared native module must itself be a declared engine dep.
+    for (const mod of NATIVE_MODULES) {
+      expect(ENGINE_DEPS).toHaveProperty(mod);
+    }
+  });
+
+  it("bakes the native runtime fingerprint (abi/platform/arch/libc) into the install marker", () => {
+    // The marker must invalidate on a Node ABI bump, an OS/arch change, OR a glibc↔musl move — not
+    // just on a dep change — otherwise a stale prebuilt binary loads and crashes. The manifest carries
+    // that fingerprint.
+    const marker = JSON.parse(desiredManifest()) as { nativeRuntime: NativeRuntime };
+    expect(marker.nativeRuntime).toEqual({
+      abi: process.versions.modules,
+      platform: process.platform,
+      arch: process.arch,
+      libc: process.platform === "linux" ? expect.stringMatching(/glibc|musl/) : null,
+    });
+    expect(nativeRuntime()).toEqual(marker.nativeRuntime);
+  });
+
+  it("detectLibc distinguishes glibc/musl on Linux and is null off Linux", () => {
+    // Dependency-free libc detection via process.report. On non-Linux it must be null (no libc axis);
+    // on Linux it must commit to one of the two families sharp ships distinct binaries for.
+    const glibc = { platform: "linux", report: { getReport: () => ({ header: { glibcVersionRuntime: "2.39" } }) } };
+    const musl = { platform: "linux", report: { getReport: () => ({ header: {} }) } };
+    expect(detectLibc(glibc)).toBe("glibc");
+    expect(detectLibc(musl)).toBe("musl");
+    expect(detectLibc({ platform: "darwin" })).toBeNull();
+    expect(detectLibc({ platform: "win32" })).toBeNull();
+    // The real host: null off Linux, else glibc|musl.
+    const here = detectLibc();
+    expect(process.platform === "linux" ? /glibc|musl/.test(String(here)) : here === null).toBe(true);
   });
 
   it("creates the bridge symlink when the plugin root has no node_modules (production)", () => {
@@ -275,6 +345,28 @@ describe("computeInstallState (--check inspection)", () => {
     expect(state.missing).toEqual(["marker"]);
   });
 
+  it("reports not-installed when only the native runtime fingerprint changed (Node ABI bump)", () => {
+    // Same deps, same browser — but the stored marker was written under a different Node ABI (the
+    // classic "user upgraded Node, prebuilt binary no longer loads" case). The marker must mismatch
+    // so the next session rebuilds, instead of trusting deps that were built for the old ABI.
+    const current = JSON.parse(desiredManifest()) as { nativeRuntime: NativeRuntime };
+    const stale = desiredManifest().replace(
+      `"abi": ${JSON.stringify(current.nativeRuntime.abi)}`,
+      `"abi": ${JSON.stringify(`${current.nativeRuntime.abi}-OLD`)}`,
+    );
+    expect(stale).not.toEqual(desiredManifest()); // the replacement actually changed something
+    writeMarker(stale);
+    makeDeps();
+    makeBrowser();
+
+    const state = computeInstallState(dataDir);
+    expect(state.installed).toBe(false);
+    expect(state.markerMatches).toBe(false);
+    expect(state.missing).toEqual(["marker"]);
+    // --check still reports the *current* runtime so the consent gate can explain the rebuild.
+    expect(state.nativeRuntime).toEqual(current.nativeRuntime);
+  });
+
   it("reports not-installed with both deps and browser missing for an empty data dir", () => {
     // nothing created beyond the empty dataDir
     const state = computeInstallState(dataDir);
@@ -285,6 +377,122 @@ describe("computeInstallState (--check inspection)", () => {
     expect(state.missing).toContain("deps");
     expect(state.missing).toContain("browser");
     expect(state.missing).toContain("marker");
+  });
+});
+
+describe("verifyNativeModules — load-test the native addons (catches a silent exit-0 install)", () => {
+  let tmp = "";
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-native-"));
+  });
+
+  afterEach(() => {
+    if (tmp) {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("returns [] when both native addons load (probing the repo's real node_modules)", () => {
+    // The repo's own install has working better-sqlite3 + sharp, so probing it must find both healthy.
+    expect(verifyNativeModules(repoRoot, process.env)).toEqual([]);
+  });
+
+  it("reports every native addon as failed when node_modules has none of them", () => {
+    // A bare dir with no node_modules on the walk-up path: every `require()` fails → all reported.
+    // This is the shape the verifier sees right after a prebuild silently failed to drop the binary.
+    expect([...verifyNativeModules(tmp, process.env)].sort()).toEqual(["better-sqlite3", "sharp"]);
+  }, 15_000);
+});
+
+describe("resolveNpm — run npm under the engine's own Node (correct native ABI)", () => {
+  it("pins npm to process.execPath when npm-cli.js sits next to the running Node", () => {
+    const npm = resolveNpm();
+    // On a normal install npm-cli.js is found next to node → command is THIS node, prefix is the cli.
+    expect(npm.command).toBe(process.execPath);
+    expect(npm.prefix).toHaveLength(1);
+    expect(npm.prefix[0]).toMatch(/npm-cli\.js$/);
+  });
+
+  it("falls back to the bare `npm` shim when no npm-cli.js is found beside the given Node", () => {
+    // A bogus exec path with no sibling npm → graceful fallback to PATH `npm` (better than crashing).
+    expect(resolveNpm("/nonexistent/dir/node", "linux")).toEqual({ command: "npm", prefix: [] });
+  });
+});
+
+describe("acquireInstallLock — serialize concurrent SessionStart installs", () => {
+  let tmp = "";
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-lock-"));
+  });
+  afterEach(() => {
+    if (tmp) {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("grants the lock once, refuses a second live holder, and re-grants after release", () => {
+    const a = acquireInstallLock(tmp);
+    expect(typeof a).toBe("string"); // acquired by us
+    // A second acquire while we (a live process) still hold it must DEFER.
+    expect(acquireInstallLock(tmp)).toBe(false);
+    releaseInstallLock(a);
+    // After release the lock is free again.
+    const b = acquireInstallLock(tmp);
+    expect(typeof b).toBe("string");
+    releaseInstallLock(b);
+  });
+
+  it("reclaims a stale lock (dead holder / ancient timestamp)", () => {
+    const lockDir = join(tmp, ".engine-install.lock");
+    mkdirSync(lockDir, { recursive: true });
+    // pid 999999999 is not a live process AND the timestamp is epoch-0 — stale on both counts.
+    writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: 999999999, at: 0 }));
+    const got = acquireInstallLock(tmp);
+    expect(typeof got).toBe("string"); // reclaimed and granted
+    releaseInstallLock(got);
+  });
+
+  it("releaseInstallLock is a no-op for the true/false sentinels", () => {
+    expect(() => releaseInstallLock(true)).not.toThrow();
+    expect(() => releaseInstallLock(false)).not.toThrow();
+  });
+});
+
+describe("bridgeReachable — the engine's deps actually resolve from the plugin root", () => {
+  let tmp = "";
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-reach-"));
+  });
+  afterEach(() => {
+    if (tmp) {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("true for a real dev node_modules directory", () => {
+    const root = join(tmp, "node_modules");
+    mkdirSync(root, { recursive: true });
+    expect(bridgeReachable(root, join(tmp, "deps", "node_modules"))).toBe(true);
+  });
+
+  it("true for a symlink that resolves to the deps", () => {
+    const deps = join(tmp, "deps", "node_modules");
+    mkdirSync(deps, { recursive: true });
+    const root = join(tmp, "plugin", "node_modules");
+    mkdirSync(dirname(root), { recursive: true });
+    symlinkSync(deps, root, "dir");
+    expect(bridgeReachable(root, deps)).toBe(true);
+  });
+
+  it("false for a broken symlink and for a missing entry (a symlink-less filesystem)", () => {
+    const deps = join(tmp, "deps", "node_modules");
+    mkdirSync(deps, { recursive: true });
+    const broken = join(tmp, "plugin", "node_modules");
+    mkdirSync(dirname(broken), { recursive: true });
+    symlinkSync(join(tmp, "gone"), broken, "dir"); // target does not exist → broken link
+    expect(bridgeReachable(broken, deps)).toBe(false);
+    expect(bridgeReachable(join(tmp, "absent"), deps)).toBe(false);
   });
 });
 

@@ -28,7 +28,7 @@
  *
  * ENGINE_DEPS is kept in sync with `dependencies` in ../package.json, plus `tsx` (the runner).
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -65,15 +65,254 @@ export const ENGINE_DEPS = {
   typescript: "5.7.3",
 };
 
-/** The engine-only manifest written into the data dir; also the install marker. */
+/**
+ * The engine's *native* addons — the ones whose binaries are platform/ABI-specific and can fail to
+ * install even when `npm install` exits 0:
+ *   - `better-sqlite3`: a node-gyp/NAN addon. Its prebuilt binary is keyed by Node's **ABI**
+ *     (`process.versions.modules`) + platform + arch; `prebuild-install` silently no-ops if the
+ *     matching binary can't be fetched, leaving the addon unloadable.
+ *   - `sharp`: ships per-platform `@img/sharp-{platform}-{arch}` packages selected by npm at install
+ *     time (N-API, so ABI-independent, but still platform/arch-specific).
+ * These two are the runtime addons the engine `require()`s; everything else in ENGINE_DEPS is pure
+ * JS. `tsx`/`vite`/`@rollup`/`fsevents` carry native bits too but are the dev/runner toolchain, not
+ * something the diff/studio engine loads.
+ */
+export const NATIVE_MODULES = ["better-sqlite3", "sharp"];
+
+/** Addons we can rebuild *from source* as a last resort (sharp-from-source needs libvips → no). */
+const SOURCE_BUILDABLE = new Set(["better-sqlite3"]);
+
+/**
+ * Linux libc family — glibc vs musl. sharp ships DISTINCT prebuilt packages per libc
+ * (`@img/sharp-linux-*` for glibc vs `@img/sharp-linuxmusl-*` for musl), and better-sqlite3's compiled
+ * binary is libc-specific too — yet both report platform `linux` with the same arch, so `{abi,
+ * platform, arch}` alone cannot tell a Debian build from an Alpine one. Detected dependency-free via
+ * `process.report` (glibc systems expose `header.glibcVersionRuntime`; musl does not). Non-Linux ⇒ null.
+ */
+export function detectLibc(proc = process) {
+  if (proc.platform !== "linux") {
+    return null;
+  }
+  try {
+    const header = proc.report?.getReport?.()?.header;
+    return header && header.glibcVersionRuntime ? "glibc" : "musl";
+  } catch {
+    // report unavailable (e.g. disabled) → assume the common case rather than force a needless rebuild.
+    return "glibc";
+  }
+}
+
+/**
+ * Fingerprint of the runtime the native addons must match. better-sqlite3's prebuilt binary is keyed
+ * by Node's ABI (`process.versions.modules`); both addons select platform/arch/libc-specific binaries
+ * at install time. Encoding this in the install marker (below) means a **Node upgrade** (ABI bump) or
+ * a **moved/copied data dir** (different OS/arch, or glibc↔musl) invalidates the install, so the next
+ * session rebuilds for the current runtime instead of loading a stale binary that crashes with
+ * `ERR_DLOPEN_FAILED`/`NODE_MODULE_VERSION`.
+ */
+export function nativeRuntime(proc = process) {
+  return {
+    abi: proc.versions.modules,
+    platform: proc.platform,
+    arch: proc.arch,
+    libc: detectLibc(proc),
+  };
+}
+
+/**
+ * The engine-only manifest written into the data dir; also the install marker. `nativeRuntime` is
+ * part of the marker (not just `dependencies`) so the same deps built for a different Node ABI or a
+ * different platform/arch/libc are correctly treated as "needs reinstall". `npm install` ignores the
+ * extra field; only our marker comparison reads it.
+ */
 export function desiredManifest() {
   return (
     JSON.stringify(
-      { name: "visual-guard-engine", private: true, dependencies: ENGINE_DEPS },
+      {
+        name: "visual-guard-engine",
+        private: true,
+        dependencies: ENGINE_DEPS,
+        nativeRuntime: nativeRuntime(),
+      },
       null,
       2,
     ) + "\n"
   );
+}
+
+/**
+ * Resolve an npm invocation that runs under the SAME Node as the engine (`process.execPath`). This is
+ * critical: node-gyp/prebuild-install build/fetch a native binary for the ABI of *whatever Node runs
+ * npm* — and the `npm` first on PATH frequently belongs to a DIFFERENT Node than the engine's under
+ * nvm/volta/asdf/fnm or a GUI-launched app. Pinning npm to `process.execPath npm-cli.js` guarantees
+ * the binary matches the ABI the engine (and {@link verifyNativeModules}) load under. Falls back to
+ * the bare `npm` shim only when npm's CLI can't be located next to the running Node.
+ *
+ * @param {string} execPath
+ * @param {NodeJS.Platform} platform
+ * @returns {{ command: string, prefix: string[] }}
+ */
+export function resolveNpm(execPath = process.execPath, platform = process.platform) {
+  const nodeDir = dirname(execPath);
+  const candidates =
+    platform === "win32"
+      ? [join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js")]
+      : [
+          join(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+          join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"),
+        ];
+  for (const cli of candidates) {
+    if (existsSync(cli)) {
+      return { command: execPath, prefix: [cli] };
+    }
+  }
+  return { command: "npm", prefix: [] };
+}
+
+/**
+ * Build the child-process probe for one native addon. Requires the addon by its ABSOLUTE package dir
+ * under `dataDir/node_modules` — NOT a bare specifier — so resolution is pinned to the data-dir deps
+ * and can never be satisfied by a stray `node_modules` higher up the tree (which would mask a broken
+ * install, or, in tests, resolve the repo's own copy). `require()` triggers the `.node` dlopen, the
+ * actual failure point; better-sqlite3 also gets a tiny exercise to be sure the binding is usable.
+ */
+function probeFor(mod, dataDir) {
+  const dir = JSON.stringify(join(dataDir, "node_modules", mod));
+  if (mod === "better-sqlite3") {
+    return `const D=require(${dir});const db=new D(':memory:');db.prepare('select 1 as x').get();db.close();`;
+  }
+  return `require(${dir});`;
+}
+
+/**
+ * Load-test the native addons in a child Node process — `process.execPath`, so the probe runs under
+ * the SAME Node (hence ABI) the engine will. Resolution is pinned to `dataDir/node_modules` (see
+ * {@link probeFor}). Returns the addons that FAILED to load (empty ⇒ all healthy). Never throws.
+ *
+ * @param {string} dataDir  Install dir whose `node_modules` to probe.
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string[]}
+ */
+export function verifyNativeModules(dataDir, env) {
+  const failures = [];
+  for (const mod of NATIVE_MODULES) {
+    const result = spawnSync(process.execPath, ["-e", probeFor(mod, dataDir)], {
+      cwd: dataDir,
+      env,
+      stdio: "ignore",
+    });
+    // status === null ⇒ spawn failed / killed by signal → also a failure.
+    if (result.status !== 0) {
+      failures.push(mod);
+    }
+  }
+  return failures;
+}
+
+/**
+ * Repair ONE native addon in place, using the strategy that actually works for it:
+ *   - `sharp`: its binary lives in the `@img/sharp-{platform}-{arch}[-musl]` OPTIONAL dependency, not
+ *     in a build step, so `npm rebuild sharp` (which only re-runs sharp's no-op install script) can't
+ *     fix a missing binary. Re-INSTALL sharp WITH optionals so npm re-resolves and fetches the right
+ *     `@img` package. `--no-save` keeps the marker `package.json` byte-stable.
+ *   - node-gyp/prebuild addons (`better-sqlite3`): `npm rebuild` re-fetches the prebuilt binary for
+ *     the current ABI (or compiles, with `--build-from-source`).
+ * npm is pinned to the engine's Node via {@link resolveNpm} so the binary targets the right ABI.
+ */
+async function repairNative(mod, dataDir, env, npm) {
+  if (mod === "sharp") {
+    await runStep(
+      "▸ Repairing sharp (reinstall platform package)…",
+      npm.command,
+      [
+        ...npm.prefix,
+        "install",
+        `sharp@${ENGINE_DEPS.sharp}`,
+        "--include=optional",
+        "--no-save",
+        "--no-audit",
+        "--no-fund",
+      ],
+      { cwd: dataDir, env },
+    );
+    return;
+  }
+  await runStep(
+    `▸ Repairing ${mod} (re-fetch prebuilt binary)…`,
+    npm.command,
+    [...npm.prefix, "rebuild", mod],
+    { cwd: dataDir, env },
+  );
+}
+
+/** Last resort for a source-buildable addon: compile from source via node-gyp (pinned npm/Node). */
+async function rebuildFromSource(mod, dataDir, env, npm) {
+  await runStep(
+    `▸ Repairing ${mod} (compile from source)…`,
+    npm.command,
+    [...npm.prefix, "rebuild", mod, "--build-from-source"],
+    { cwd: dataDir, env },
+  );
+}
+
+/** Per-addon guidance when repair couldn't make a binding load (sharp ≠ a compiler problem). */
+function nativeFailureMessage(failed) {
+  const parts = [`Native bindings failed to load after repair: ${failed.join(", ")}.`];
+  if (failed.includes("sharp")) {
+    parts.push(
+      "sharp's platform package (@img/sharp-…) could not be installed — check network access, that " +
+        "your OS/arch is supported by sharp, and that npm is not omitting optional dependencies " +
+        "(`npm config get omit`).",
+    );
+  }
+  if (failed.some((m) => SOURCE_BUILDABLE.has(m))) {
+    parts.push(
+      "A C/C++ build toolchain may be missing (macOS: `xcode-select --install`; Debian/Ubuntu: " +
+        "`sudo apt-get install -y build-essential python3`; Windows: the Visual Studio Build Tools).",
+    );
+  }
+  parts.push("Start a fresh session to retry.");
+  return parts.join(" ");
+}
+
+/**
+ * Ensure every native addon actually loads — repairing in place if not. npm exits 0 even when a
+ * prebuilt binary silently fails to download, so a plain install can record a *broken* engine as
+ * "installed"; this is what makes the studio crash later with `ERR_DLOPEN_FAILED`. Escalation:
+ * per-addon repair ({@link repairNative}) → compile-from-source for source-buildable addons → throw
+ * with tailored guidance if still broken (the caller removes the marker so the next session retries
+ * from clean). Returns once all addons load.
+ *
+ * @param {string} dataDir
+ * @param {NodeJS.ProcessEnv} env
+ */
+async function ensureNativeModules(dataDir, env) {
+  let failed = verifyNativeModules(dataDir, env);
+  if (failed.length === 0) {
+    return;
+  }
+  const npm = resolveNpm();
+  process.stderr.write(
+    `[visual-guard] Native bindings did not load (${failed.join(", ")}) — repairing…\n`,
+  );
+  for (const mod of failed) {
+    await repairNative(mod, dataDir, env, npm);
+  }
+  failed = verifyNativeModules(dataDir, env);
+  if (failed.length === 0) {
+    return;
+  }
+
+  // Still broken after the re-fetch/reinstall: compile from source for addons that support it.
+  for (const mod of failed.filter((m) => SOURCE_BUILDABLE.has(m))) {
+    await rebuildFromSource(mod, dataDir, env, npm);
+  }
+  failed = verifyNativeModules(dataDir, env);
+  if (failed.length === 0) {
+    return;
+  }
+
+  throw new Error(nativeFailureMessage(failed));
 }
 
 /** True iff `linkPath` is a symlink that resolves to the same real dir as `depsNodeModules`. */
@@ -209,6 +448,7 @@ export function computeInstallState(dataDir) {
     markerMatches,
     missing,
     engineDeps: ENGINE_DEPS,
+    nativeRuntime: nativeRuntime(),
     browser: BROWSER_LABEL,
   };
 }
@@ -328,6 +568,105 @@ export function runStep(label, command, args, opts) {
   });
 }
 
+const INSTALL_LOCK_NAME = ".engine-install.lock";
+// Longer than any realistic install (npm + ~150 MB Chromium + native repair) so a live install is
+// never mistaken for stale, but bounded so a crashed holder's lock is eventually reclaimable.
+const INSTALL_LOCK_STALE_MS = 30 * 60 * 1000;
+
+/** True if a process with `pid` is alive (EPERM ⇒ alive but not ours; ESRCH ⇒ gone). */
+function isHolderAlive(pid) {
+  if (typeof pid !== "number" || !Number.isInteger(pid)) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return Boolean(err && err.code === "EPERM");
+  }
+}
+
+/**
+ * Serialize the install/repair critical section against a concurrent SessionStart (two windows, a
+ * resume racing a new session) — running `npm install` twice into the same `node_modules` is a known
+ * corruption source (interleaved rename/unlink → a truncated `.node` or half-extracted package). Uses
+ * an atomic `mkdir` lock (atomic on POSIX and Windows). Returns:
+ *   - the lock dir path (string) → acquired by us; release with {@link releaseInstallLock} when done,
+ *   - `false`                    → a LIVE, fresh holder owns it; this session should defer,
+ *   - `true`                     → proceed WITHOUT a lock (fail-open: an unexpected fs error must
+ *                                  never block installs, so we degrade to lock-free rather than wedge).
+ * A stale lock (dead holder, or older than {@link INSTALL_LOCK_STALE_MS}) is reclaimed.
+ */
+export function acquireInstallLock(dataDir) {
+  const lockDir = join(dataDir, INSTALL_LOCK_NAME);
+  const ownerPath = join(lockDir, "owner.json");
+  const claim = () => {
+    mkdirSync(lockDir); // atomic; throws EEXIST if it already exists
+    try {
+      writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, at: Date.now() }));
+    } catch {
+      /* owner metadata is best-effort; the dir's existence IS the lock */
+    }
+    return lockDir;
+  };
+  try {
+    return claim();
+  } catch (err) {
+    if (!err || err.code !== "EEXIST") {
+      return true; // unexpected fs error → fail-open
+    }
+  }
+  // Held: reclaim only if stale (dead holder, or older than the timeout).
+  let owner = null;
+  try {
+    owner = JSON.parse(readFileSync(ownerPath, "utf8"));
+  } catch {
+    owner = null; // no/unreadable owner metadata → treat as stale
+  }
+  const ageMs = owner && typeof owner.at === "number" ? Date.now() - owner.at : Infinity;
+  const stale = !owner || ageMs > INSTALL_LOCK_STALE_MS || !isHolderAlive(owner.pid);
+  if (!stale) {
+    return false; // a fresh, live holder — defer to it
+  }
+  try {
+    rmSync(lockDir, { recursive: true, force: true });
+    return claim();
+  } catch (err) {
+    // Another session reclaimed/created it between our rm and claim → defer; any other error → fail-open.
+    return Boolean(err && err.code === "EEXIST") ? false : true;
+  }
+}
+
+/** Release a lock acquired by {@link acquireInstallLock} (no-op for the `true`/`false` sentinels). */
+export function releaseInstallLock(lock) {
+  if (typeof lock === "string") {
+    try {
+      rmSync(lock, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+/**
+ * True iff the engine's bare imports will resolve from `${pluginRoot}/scripts/` — i.e. the bridge is
+ * either a real dev `node_modules` directory or a symlink that resolves to the data-dir deps. Lets an
+ * install FAIL on a filesystem that can't create symlinks (some network/FAT/Docker mounts, Windows
+ * without the privilege) instead of marking a permanently-unrunnable engine as "installed".
+ */
+export function bridgeReachable(rootNodeModules, depsNodeModules) {
+  let stat;
+  try {
+    stat = lstatSync(rootNodeModules);
+  } catch {
+    return false; // nothing there — the bridge was never created
+  }
+  if (stat.isSymbolicLink()) {
+    return pointsAtDeps(rootNodeModules, depsNodeModules);
+  }
+  return stat.isDirectory(); // a real dev node_modules — bare imports resolve here
+}
+
 async function main() {
   // `--check`: read-only install-state inspection for the /visual-setup consent gate. Prints the
   // computeInstallState() JSON to STDOUT and exits 0 — ALWAYS, even when the data dir can't be
@@ -350,6 +689,7 @@ async function main() {
           markerMatches: false,
           missing: ["deps", "browser", "marker"],
           engineDeps: ENGINE_DEPS,
+          nativeRuntime: nativeRuntime(),
           browser: BROWSER_LABEL,
           reason:
             "CLAUDE_PLUGIN_DATA is not set and the data dir could not be resolved — treat as not installed.",
@@ -403,50 +743,101 @@ async function main() {
     }
   };
 
-  if (isInstalled()) {
-    // Re-assert the bridge every session — cheap, and self-heals a wiped/relocated link.
-    refreshBridge();
-    process.exit(0); // already bootstrapped — silent no-op
-  }
-
   // Chromium must resolve to the same path at install time and at capture time.
   const env = { ...process.env, PLAYWRIGHT_BROWSERS_PATH: browsersDir };
 
-  try {
-    mkdirSync(dataDir, { recursive: true });
-    // The marker must exist for `npm install` to read it, but must NOT survive a failure.
-    writeFileSync(markerPath, manifest);
-
+  // Fast path: already bootstrapped AND the native bindings still load under THIS Node. The marker's
+  // nativeRuntime fingerprint catches a Node/OS/arch/libc change; this cheap re-verify ADDITIONALLY
+  // catches a marker that matches but whose binary is missing/corrupt/built-for-a-different-Node
+  // (partial node_modules loss, an install interrupted before it verified, a copied data dir). On a
+  // clean verify we just re-assert the bridge and no-op; otherwise we fall through to repair.
+  if (isInstalled()) {
+    if (verifyNativeModules(dataDir, env).length === 0) {
+      refreshBridge(); // self-heals a wiped/relocated link
+      process.exit(0); // already bootstrapped — silent no-op
+    }
     process.stderr.write(
-      "[visual-guard] Setting up the engine (one-time): runtime deps + a pinned Chromium " +
-        `(~150 MB) → ${dataDir}\n`,
+      "[visual-guard] Engine is installed but its native bindings did not load — repairing…\n",
     );
+  }
 
-    // Two streamed phases, each with a heartbeat so a long, quiet download never looks frozen.
-    await runStep(
-      "▸ 1/2 Installing engine packages (npm)…",
-      "npm",
-      ["install", "--no-audit", "--no-fund", "--no-package-lock"],
-      { cwd: dataDir, env },
+  // Serialize install/repair against a concurrent SessionStart so two hooks never `npm install` into
+  // the same node_modules at once. Acquired AFTER the fast path so a healthy session never contends.
+  const lock = acquireInstallLock(dataDir);
+  if (lock === false) {
+    process.stderr.write(
+      "[visual-guard] Another session is setting up the engine — it will be ready shortly. " +
+        "If a command reports the engine is missing, retry in a fresh session.\n",
     );
-    await runStep("▸ 2/2 Downloading Chromium (~150 MB)…", playwrightBin, ["install", "chromium"], {
-      cwd: dataDir,
-      env,
-    });
-
-    // Deps + browser are in place — now wire them to the plugin root so the engine is runnable.
-    refreshBridge();
-
-    process.stderr.write("[visual-guard] ✓ Engine ready — deps + Chromium installed.\n");
     process.exit(0);
+  }
+
+  const npm = resolveNpm();
+  let exitCode = 0;
+  try {
+    // Re-check under the lock: a holder we waited behind may have just finished a healthy install.
+    if (isInstalled() && verifyNativeModules(dataDir, env).length === 0) {
+      refreshBridge();
+    } else {
+      mkdirSync(dataDir, { recursive: true });
+      // The marker must exist for `npm install` to read it, but must NOT survive a failure.
+      writeFileSync(markerPath, manifest);
+
+      process.stderr.write(
+        "[visual-guard] Setting up the engine (one-time): runtime deps + a pinned Chromium " +
+          `(~150 MB) → ${dataDir}\n`,
+      );
+
+      // `--include=optional` so sharp's `@img/sharp-*` platform package is never silently omitted (a
+      // user/global npmrc `omit=optional` would otherwise drop it → a broken sharp). npm is pinned to
+      // THIS Node (resolveNpm) so native addons build for the engine's ABI, not a different `npm`'s.
+      await runStep(
+        "▸ 1/2 Installing engine packages (npm)…",
+        npm.command,
+        [
+          ...npm.prefix,
+          "install",
+          "--no-audit",
+          "--no-fund",
+          "--no-package-lock",
+          "--include=optional",
+        ],
+        { cwd: dataDir, env },
+      );
+      await runStep("▸ 2/2 Downloading Chromium (~150 MB)…", playwrightBin, ["install", "chromium"], {
+        cwd: dataDir,
+        env,
+      });
+
+      // npm can exit 0 with a native addon's binary silently missing — load-test and repair BEFORE
+      // trusting the install, so a broken binding is never recorded as "installed" (the root cause of
+      // the studio's ERR_DLOPEN_FAILED crash). Throws (→ marker removed → retry) if unfixable.
+      await ensureNativeModules(dataDir, env);
+
+      // Wire the deps to the plugin root, then CONFIRM the wiring actually resolves. On a filesystem
+      // that can't create symlinks the bridge silently fails; treat that as a failed install (throw →
+      // marker removed) rather than marking a permanently-unrunnable engine "ready".
+      refreshBridge();
+      if (!bridgeReachable(rootNodeModules, nodeModulesDir)) {
+        throw new Error(
+          "Could not link the engine into the plugin root (the data-dir filesystem may not support " +
+            "symlinks). The bundled engine scripts cannot resolve their dependencies without this link.",
+        );
+      }
+
+      process.stderr.write("[visual-guard] ✓ Engine ready — deps + Chromium installed.\n");
+    }
   } catch (err) {
     // Leave NO marker behind so the next session retries from a clean slate.
     rmSync(markerPath, { force: true });
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[visual-guard] Dependency bootstrap failed: ${message}`);
     console.error("[visual-guard] Will retry on the next session.");
-    process.exit(1);
+    exitCode = 1;
+  } finally {
+    releaseInstallLock(lock);
   }
+  process.exit(exitCode);
 }
 
 // Run only when invoked directly (`node install-deps.mjs`), so the module can be imported by
