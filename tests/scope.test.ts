@@ -79,6 +79,34 @@ describe("matchesAnyGlob / isGlobalFile", () => {
       false,
     );
   });
+
+  it("flags the build/env/asset surface the adversarial audit surfaced (else they slip to 'affects no story')", () => {
+    for (const file of [
+      "vite.config.ts",
+      "vite.config.mts",
+      "webpack.config.js",
+      "babel.config.json",
+      ".babelrc",
+      "components.json",
+      ".npmrc",
+      ".env",
+      ".env.production",
+      "src/theme/tokens.scss",
+      "src/styles/base.css",
+      "src/styles/reset.css",
+      "src/theme/designTokens.ts",
+      "src/components/Button/Button.theme.ts",
+      ".storybook/preview-head.html",
+      "public/fonts/Brand.woff2",
+      "static/logo.svg",
+      "patches/@acme+ui+1.0.0.patch",
+    ]) {
+      expect(isGlobalFile(file, DEFAULT_GLOBAL_GLOBS, TOKEN_GLOBS), file).toBe(true);
+    }
+    // A component-local stylesheet/asset is NOT global (it scopes to its importers via the graph).
+    expect(isGlobalFile("src/components/Button/Button.css", DEFAULT_GLOBAL_GLOBS, TOKEN_GLOBS)).toBe(false);
+    expect(isGlobalFile("src/components/Button/icon.svg", DEFAULT_GLOBAL_GLOBS, TOKEN_GLOBS)).toBe(false);
+  });
 });
 
 describe("decideScope — the cardinal invariant (uncertainty always widens to a full sweep)", () => {

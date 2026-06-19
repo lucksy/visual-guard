@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractCssSpecifiers, isCssFile } from "../scripts/lib/graph/css-imports";
+import { classifyUrlTarget, extractCssSpecifiers, isCssFile } from "../scripts/lib/graph/css-imports";
 
 describe("isCssFile", () => {
   it("matches stylesheet extensions (case-insensitive), not source files", () => {
@@ -67,5 +67,64 @@ describe("extractCssSpecifiers", () => {
   it("flags an interpolated or bare @import as dynamic (→ the file is graph-incomplete)", () => {
     expect(extractCssSpecifiers(`@import "#{$theme}/x.css";`, ".scss").dynamic).toBe(true); // scss interpolation
     expect(extractCssSpecifiers(`@import nib;`, ".css").dynamic).toBe(true); // bare identifier
+  });
+});
+
+describe("classifyUrlTarget", () => {
+  it("treats relative paths as asset edges", () => {
+    expect(classifyUrlTarget("./bg.png")).toBe("asset");
+    expect(classifyUrlTarget("../fonts/Brand.woff2")).toBe("asset");
+    expect(classifyUrlTarget("images/sprite.svg")).toBe("asset");
+  });
+  it("skips fragments, remote, data, and ABSOLUTE (static-serve) targets", () => {
+    expect(classifyUrlTarget("#gradient")).toBe("skip"); // in-document reference
+    expect(classifyUrlTarget("https://cdn/x.woff2")).toBe("skip");
+    expect(classifyUrlTarget("//cdn/x.png")).toBe("skip");
+    expect(classifyUrlTarget("data:image/png;base64,AAAA")).toBe("skip");
+    expect(classifyUrlTarget("/logo.png")).toBe("skip"); // absolute → public/staticDirs (global, not closure)
+  });
+  it("flags interpolation / var() as dynamic (can't follow → importer incomplete)", () => {
+    expect(classifyUrlTarget("#{$icon}.png")).toBe("dynamic"); // scss
+    expect(classifyUrlTarget("@{icon}.png")).toBe("dynamic"); // less
+    expect(classifyUrlTarget("var(--logo)")).toBe("dynamic");
+  });
+});
+
+describe("extractCssSpecifiers — url() asset edges", () => {
+  it("collects relative url() assets from any declaration (@font-face src, background, etc.)", () => {
+    const css = [
+      `@font-face { font-family: Brand; src: url('../fonts/Brand.woff2') format('woff2'), url(../fonts/Brand.woff); }`,
+      `.logo { background: url("./logo.png") no-repeat; }`,
+      `.i { mask-image: url(icons/check.svg); }`,
+    ].join("\n");
+    const { assets, dynamic } = extractCssSpecifiers(css, ".css");
+    expect(assets).toEqual([
+      "../fonts/Brand.woff2",
+      "../fonts/Brand.woff",
+      "./logo.png",
+      "icons/check.svg",
+    ]);
+    expect(dynamic).toBe(false);
+  });
+
+  it("skips remote / data / absolute / fragment url() (not story-local closure edges)", () => {
+    const css = [
+      `.a { background: url(https://cdn/x.png); }`,
+      `.b { background: url('data:image/gif;base64,AAA'); }`,
+      `.c { background: url(/hero.jpg); }`, // absolute → static-serve, covered by globals
+      `.d { clip-path: url(#mask); }`,
+    ].join("\n");
+    expect(extractCssSpecifiers(css, ".css").assets).toEqual([]);
+  });
+
+  it("flags an interpolated / var() url() as dynamic (→ importer incomplete, never skipped)", () => {
+    expect(extractCssSpecifiers(`.a{ background: url("#{$dir}/x.png"); }`, ".scss").dynamic).toBe(true);
+    expect(extractCssSpecifiers(`.a{ background: url(var(--bg)); }`, ".css").dynamic).toBe(true);
+  });
+
+  it("does not treat @import url() as an asset (it's an at-rule import, captured as a specifier)", () => {
+    const out = extractCssSpecifiers(`@import url(./a.css);\n.x{ background: url(./bg.png) }`, ".css");
+    expect(out.specifiers).toEqual(["./a.css"]);
+    expect(out.assets).toEqual(["./bg.png"]);
   });
 });

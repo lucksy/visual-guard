@@ -31,6 +31,7 @@ function mkManifest(targets: ManifestTarget[]): Manifest {
       fail: by("fail"),
       new: by("new"),
       error: by("error"),
+      skipped: 0,
     },
     targets,
   };

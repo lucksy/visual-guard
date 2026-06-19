@@ -147,15 +147,21 @@ describe("parseConfig — scope block (change-scoped knobs)", () => {
       fanoutThreshold: 0.4,
       fanoutMinStories: 8,
       globalGlobs: [],
+      fingerprintSkip: false,
     });
   });
 
-  it("parses fanoutThreshold / fanoutMinStories / globalGlobs", () => {
+  it("parses fanoutThreshold / fanoutMinStories / globalGlobs / fingerprintSkip", () => {
     const cfg = parseConfig({
       ...minimal,
-      scope: { fanoutThreshold: 0.6, fanoutMinStories: 20, globalGlobs: ["**/theme/**"] },
+      scope: { fanoutThreshold: 0.6, fanoutMinStories: 20, globalGlobs: ["**/theme/**"], fingerprintSkip: true },
     });
-    expect(cfg.scope).toEqual({ fanoutThreshold: 0.6, fanoutMinStories: 20, globalGlobs: ["**/theme/**"] });
+    expect(cfg.scope).toEqual({
+      fanoutThreshold: 0.6,
+      fanoutMinStories: 20,
+      globalGlobs: ["**/theme/**"],
+      fingerprintSkip: true,
+    });
   });
 
   it("validates scope fields, naming the offender", () => {

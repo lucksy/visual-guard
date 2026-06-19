@@ -1,7 +1,21 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadConfig, type Config } from "./lib/config";
+import {
+  FINGERPRINTS_VERSION,
+  type FingerprintEntry,
+  type FingerprintsFile,
+} from "./lib/fingerprint-file";
 import { isSafeKey, walkPngFiles } from "./compare";
 
 /**
@@ -173,6 +187,92 @@ export interface BaselineResult {
   dryRun: boolean;
 }
 
+/** sha1 hex of a file's bytes (the baseline PNG tamper-evidence stored alongside the approved fp). */
+function sha1Bytes(buffer: Buffer): string {
+  return createHash("sha1").update(buffer).digest("hex");
+}
+
+/** Read a `fingerprints.json` into a `{ key: FingerprintEntry }` map; `{}` on any error/version mismatch. */
+function readFingerprintsFile(path: string): Record<string, FingerprintEntry> {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<FingerprintsFile>;
+    if (
+      parsed.version !== FINGERPRINTS_VERSION ||
+      typeof parsed.renders !== "object" ||
+      parsed.renders === null
+    ) {
+      return {};
+    }
+    const out: Record<string, FingerprintEntry> = {};
+    for (const [key, entry] of Object.entries(parsed.renders)) {
+      if (entry !== null && typeof entry === "object" && typeof entry.fp === "string") {
+        out[key] = { fp: entry.fp, ...(typeof entry.png === "string" ? { png: entry.png } : {}) };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Record the APPROVED fingerprints for the just-approved renders into the committed
+ * `baselineDir/fingerprints.json` (capture fingerprint-skip). For each WRITTEN key we pair the run's
+ * CURRENT input fingerprint (capture persisted it run-scoped, so it provably matches the PNG we just
+ * copied) with that baseline PNG's own sha1 (tamper-evidence). The merge is partial-approval-safe and:
+ *   - a written key with NO run fingerprint (it wasn't fingerprintable at capture) DROPS any stale
+ *     approved entry → it can never be skip-eligible;
+ *   - entries whose baseline PNG no longer exists are pruned.
+ * Best-effort: a failure here never fails the (already-completed) baseline copy — it just means those
+ * renders aren't skip-eligible (the safe direction).
+ */
+export function recordApprovedFingerprints(
+  runDir: string,
+  baselineDir: string,
+  writtenKeys: string[],
+): void {
+  try {
+    // No run fingerprints at all (an explicit `--target` run, or a legacy run captured before
+    // fingerprints existed) → leave the committed approved file UNTOUCHED. Those renders just aren't
+    // re-fingerprinted here; dropping existing approved fps would needlessly lose skip-eligibility.
+    const runFpsPath = join(runDir, "fingerprints.json");
+    if (!existsSync(runFpsPath)) return;
+    const runFps = readFingerprintsFile(runFpsPath);
+    const approvedPath = join(baselineDir, "fingerprints.json");
+    const approved = readFingerprintsFile(approvedPath);
+
+    for (const key of writtenKeys) {
+      if (!isSafeKey(key)) continue;
+      const current = runFps[key];
+      if (current === undefined) {
+        delete approved[key]; // not fingerprintable at capture → never skip-eligible
+        continue;
+      }
+      let png: string;
+      try {
+        png = sha1Bytes(readFileSync(join(baselineDir, key)));
+      } catch {
+        delete approved[key]; // can't hash the just-copied baseline → not skip-eligible
+        continue;
+      }
+      approved[key] = { fp: current.fp, png };
+    }
+
+    // Prune entries whose baseline PNG is gone (a deleted/renamed baseline must never be skipped to).
+    for (const key of Object.keys(approved)) {
+      if (!isSafeKey(key) || !existsSync(join(baselineDir, key))) {
+        delete approved[key];
+      }
+    }
+
+    const file: FingerprintsFile = { version: FINGERPRINTS_VERSION, renders: approved };
+    mkdirSync(dirname(approvedPath), { recursive: true });
+    writeFileSync(approvedPath, `${JSON.stringify(file, null, 2)}\n`);
+  } catch {
+    /* best-effort: never fail an approval over fingerprint bookkeeping */
+  }
+}
+
 /** Resolve the run, plan the copies, and (unless dryRun) approve them into the baseline dir. */
 export function runBaseline(config: Config, options: BaselineOptions = {}): BaselineResult {
   const outRoot = options.outRoot ?? ".visual-guard";
@@ -214,6 +314,9 @@ export function runBaseline(config: Config, options: BaselineOptions = {}): Base
   }
 
   const { written, skipped, failed } = applyBaseline(planned, baselineDir, { overwrite });
+  // Record the approved input fingerprints for the renders just written (capture fingerprint-skip).
+  // Run-scoped source so each approved fp provably pairs with the PNG it approved.
+  recordApprovedFingerprints(join(runsDir, runId), baselineDir, written);
   return { runId, baselineDir, planned, written, skipped, failed, dryRun: false };
 }
 

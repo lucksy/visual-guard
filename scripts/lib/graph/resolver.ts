@@ -15,6 +15,24 @@ const PROBE_EXTENSIONS = [
 /** CSS-first probe order for a stylesheet `@import` target (so `@import './x'` prefers x.css). */
 const CSS_PROBE_EXTENSIONS = [".css", ".scss", ".sass", ".less", ".styl", ".pcss"];
 
+/**
+ * Binary / non-code asset leaves (fonts, images, media). These are content-hashed closure nodes (a
+ * re-subset font changes pixels) but carry NO imports — so the resolver short-circuits them to a leaf
+ * WITHOUT reading them as a UTF-8 string and parsing them as TS (which would be wasteful and could
+ * spuriously trip the dynamic-import heuristic on random bytes). `.svg` is text but is likewise an
+ * asset leaf. Hashing of these bytes for the fingerprint (B2) is byte-exact, separate from this.
+ */
+const BINARY_ASSET_EXTENSIONS = new Set([
+  ".woff", ".woff2", ".ttf", ".otf", ".eot",
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".bmp", ".svg",
+  ".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg",
+]);
+
+function isBinaryAsset(file: string): boolean {
+  const dot = file.lastIndexOf(".");
+  return dot >= 0 && BINARY_ASSET_EXTENSIONS.has(file.slice(dot).toLowerCase());
+}
+
 function isFile(path: string): boolean {
   try {
     return statSync(path).isFile();
@@ -211,17 +229,33 @@ export function createResolver(
     return value.includes("/") ? { kind: "unresolved" } : { kind: "external" };
   };
 
-  /** Extract + resolve a stylesheet's `@import`/`@use`/`@forward`/`composes` edges. */
+  /**
+   * Resolve a CSS `url(...)` ASSET target by EXACT path (it carries its own extension — no extension
+   * probing, unlike a CSS `@import`). Relative/path-shaped only (absolute/remote/data/fragment were
+   * filtered out by `classifyUrlTarget`). A relative asset that isn't on disk can't be content-hashed,
+   * so it marks the importer incomplete (→ captured every run / never skipped) rather than a silent miss.
+   */
+  const resolveCssAsset = (spec: string, fromFile: string): SpecResult => {
+    const abs = resolve(dirname(fromFile), spec);
+    return isFile(abs) ? { kind: "edge", file: normalize(abs) } : { kind: "unresolved" };
+  };
+
+  /** Extract + resolve a stylesheet's `@import`/`@use`/`@forward`/`composes` edges + `url()` assets. */
   const extractCssImports = (absFile: string, text: string): FileImports => {
     const dot = absFile.lastIndexOf(".");
     const ext = dot >= 0 ? absFile.slice(dot) : "";
-    const { specifiers, dynamic } = extractCssSpecifiers(text, ext);
+    const { specifiers, assets, dynamic } = extractCssSpecifiers(text, ext);
     const resolved: string[] = [];
     let unresolvedOrDynamic = dynamic;
     for (const spec of specifiers) {
       const result = resolveCssSpec(spec, absFile);
       if (result.kind === "edge") resolved.push(result.file);
       else if (result.kind === "unresolved") unresolvedOrDynamic = true;
+    }
+    for (const asset of assets) {
+      const result = resolveCssAsset(asset, absFile);
+      if (result.kind === "edge") resolved.push(result.file);
+      else unresolvedOrDynamic = true; // a relative asset we can't find on disk → can't hash → incomplete
     }
     return { resolved, unresolvedOrDynamic };
   };
@@ -267,6 +301,11 @@ export function createResolver(
   };
 
   const extractImports = (absFile: string): FileImports => {
+    // A binary/media asset (font/image) is a content-hashed closure LEAF with no imports — never read
+    // or parse it as code (a UTF-8 read of binary bytes could spuriously trip the dynamic heuristic).
+    if (isBinaryAsset(absFile)) {
+      return { resolved: [], unresolvedOrDynamic: false };
+    }
     let text: string;
     try {
       text = readFile(absFile);
@@ -274,7 +313,8 @@ export function createResolver(
       // Can't read the file (deleted/permission) → can't trust its imports → incomplete.
       return { resolved: [], unresolvedOrDynamic: true };
     }
-    // A stylesheet's edges (@import / @use / composes) are invisible to the TS extractor — parse CSS.
+    // A stylesheet's edges (@import / @use / composes / url() assets) are invisible to the TS
+    // extractor — parse CSS.
     if (isCssFile(absFile)) {
       return extractCssImports(absFile, text);
     }

@@ -21,6 +21,7 @@ function mkImage(overrides: Partial<ManifestImage> = {}): ManifestImage {
     verdict: null,
     renderTarget: null,
     currentDimensions: null,
+    skipped: false,
     ...overrides,
   };
 }
@@ -51,6 +52,7 @@ function mkManifest(targets: ManifestTarget[]): Manifest {
       fail: by("fail"),
       new: by("new"),
       error: by("error"),
+      skipped: 0,
     },
     targets,
   };

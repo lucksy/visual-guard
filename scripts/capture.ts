@@ -1,16 +1,23 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { availableParallelism, cpus } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { chromium } from "playwright";
 import { loadConfig, type Config } from "./lib/config";
 import {
+  renderRelPath,
   resolveTargets,
   sanitizePathSegment,
   type FetchLike,
   type RenderTarget,
 } from "./lib/targets";
 import { FREEZE_INIT_SCRIPT, FREEZE_STYLE, SETTLE_SCRIPT, contextOptions } from "./lib/browser";
+import {
+  FINGERPRINTS_VERSION,
+  type FingerprintEntry,
+  type FingerprintsFile,
+} from "./lib/fingerprint-file";
 import { managedLadleTargets } from "./lib/harness/serve-plan";
 
 /**
@@ -46,15 +53,21 @@ export interface CliArgs {
   concurrency?: number;
   /** Path to a `.visual-guard/scope.json` (`--scope-file`); restricts capture to the scoped set. */
   scopeFile?: string;
+  /** Path to the run's current fingerprints.json (`--fingerprints`); pairs with `--skip-unchanged`. */
+  fingerprintsFile?: string;
+  /** Enable fingerprint-skip (`--skip-unchanged`); opt-in, no-op without `--fingerprints`. */
+  skipUnchanged?: boolean;
 }
 
-/** Parse `--config <path> --target <name> --run <id> --concurrency <n> --scope-file <path>`; unknown flags / missing values throw. */
+/** Parse `--config <path> --target <name> --run <id> --concurrency <n> --scope-file <path> --fingerprints <path> --skip-unchanged`; unknown flags / missing values throw. */
 export function parseArgs(argv: string[]): CliArgs {
   let config = "config/visual.config.json";
   let target: string | undefined;
   let runId: string | undefined;
   let concurrency: number | undefined;
   let scopeFile: string | undefined;
+  let fingerprintsFile: string | undefined;
+  let skipUnchanged = false;
 
   const value = (index: number, flag: string): string => {
     const next = argv[index];
@@ -88,12 +101,18 @@ export function parseArgs(argv: string[]): CliArgs {
       case "--scope-file":
         scopeFile = value(++i, "--scope-file");
         break;
+      case "--fingerprints":
+        fingerprintsFile = value(++i, "--fingerprints");
+        break;
+      case "--skip-unchanged":
+        skipUnchanged = true;
+        break;
       default:
         fail(`unknown argument ${JSON.stringify(arg)}.`);
     }
   }
 
-  return { config, target, runId, concurrency, scopeFile };
+  return { config, target, runId, concurrency, scopeFile, fingerprintsFile, skipUnchanged };
 }
 
 /** A capture scope: components and/or exact story ids to keep (the change-scoped subset). */
@@ -165,10 +184,9 @@ export function resolveConcurrency(requested: number | undefined, cores: number)
   return Math.min(Math.max(usableCores - 1, 2), 8);
 }
 
-/** The shared relative key for a render — used under current/, baseline/, and diff/. */
-export function renderRelPath(render: RenderTarget): string {
-  return `${render.instance}/${render.name}/${render.state}@${render.viewport}.png`;
-}
+// `renderRelPath` now lives in lib/targets.ts (so scope.ts can key fingerprints by it without
+// importing Playwright via this module); re-exported here for back-compat with existing importers.
+export { renderRelPath };
 
 /** A sortable, filesystem-safe run id from a timestamp, e.g. "20260613-080905" (UTC). */
 export function makeRunId(date: Date): string {
@@ -286,12 +304,31 @@ export interface CaptureOptions {
    * resolved renders (a full sweep). Applied AFTER the `--target` filter.
    */
   scope?: CaptureScope;
+  /**
+   * Enable capture fingerprint-skip (opt-in, OFF by default; the command NEVER auto-enables it under
+   * a plain `--all` sweep — that stays a true full capture). When true AND {@link fingerprintsFile} is
+   * set, a render whose current input fingerprint byte-equals its approved one (and whose baseline PNG
+   * is intact) is copied forward instead of screenshotted. Any gap → captured normally.
+   */
+  skipUnchanged?: boolean;
+  /** Path to the run's CURRENT fingerprints.json (scope-emitted). Required for {@link skipUnchanged} to engage. */
+  fingerprintsFile?: string;
+  /** Committed baseline root (holds the baseline PNGs + the approved fingerprints.json). Defaults to config.baselineDir. */
+  baselineDir?: string;
+  /**
+   * Rotating forced-recapture quota: how many skip-eligible renders to physically re-shoot this run
+   * (the safety bound — see {@link selectRotatingRecapture}). Absent → `ceil(sqrt(N))`; `0` disables
+   * forced recapture (every eligible render copied forward). The command leaves it at the default.
+   */
+  skipForceSample?: number;
 }
 
 export interface CaptureDeps {
   fetch: FetchLike;
   launch: Launcher;
   writeFile: (path: string, data: Buffer) => void;
+  /** Read a file's bytes (baseline PNGs + fingerprints.json for fingerprint-skip). Injectable for tests. */
+  readFile: (path: string) => Buffer;
   now: () => Date;
 }
 
@@ -322,6 +359,13 @@ export interface RenderRecord {
    * PNG was written, so compare never sees it; report surfaces this as an `error`-status manifest image.
    */
   error?: string;
+  /**
+   * True when this render's pixels were COPIED from the approved baseline (its input fingerprint was
+   * byte-identical to approval time), NOT screenshotted — capture fingerprint-skip. The copied bytes
+   * still land under current/, so compare diffs them to 0 → `pass`; this flag keeps the report honest
+   * ("trusted the baseline", never silently folded into "all good"). Additive: report reads tolerantly.
+   */
+  skipped?: boolean;
 }
 
 /** The `renders.json` artifact: render records keyed by the shared `renderRelPath` key. */
@@ -332,10 +376,95 @@ export interface RendersFile {
 
 const RENDERS_VERSION = 1;
 
+// The fingerprints.json schema lives in lib/fingerprint-file.ts (dependency-free, shared with scope.ts
+// so scope can emit fingerprints without importing Playwright via this module). Re-exported for callers.
+export { FINGERPRINTS_VERSION, type FingerprintEntry, type FingerprintsFile };
+
+/** sha1 hex of a buffer (a baseline PNG's bytes for tamper-evidence). */
+function sha1Bytes(buffer: Buffer): string {
+  return createHash("sha1").update(buffer).digest("hex");
+}
+
+/**
+ * Rotating forced-recapture (the safety bound on fingerprint-skip): choose which skip-eligible renders
+ * to physically RE-SHOOT this run rather than copy forward. A deterministic window of `ceil(sqrt(N))`
+ * keys, offset by a hash of the run id so a DIFFERENT subset is re-shot each run. This converts the
+ * irreducible blind spots a fingerprint can't witness (host-font fallback, the Chromium binary, remote/
+ * CDN assets, shell-injected env) from PERMANENT into bounded-latency: over ~sqrt(N) runs every baseline
+ * is re-verified. Stateless (works on a fresh CI checkout). `N ≤ ceil(sqrt(N))` → re-shoot them all.
+ */
+export function selectRotatingRecapture(keys: string[], runId: string, sample?: number): Set<string> {
+  const n = keys.length;
+  if (n === 0) return new Set();
+  const k = sample ?? Math.ceil(Math.sqrt(n)); // default quota: ceil(sqrt(N)) (configurable; 0 disables)
+  if (k <= 0) return new Set();
+  if (k >= n) return new Set(keys);
+  const sorted = [...keys].sort();
+  const offset = parseInt(createHash("sha1").update(runId).digest("hex").slice(0, 8), 16) % n;
+  const out = new Set<string>();
+  for (let i = 0; i < k; i++) {
+    out.add(sorted[(offset + i) % n] as string);
+  }
+  return out;
+}
+
+/**
+ * Read a fingerprints.json into a `{ renderRelPath: FingerprintEntry }` map. Best-effort: a missing
+ * file, wrong version, or any parse error → `{}` (skip NOTHING) — upholding the never-skip-on-
+ * uncertainty invariant. Reads through the injected `read` so capture stays testable without the fs.
+ */
+export function readFingerprints(
+  path: string,
+  read: (p: string) => Buffer,
+): Record<string, FingerprintEntry> {
+  try {
+    const parsed = JSON.parse(read(path).toString("utf8")) as Partial<FingerprintsFile>;
+    if (
+      parsed.version !== FINGERPRINTS_VERSION ||
+      typeof parsed.renders !== "object" ||
+      parsed.renders === null
+    ) {
+      return {};
+    }
+    const out: Record<string, FingerprintEntry> = {};
+    for (const [key, entry] of Object.entries(parsed.renders)) {
+      if (entry !== null && typeof entry === "object" && typeof entry.fp === "string") {
+        out[key] = { fp: entry.fp, ...(typeof entry.png === "string" ? { png: entry.png } : {}) };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Read the `inputs` content-hash map (relPosix → byte-hash) scope emitted alongside the fps — the source
+ * files behind the fps, used for the approve-time TOCTOU guard. `{}` on any error / wrong version.
+ */
+export function readFingerprintInputs(path: string, read: (p: string) => Buffer): Record<string, string> {
+  try {
+    const parsed = JSON.parse(read(path).toString("utf8")) as Partial<FingerprintsFile>;
+    if (parsed.version !== FINGERPRINTS_VERSION || typeof parsed.inputs !== "object" || parsed.inputs === null) {
+      return {};
+    }
+    const out: Record<string, string> = {};
+    for (const [key, hash] of Object.entries(parsed.inputs)) {
+      if (typeof hash === "string") {
+        out[key] = hash;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 const defaultDeps: CaptureDeps = {
   fetch: defaultFetch,
   launch: launchChromium,
   writeFile: writeFileDefault,
+  readFile: (path) => readFileSync(path),
   now: () => new Date(),
 };
 
@@ -389,112 +518,206 @@ export async function captureAll(
   const written: string[] = [];
   const renders: Record<string, RenderRecord> = {};
 
-  // Bounded-concurrency capture: a pool of workers pulls renders off a shared index queue, each
-  // owning an isolated browser context (the R1 determinism settings are per-context, so running
-  // many in parallel never changes a single render's pixels). Results are slotted by the target's
-  // ORIGINAL index, so `written`/`renders` stay in config/target order regardless of which worker
-  // finishes first. With failFast, the first failure stops new work being pulled and is rethrown
-  // after the in-flight renders drain and the browser closes.
-  const cores = availableParallelism?.() ?? cpus().length;
-  const workerCount = Math.min(resolveConcurrency(options.concurrency, cores), targets.length);
-
   type Slot = { rel: string; record: RenderRecord; wrote: boolean };
   const slots: Array<Slot | null> = new Array(targets.length).fill(null);
-  let nextIndex = 0;
+
+  // ---- Fingerprint-skip plan (opt-in via --skip) -------------------------------------------------
+  // A render whose CURRENT input fingerprint byte-equals its APPROVED one (and whose baseline PNG
+  // exists) cannot have changed pixels → copy the baseline forward, no browser. OFF unless --skip AND
+  // a --fingerprints file are supplied; ANY gap (no current fp, no approved fp, mismatch, unreadable
+  // baseline) → capture normally. The copied bytes land under current/, so compare diffs them to 0 →
+  // `pass`, keeping compare/report unchanged. `skipped:true` keeps the report honest (see RenderRecord).
+  const baselineDir = options.baselineDir ?? config.baselineDir;
+  // Read the run's CURRENT fingerprints whenever a --fingerprints file is given — INDEPENDENT of
+  // --skip-unchanged — because they are persisted run-scoped below so /visual-baseline can record the
+  // approved fingerprint that pairs with each approved PNG. They drive a SKIP only under --skip-unchanged
+  // (so the approved file is read, and a render is copied forward, only then).
+  const currentFps =
+    options.fingerprintsFile !== undefined
+      ? readFingerprints(options.fingerprintsFile, deps.readFile)
+      : {};
+  // The source-file content hashes scope computed F from — re-verified AFTER the pool (the TOCTOU guard).
+  const currentInputs =
+    options.fingerprintsFile !== undefined
+      ? readFingerprintInputs(options.fingerprintsFile, deps.readFile)
+      : {};
+  const approvedFps =
+    options.skipUnchanged === true && Object.keys(currentFps).length > 0
+      ? readFingerprints(join(baselineDir, "fingerprints.json"), deps.readFile)
+      : {};
+
+  // PASS 1 — classify each target as skip-ELIGIBLE (inputs byte-identical to an intact approved
+  // baseline) or must-capture. Skip ONLY when: current input fp === approved input fp, AND the approved
+  // entry carries a baseline PNG hash (tamper-evidence — fail closed if absent), AND the live baseline
+  // PNG still hashes to it (a corrupted/edited baseline must never be laundered forward), AND it reads.
+  const captureIndices: number[] = [];
+  const skipEligible: Array<{ index: number; rel: string; bytes: Buffer }> = [];
+  for (let i = 0; i < targets.length; i++) {
+    const target = targets[i];
+    if (target === undefined) {
+      continue;
+    }
+    const rel = renderRelPath(target);
+    const cur = currentFps[rel];
+    const appr = approvedFps[rel];
+    let baselineBytes: Buffer | null = null;
+    if (cur !== undefined && appr !== undefined && cur.fp === appr.fp && appr.png !== undefined) {
+      try {
+        const bytes = deps.readFile(join(baselineDir, rel)); // missing/unreadable baseline → capture
+        baselineBytes = sha1Bytes(bytes) === appr.png ? bytes : null; // tamper mismatch → capture
+      } catch {
+        baselineBytes = null;
+      }
+    }
+    if (baselineBytes !== null) {
+      skipEligible.push({ index: i, rel, bytes: baselineBytes });
+    } else {
+      captureIndices.push(i);
+    }
+  }
+
+  // PASS 2 — rotating forced recapture: physically re-shoot a rotating sample of the skip-eligible set
+  // (so no blind spot a fingerprint can't see is permanent), and COPY the rest forward (no browser).
+  // `skipForceSample` is NOT parsed by the CLI and is absent from the config schema — it exists only so
+  // tests can disable the rotation (sample 0). Do NOT wire a production knob to 0: that removes the only
+  // bound on the fingerprint's invisible-input blind spots (host fonts, Chromium binary, CDN, env).
+  const forced = selectRotatingRecapture(
+    skipEligible.map((entry) => entry.rel),
+    runId,
+    options.skipForceSample,
+  );
+  for (const { index, rel, bytes } of skipEligible) {
+    if (forced.has(rel)) {
+      captureIndices.push(index); // re-verify this baseline this run (captured normally, not skipped)
+      continue;
+    }
+    const target = targets[index] as RenderTarget;
+    deps.writeFile(join(currentDir, rel), bytes);
+    slots[index] = {
+      rel,
+      wrote: true,
+      record: {
+        url: target.url,
+        kind: target.kind,
+        viewport: target.viewport,
+        currentDimensions: readPngDimensions(bytes),
+        skipped: true,
+      },
+    };
+  }
+
+  // Bounded-concurrency capture of the NON-skipped renders: a pool of workers pulls off a shared
+  // cursor, each owning an isolated browser context (the R1 determinism settings are per-context, so
+  // running many in parallel never changes a single render's pixels). Results are slotted by the
+  // target's ORIGINAL index, so `written`/`renders` stay in config/target order regardless of which
+  // worker finishes first. With failFast, the first failure stops new work being pulled and is
+  // rethrown after the in-flight renders drain and the browser closes.
+  const cores = availableParallelism?.() ?? cpus().length;
+  const workerCount = Math.min(resolveConcurrency(options.concurrency, cores), captureIndices.length);
+
+  let nextCursor = 0;
   let aborted = false;
   let firstError: unknown = null;
 
-  const browser = await deps.launch();
+  // Launch the browser ONLY when something needs screenshotting — an all-unchanged sweep (the CI
+  // source-of-truth with nothing changed) copies every baseline forward and never starts Chromium.
+  if (captureIndices.length > 0) {
+    const browser = await deps.launch();
 
-  /** Capture one render end-to-end in its own context. Throws (failFast) or returns an error slot. */
-  const captureOne = async (target: RenderTarget): Promise<Slot> => {
-    const rel = renderRelPath(target);
-    const context = await browser.newContext(contextOptions(target.viewport));
-    try {
-      // Freeze animations/transitions BEFORE any page CSS/JS runs, so a load-time animation is
-      // never captured mid-flight (R1).
-      await context.addInitScript(FREEZE_INIT_SCRIPT);
-      const page = await context.newPage();
+    /** Capture one render end-to-end in its own context. Throws (failFast) or returns an error slot. */
+    const captureOne = async (target: RenderTarget): Promise<Slot> => {
+      const rel = renderRelPath(target);
+      const context = await browser.newContext(contextOptions(target.viewport));
       try {
+        // Freeze animations/transitions BEFORE any page CSS/JS runs, so a load-time animation is
+        // never captured mid-flight (R1).
+        await context.addInitScript(FREEZE_INIT_SCRIPT);
+        const page = await context.newPage();
         try {
-          await page.goto(target.url, { waitUntil: "networkidle", timeout: navTimeoutMs });
-          // Belt-and-suspenders freeze for any style inserted late, then wait for fonts / images
-          // to settle and reset scroll before the shot.
-          await page.addStyleTag({ content: FREEZE_STYLE });
-          await page.evaluate(SETTLE_SCRIPT);
-          const buffer = await page.screenshot({ fullPage: true });
-          deps.writeFile(join(currentDir, rel), buffer);
-          // Persist the render's identity + dimensions for manifest v2 (T-13), keyed by the same
-          // relative path compare/report key on — so the reviewer can re-render it live.
-          return {
-            rel,
-            wrote: true,
-            record: {
-              url: target.url,
-              kind: target.kind,
-              viewport: target.viewport,
-              currentDimensions: readPngDimensions(buffer),
-            },
-          };
-        } catch (err) {
-          // failFast (default): a down/broken render aborts the run loudly. Tolerant mode (managed
-          // harness / Studio sync): record the error, write NO png, and keep going so a single bad
-          // story can't nuke the whole capture — report surfaces it from renders.json.
-          if (failFast) {
-            fail(`failed to capture ${target.instance}/${target.name} (${target.url}): ${detailOf(err)}`);
+          try {
+            await page.goto(target.url, { waitUntil: "networkidle", timeout: navTimeoutMs });
+            // Belt-and-suspenders freeze for any style inserted late, then wait for fonts / images
+            // to settle and reset scroll before the shot.
+            await page.addStyleTag({ content: FREEZE_STYLE });
+            await page.evaluate(SETTLE_SCRIPT);
+            const buffer = await page.screenshot({ fullPage: true });
+            deps.writeFile(join(currentDir, rel), buffer);
+            // Persist the render's identity + dimensions for manifest v2 (T-13), keyed by the same
+            // relative path compare/report key on — so the reviewer can re-render it live.
+            return {
+              rel,
+              wrote: true,
+              record: {
+                url: target.url,
+                kind: target.kind,
+                viewport: target.viewport,
+                currentDimensions: readPngDimensions(buffer),
+              },
+            };
+          } catch (err) {
+            // failFast (default): a down/broken render aborts the run loudly. Tolerant mode (managed
+            // harness / Studio sync): record the error, write NO png, and keep going so a single bad
+            // story can't nuke the whole capture — report surfaces it from renders.json.
+            if (failFast) {
+              fail(`failed to capture ${target.instance}/${target.name} (${target.url}): ${detailOf(err)}`);
+            }
+            return {
+              rel,
+              wrote: false,
+              record: {
+                url: target.url,
+                kind: target.kind,
+                viewport: target.viewport,
+                currentDimensions: null,
+                error: detailOf(err),
+              },
+            };
           }
-          return {
-            rel,
-            wrote: false,
-            record: {
-              url: target.url,
-              kind: target.kind,
-              viewport: target.viewport,
-              currentDimensions: null,
-              error: detailOf(err),
-            },
-          };
+        } finally {
+          await page.close();
         }
       } finally {
-        await page.close();
+        await context.close();
       }
-    } finally {
-      await context.close();
-    }
-  };
+    };
 
-  const worker = async (): Promise<void> => {
-    while (!aborted) {
-      const index = nextIndex++;
-      if (index >= targets.length) {
-        return;
-      }
-      const target = targets[index];
-      if (target === undefined) {
-        return;
-      }
-      try {
-        slots[index] = await captureOne(target);
-      } catch (err) {
-        // failFast: captureOne threw — keep the FIRST error and stop the pool pulling new work.
-        if (firstError === null) {
-          firstError = err;
+    const worker = async (): Promise<void> => {
+      while (!aborted) {
+        const cursor = nextCursor++;
+        if (cursor >= captureIndices.length) {
+          return;
         }
-        aborted = true;
-        return;
+        const index = captureIndices[cursor];
+        if (index === undefined) {
+          return;
+        }
+        const target = targets[index];
+        if (target === undefined) {
+          return;
+        }
+        try {
+          slots[index] = await captureOne(target);
+        } catch (err) {
+          // failFast: captureOne threw — keep the FIRST error and stop the pool pulling new work.
+          if (firstError === null) {
+            firstError = err;
+          }
+          aborted = true;
+          return;
+        }
       }
+    };
+
+    try {
+      await Promise.all(Array.from({ length: Math.max(1, workerCount) }, () => worker()));
+    } finally {
+      await browser.close();
     }
-  };
 
-  try {
-    await Promise.all(Array.from({ length: Math.max(1, workerCount) }, () => worker()));
-  } finally {
-    await browser.close();
-  }
-
-  // failFast: rethrow the first failure only after the browser is closed (no leaked Chromium).
-  if (firstError !== null) {
-    throw firstError instanceof Error ? firstError : new Error(String(firstError));
+    // failFast: rethrow the first failure only after the browser is closed (no leaked Chromium).
+    if (firstError !== null) {
+      throw firstError instanceof Error ? firstError : new Error(String(firstError));
+    }
   }
 
   // Flatten per-index slots in target order so written[]/renders are deterministic regardless of
@@ -518,6 +741,36 @@ export async function captureAll(
     Buffer.from(`${JSON.stringify(rendersFile, null, 2)}\n`),
   );
 
+  // Persist the run's CURRENT input fingerprints (when scope supplied them) RUN-SCOPED, so
+  // /visual-baseline records the approved fingerprint that pairs with each approved PNG — never the
+  // stale, fixed-path fingerprints-current.json (which a later run may have overwritten).
+  if (options.fingerprintsFile !== undefined) {
+    // Approve-time TOCTOU guard: scope byte-hashed the SOURCE to compute these fps BEFORE this run
+    // screenshotted the live-server PIXELS. If any of those source inputs changed during the run (an
+    // editor / format-on-save / watch task / slow build writing mid-capture), the fps no longer describe
+    // the captured PNGs — DROP them all so /visual-baseline can't record a poisoned fp↔PNG pair. The
+    // safe direction: those renders just stay non-skip-eligible until re-approved from a clean run.
+    let changed = false;
+    for (const [rel, hash] of Object.entries(currentInputs)) {
+      let now: string | null;
+      try {
+        now = sha1Bytes(deps.readFile(resolve(rel)));
+      } catch {
+        now = null; // an input deleted/unreadable mid-run is a change
+      }
+      if (now !== hash) {
+        changed = true;
+        break;
+      }
+    }
+    const persistedFps = changed ? {} : currentFps;
+    const fpsFile: FingerprintsFile = { version: FINGERPRINTS_VERSION, renders: persistedFps };
+    deps.writeFile(
+      join(runDir, "fingerprints.json"),
+      Buffer.from(`${JSON.stringify(fpsFile, null, 2)}\n`),
+    );
+  }
+
   return { runId, runDir, currentDir, written };
 }
 
@@ -537,6 +790,10 @@ async function main(argv: string[]): Promise<void> {
     // `--concurrency` overrides the persisted config knob; both fall back to the cores-based default.
     concurrency: args.concurrency ?? config.concurrency,
     scope,
+    // Fingerprint-skip is opt-in: only engages with BOTH `--skip-unchanged` and a `--fingerprints`
+    // file. The /visual-check command never passes `--skip-unchanged` for a plain `--all` sweep.
+    skipUnchanged: args.skipUnchanged,
+    fingerprintsFile: args.fingerprintsFile,
   });
   console.log(`${PREFIX}: wrote ${result.written.length} render(s) -> ${result.currentDir}`);
 }

@@ -61,7 +61,8 @@ words what it does and whether it changes anything (read-only vs writes).
 - **Tokens** — the `tokens.sources` paths (or "engine default" if absent).
 - **Figma** — the linked `figma.files` (by `label`/key), or "not linked — code-only".
 - **Scope & performance** — `concurrency` (capture-pool size, "auto" if absent) and the `scope` block
-  (`fanoutThreshold` · `fanoutMinStories` · `scope.globalGlobs`), or "engine defaults" if absent.
+  (`fanoutThreshold` · `fanoutMinStories` · `scope.globalGlobs` · `fingerprintSkip`), or "engine
+  defaults" if absent.
 - **Matrix size** — multiply discovered stories × `viewports` (× `states` for app targets) and state
   the full-sweep size, e.g. *"4,800 stories × 3 viewports = 14,400 renders. A full sweep; `/visual-check`
   is change-scoped by default and captures only what a change affects; `--all` sweeps everything."* If
@@ -83,6 +84,14 @@ Ask with **AskUserQuestion** (multi-select) which changes to make. Offer the opt
   fraction of the library widens to a full sweep), `fanoutMinStories` (default 8), and
   `scope.globalGlobs` (extra globs that force a full sweep — use it to mark a project-specific global
   file, e.g. a theme provider applied via a Storybook decorator that no story closure reaches).
+- **Fingerprint-skip** — `scope.fingerprintSkip` (default `false`). When `true`, `/visual-check` COPIES
+  a baseline forward instead of re-screenshotting a render whose inputs are **byte-identical to
+  approval** (component closure + globals + the pinned engine), making big-library sweeps far cheaper.
+  Explain the **trust boundary** before enabling: a skip trusts the baseline; it cannot witness host-OS
+  font drift, a swapped Chromium binary at the same version, remote/CDN assets, or shell-injected env
+  (a rotating ~`sqrt(N)` sample is re-shot each run so such drift is caught within a bounded number of
+  runs, and a plain `/visual-check --all` is always the full backstop). With it enabled, scoped runs
+  skip automatically; a full `--all` sweep skips **only** with an explicit `--all --skip-unchanged`.
 
 Then gather the details for each chosen change:
 

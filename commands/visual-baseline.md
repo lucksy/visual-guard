@@ -99,7 +99,10 @@ errors out otherwise). Omit both to approve only the new renders (existing basel
 Report the result from its JSON (`written` / `skipped`, and `failed` if any copy errored). Then:
 
 - Remind the user that baselines live in `baselineDir` and should be **committed** to version
-  control so the whole team shares the same source of truth.
+  control so the whole team shares the same source of truth. Approving also records a
+  `baselineDir/fingerprints.json` (the inputs each baseline was approved against) — **commit it too**;
+  it travels with the baselines and is what lets `scope.fingerprintSkip` cheaply copy an unchanged
+  render forward instead of re-screenshotting it.
 - Suggest re-running `/visual-check $ARGUMENTS` to confirm it now reports **0 regressions** for
   the approved target.
 

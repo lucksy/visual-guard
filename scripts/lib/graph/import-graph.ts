@@ -21,6 +21,19 @@ export interface ImportGraph {
   fileToStoryFiles: Map<string, Set<string>>;
   /** lowercased story-file rel-posix → whether any node in its closure is import-incomplete. */
   storyIncomplete: Map<string, boolean>;
+  /**
+   * lowercased story-file rel-posix → the ABSOLUTE paths of every file in that story's transitive
+   * import closure (the story file itself included). The forward map (a story → its exact inputs),
+   * vs. {@link fileToStoryFiles}'s inverse. Used by capture fingerprint-skip to content-hash a
+   * story's precise input set. Values are ABSOLUTE (not rel-posix) so a caller maps straight to the
+   * graph cache (keyed by absolute path) and to `readFile` with no casing round-trip — a lowercased
+   * rel path could miss the cache entry the resolver stored under the on-disk casing.
+   *
+   * Optional only so partial/mock graphs (e.g. `decideScope` fixtures that never fingerprint) stay
+   * valid; {@link buildImportGraph} ALWAYS populates it. An absent/empty closure is treated by the
+   * fingerprint path as "can't prove the inputs → never skip" — the conservative default.
+   */
+  storyClosure?: Map<string, Set<string>>;
 }
 
 /** A graph is "complete" iff it built AND no story's closure contains an unresolved/dynamic import. */
@@ -55,6 +68,7 @@ export function buildImportGraph(
   const maxFiles = options.maxFiles ?? 50000;
   const fileToStoryFiles = new Map<string, Set<string>>();
   const storyIncomplete = new Map<string, boolean>();
+  const storyClosure = new Map<string, Set<string>>();
   const edgeCache = new Map<string, { resolved: string[]; unresolvedOrDynamic: boolean }>();
   const edgesOf = (abs: string): { resolved: string[]; unresolvedOrDynamic: boolean } => {
     let edges = edgeCache.get(abs);
@@ -77,7 +91,12 @@ export function buildImportGraph(
       seen.add(file);
       if (++visited > maxFiles) {
         // Over budget — abandon the whole graph so the caller falls back to a full sweep.
-        return { built: false, fileToStoryFiles: new Map(), storyIncomplete: new Map() };
+        return {
+          built: false,
+          fileToStoryFiles: new Map(),
+          storyIncomplete: new Map(),
+          storyClosure: new Map(),
+        };
       }
       const { resolved, unresolvedOrDynamic } = edgesOf(file);
       if (unresolvedOrDynamic) incomplete = true;
@@ -88,7 +107,15 @@ export function buildImportGraph(
     // Last write wins if the same story file is a root twice (it won't be — roots are de-duped by
     // the caller), and incompleteness is OR-ed across a closure by construction above.
     storyIncomplete.set(rootKey, storyIncomplete.get(rootKey) === true || incomplete);
+    // The forward closure (absolute paths). UNION across repeated roots (defensive — roots are
+    // de-duped by the caller) so a story's input set is never under-counted.
+    let closure = storyClosure.get(rootKey);
+    if (closure === undefined) {
+      closure = new Set<string>();
+      storyClosure.set(rootKey, closure);
+    }
     for (const abs of seen) {
+      closure.add(abs);
       const fileKey = relPosixLower(projectRoot, abs);
       let set = fileToStoryFiles.get(fileKey);
       if (set === undefined) {
@@ -99,5 +126,5 @@ export function buildImportGraph(
     }
   }
 
-  return { built: true, fileToStoryFiles, storyIncomplete };
+  return { built: true, fileToStoryFiles, storyIncomplete, storyClosure };
 }

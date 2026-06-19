@@ -55,6 +55,40 @@ describe("createResolver + buildImportGraph (real TS resolution)", () => {
     expect(r.extractImports(join(dir, "src/miss/Miss.tsx")).unresolvedOrDynamic).toBe(true);
   });
 
+  it("follows a CSS url() asset to a real file (a font/image edge), as a content-hashed leaf", () => {
+    write("src/A/A.css", `@font-face { src: url('./Brand.woff2'); }\n.a { background: url(../shared/bg.png); }\n`);
+    write("src/A/Brand.woff2", `FONT-BYTES`);
+    write("src/shared/bg.png", `IMG-BYTES`);
+    const r = createResolver(dir, (p) => readFileSync(p, "utf8"));
+    const out = r.extractImports(join(dir, "src/A/A.css"));
+    expect(out.unresolvedOrDynamic).toBe(false);
+    const rels = out.resolved.map((p) => p.slice(dir.length + 1).split("\\").join("/")).sort();
+    expect(rels).toEqual(["src/A/Brand.woff2", "src/shared/bg.png"]);
+    // The asset itself is a leaf: no imports, never parsed as code.
+    expect(r.extractImports(join(dir, "src/A/Brand.woff2"))).toEqual({
+      resolved: [],
+      unresolvedOrDynamic: false,
+    });
+  });
+
+  it("marks a CSS file with a missing relative url() asset as incomplete (never a silent miss)", () => {
+    write("src/A/A.css", `.a { background: url(./not-here.png); }\n`);
+    const r = createResolver(dir, (p) => readFileSync(p, "utf8"));
+    expect(r.extractImports(join(dir, "src/A/A.css")).unresolvedOrDynamic).toBe(true);
+  });
+
+  it("threads a story → css → font asset into the story's closure (the per-story font hole)", () => {
+    write("src/A/A.css", `@font-face { src: url('./Brand.woff2'); }\n`);
+    write("src/A/Brand.woff2", `FONT-BYTES`);
+    const r = createResolver(dir, (p) => readFileSync(p, "utf8"));
+    const graph = buildImportGraph(dir, [join(dir, "src/A/A.stories.tsx")], r);
+    expect(graph.built).toBe(true);
+    // Editing the font now scopes A's story (it was invisible before url() edges).
+    expect([...(graph.fileToStoryFiles.get("src/a/brand.woff2") ?? [])]).toEqual([
+      "src/a/a.stories.tsx",
+    ]);
+  });
+
   it("inverts the real graph so editing A's component scopes BOTH A's and B's stories", () => {
     const r = createResolver(dir, (p) => readFileSync(p, "utf8"));
     const roots = [join(dir, "src/A/A.stories.tsx"), join(dir, "src/B/B.stories.tsx")];

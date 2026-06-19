@@ -128,6 +128,12 @@ export interface ManifestImage {
   renderTarget: RenderInfo | null;
   /** v2: pixel dimensions of the captured `current` PNG. Null pre-v2 or if unreadable. */
   currentDimensions: { width: number; height: number } | null;
+  /**
+   * True when this render was NOT screenshotted — its inputs were byte-identical to approval, so the
+   * approved baseline was copied forward (capture fingerprint-skip). It still compares to `pass`; this
+   * flag keeps the report honest ("trusted the baseline", never silently folded into "all good").
+   */
+  skipped: boolean;
 }
 
 export interface ManifestTarget {
@@ -149,7 +155,16 @@ export interface Manifest {
   gates: { threshold: number; maxDiffRatio: number };
   /** All changed UI files in the run (git, filtered by uiGlobs), project-root-relative. */
   changedFiles: string[];
-  summary: { targets: number; images: number; pass: number; fail: number; new: number; error: number };
+  summary: {
+    targets: number;
+    images: number;
+    pass: number;
+    fail: number;
+    new: number;
+    error: number;
+    /** Of `pass`, how many were COPIED from the baseline (fingerprint-skip), not screenshotted. */
+    skipped: number;
+  };
   targets: ManifestTarget[];
 }
 
@@ -332,6 +347,7 @@ export function buildManifest(
       verdict: null,
       renderTarget: record === undefined ? null : renderInfoOf(record),
       currentDimensions: record?.currentDimensions ?? null,
+      skipped: record?.skipped === true,
     });
   }
 
@@ -366,6 +382,7 @@ export function buildManifest(
       verdict: null,
       renderTarget: renderInfoOf(record),
       currentDimensions: null,
+      skipped: false,
     });
     captureErrors += 1;
   }
@@ -392,6 +409,7 @@ export function buildManifest(
       fail: compare.summary.failed,
       new: compare.summary.added,
       error: compare.summary.errored + captureErrors,
+      skipped: Object.values(renders).filter((record) => record.skipped === true).length,
     },
     targets,
   };
@@ -675,10 +693,23 @@ function main(argv: string[]): void {
   const config = loadConfig(args.config);
   const { manifestPath, manifest } = report(config, { runId: args.runId });
   const { summary } = manifest;
+  const captured = summary.images - summary.skipped;
   console.log(
     `${PREFIX}: ${summary.targets} target(s), ${summary.images} image(s) — ` +
       `${summary.fail} fail, ${summary.new} new, ${summary.error} error -> ${manifestPath}`,
   );
+  // Honest accounting + trust boundary whenever fingerprint-skip copied baselines forward: a skip means
+  // "the inputs are byte-identical to approval", NEVER "verified unchanged". State what skip does NOT
+  // re-check so the user can audit it / run the true backstop.
+  if (summary.skipped > 0) {
+    console.log(
+      `${PREFIX}: ${captured} captured, ${summary.skipped} skipped (inputs unchanged since approval). ` +
+        `Skip trusts the baseline; it does NOT re-check host fonts, the Chromium binary if unpinned, ` +
+        `remote/CDN assets, or shell env — but a rotating sample (~sqrt of the skipped set) IS re-shot ` +
+        `each run, so any such drift is caught within a bounded number of runs. For a full re-verification ` +
+        `now, run /visual-check --all (without --skip-unchanged).`,
+    );
+  }
 }
 
 const invokedDirectly =

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadConfig } from "./lib/config";
@@ -7,6 +7,12 @@ import { resolveTargets, type RenderTarget } from "./lib/targets";
 import { buildImportGraph, graphComplete, type ImportGraph } from "./lib/graph/import-graph";
 import { createResolver } from "./lib/graph/resolver";
 import { loadGraphCache, saveGraphCache, sha1, withCache } from "./lib/graph/cache";
+import {
+  computeFingerprintsCurrent,
+  resolveChromiumRevision,
+  resolvePlaywrightVersion,
+} from "./lib/fingerprint-emit";
+import { FINGERPRINTS_VERSION, type FingerprintsFile } from "./lib/fingerprint-file";
 
 /**
  * Change-scoped capture — the decision engine (Phase 0).
@@ -126,19 +132,55 @@ export const DEFAULT_GLOBAL_GLOBS = [
   "**/.storybook/**",
   "**/.ladle/**",
   "**/preview.{ts,tsx,js,jsx}",
+  "**/manager.{ts,tsx,js,jsx}",
+  "**/preview-head.html",
+  "**/manager-head.html",
   "**/*.global.{css,scss,less}",
   "**/global.{css,scss,less}",
   "**/globals.{css,scss,less}",
+  "**/reset.{css,scss,less}",
+  "**/base.{css,scss,less}",
+  "**/typography.{css,scss,less}",
   "**/index.css",
   "**/app.css",
   "**/styles.css",
+  // Theme / token PROVIDERS are commonly applied globally (a theme provider / token module wraps every
+  // story), so a change fans out to a full sweep rather than scoping to importers. Conservative by
+  // design: over-capture is always safe; a token recolor that the import graph would scope narrowly is
+  // still correctly a full sweep here.
+  "**/theme.{ts,tsx,js,jsx}",
+  "**/*.theme.{ts,tsx,js,jsx}",
+  "**/tokens.{css,scss,less,ts,tsx,js,jsx}",
+  "**/designTokens.{ts,tsx,js,jsx}",
+  // Build / bundler / tooling config: a Vite `define`, a Babel plugin, a PostCSS plugin, an SVGR option
+  // etc. can shift EVERY render. Without these a changed `vite.config.ts` mapped to no story under a
+  // complete graph → "affects no story" → captured NOTHING (an under-capture the adversarial audit
+  // surfaced). Marking them global closes that hole.
   "**/tailwind.config.{ts,js,cjs,mjs}",
   "**/postcss.config.{ts,js,cjs,mjs}",
-  "**/theme.{ts,tsx,js,jsx}",
+  "**/vite.config.{ts,js,cjs,mjs,mts,cts}",
+  "**/vitest.config.{ts,js,cjs,mjs}",
+  "**/webpack.config.{ts,js,cjs,mjs}",
+  "**/rollup.config.{ts,js,cjs,mjs}",
+  "**/babel.config.{js,cjs,mjs,json}",
+  "**/.babelrc",
+  "**/.babelrc.{js,cjs,mjs,json}",
+  "**/components.json",
+  "**/.npmrc",
+  "**/.env",
+  "**/.env.*",
+  // Dependency manifests + in-place patch state (patch-package / yarn patches): an installed
+  // dependency's rendered output can change via a patch without the lockfile moving.
   "**/package.json",
   "**/package-lock.json",
   "**/pnpm-lock.yaml",
   "**/yarn.lock",
+  "**/patches/**",
+  "**/.yarn/patches/**",
+  // Static-serve roots (Storybook staticDirs / Vite public): assets served by URL, referenced by no
+  // import edge, so a swapped logo/font/background is invisible to the graph — treat as global.
+  "**/public/**",
+  "**/static/**",
 ];
 
 /**
@@ -690,15 +732,92 @@ export function buildProjectGraph(
   }
 }
 
+/**
+ * Emit the run's CURRENT per-render fingerprints for capture fingerprint-skip (Phase B2c) to
+ * `<outDir>/fingerprints-current.json`. BEST-EFFORT and FAIL-CLOSED: any error, an absent/unbuilt
+ * graph, or an untrustworthy global set leaves NO file (or no entry for a render) → capture skips
+ * nothing. This NEVER affects the scope decision (its own try/catch swallows everything). The global
+ * roots are the working-tree files matching the SAME global globs the scope decision uses, so a global
+ * change busts every fingerprint exactly as it forces a full scoped sweep.
+ */
+function writeCurrentFingerprints(
+  cwd: string,
+  outDir: string,
+  targets: RenderTarget[],
+  graph: ImportGraph | undefined,
+  globalGlobs: string[],
+  tokenGlobs: string[],
+): void {
+  const outPath = join(outDir, "fingerprints-current.json");
+  try {
+    // Clear any prior run's fingerprints FIRST: "emit nothing on doubt" must mean "leave no file to
+    // trust", not "leave the stale one". The path is fixed (not run-scoped), so a leftover from a
+    // previous run could otherwise be mistaken for this run's by a future `--fingerprints` wiring.
+    rmSync(outPath, { force: true });
+    if (graph === undefined || !graph.built) return; // no trustworthy graph → emit nothing → never skip
+    const tracked = git(cwd, ["ls-files"]);
+    if (tracked === null) return; // not a git repo / git unavailable → can't enumerate globals → never skip
+    const untracked = git(cwd, ["ls-files", "--others", "--exclude-standard"]);
+    const treeFiles = new Set<string>();
+    for (const out of [tracked, untracked]) {
+      if (out === null) continue;
+      for (const line of out.split("\n")) {
+        const file = line.trim();
+        if (file.length > 0) treeFiles.add(toPosix(file));
+      }
+    }
+    const matchGlobs = [...globalGlobs, ...tokenGlobs];
+    const globalRoots = [...treeFiles]
+      .filter((file) => matchesAnyGlob(file, matchGlobs))
+      .map((file) => resolve(cwd, file));
+
+    const { fps, inputs } = computeFingerprintsCurrent({
+      cwd,
+      targets,
+      storyGraph: graph,
+      globalRoots,
+      playwrightVersion: resolvePlaywrightVersion(cwd),
+      chromiumRevision: resolveChromiumRevision(cwd),
+    });
+
+    // Only WRITE when there is something to skip — an empty `fps` map means "skip nothing", which the
+    // cleared file (absent) already conveys; this avoids leaving an empty file that reads as "ran".
+    if (Object.keys(fps).length === 0) return;
+    const file: FingerprintsFile = {
+      version: FINGERPRINTS_VERSION,
+      renders: Object.fromEntries(Object.entries(fps).map(([key, fp]) => [key, { fp }])),
+      inputs, // capture re-hashes these after screenshotting to catch a mid-run source edit (TOCTOU)
+    };
+    mkdirSync(dirname(outPath), { recursive: true });
+    writeFileSync(outPath, `${JSON.stringify(file, null, 2)}\n`);
+  } catch {
+    /* best-effort: a fingerprint failure must never break the run, narrow scope, or cause a wrong skip */
+  }
+}
+
 async function main(argv: string[]): Promise<void> {
   // The default out path matches what /visual-check reads, so even if ARG PARSING itself throws
   // (a mis-quoted `--since <ref>` arriving as one token under zsh) we still leave a conservative
   // decision on disk rather than nothing — never a stale read. parseScopeArgs is INSIDE the try.
   let outPath = join(process.cwd(), ".visual-guard", "scope.json");
+  // Clear any prior run's fingerprints BEFORE doing anything that can throw. writeCurrentFingerprints
+  // also clears+rewrites them, but it runs only AFTER resolveTargets/buildProjectGraph/decideScope — so
+  // a throw there (e.g. a transient dev-server flake) would otherwise leave a STALE file that capture
+  // persists and /visual-baseline records as an approved fp paired with a fresh PNG → a silent wrong
+  // skip. Clearing up front makes the emit-nothing-on-doubt contract hold on EVERY failure path.
+  const clearStaleFingerprints = (path: string): void => {
+    try {
+      rmSync(join(dirname(path), "fingerprints-current.json"), { force: true });
+    } catch {
+      /* best-effort */
+    }
+  };
+  clearStaleFingerprints(outPath);
   let decision: ScopeDecision;
   try {
     const args = parseScopeArgs(argv, process.cwd());
     outPath = args.out;
+    clearStaleFingerprints(outPath); // re-clear if --out pointed at a different dir
     const config = loadConfig(args.config);
     const { files, gitResolved } = collectChangedFiles(args.cwd, args.since);
     const tokenGlobs = config.tokens.sources.map((source) => source.source);
@@ -720,6 +839,18 @@ async function main(argv: string[]): Promise<void> {
       fanoutThreshold: config.scope.fanoutThreshold,
       fanoutMinStories: config.scope.fanoutMinStories,
     });
+    // Emit the run's CURRENT fingerprints (capture fingerprint-skip) alongside scope.json. Best-effort
+    // + fail-closed: it never throws out of here and never touches `decision` (a wrong scope is far
+    // worse than no skip). Capture only skips when `--skip-unchanged` is passed AND these match the
+    // committed approved fingerprints, so a plain run/sweep is unaffected.
+    writeCurrentFingerprints(
+      args.cwd,
+      dirname(outPath),
+      targets,
+      graph,
+      [...DEFAULT_GLOBAL_GLOBS, ...config.scope.globalGlobs],
+      tokenGlobs,
+    );
   } catch (err) {
     // The invariant under failure: never narrow. Any error → full sweep, capture proceeds normally.
     decision = {

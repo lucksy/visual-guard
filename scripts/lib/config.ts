@@ -122,6 +122,13 @@ export interface ScopeConfig {
   fanoutMinStories: number;
   /** Extra "global" globs merged with the engine defaults; a change matching one forces a full sweep. */
   globalGlobs: string[];
+  /**
+   * Capture fingerprint-skip (opt-in, default FALSE). When true, `/visual-check` may COPY a baseline
+   * forward instead of re-screenshotting a render whose inputs are byte-identical to approval time —
+   * making even a `--all --skip-unchanged` sweep cheap. OFF by default because skipping under a plain
+   * `--all` would weaken the full-capture backstop; see docs/capture-fingerprint-skip/SPEC.md.
+   */
+  fingerprintSkip: boolean;
 }
 
 export interface Config {
@@ -167,6 +174,7 @@ const SCOPE_DEFAULTS: ScopeConfig = {
   fanoutThreshold: 0.4,
   fanoutMinStories: 8,
   globalGlobs: [],
+  fingerprintSkip: false,
 };
 
 const DEFAULT_TOKEN_SOURCE = "src/styles/tokens.css";
@@ -537,6 +545,10 @@ export function parseScope(raw: unknown): ScopeConfig {
       raw.globalGlobs === undefined
         ? []
         : asStringArray(raw.globalGlobs, "scope.globalGlobs"),
+    fingerprintSkip:
+      raw.fingerprintSkip === undefined
+        ? SCOPE_DEFAULTS.fingerprintSkip
+        : asBoolean(raw.fingerprintSkip, "scope.fingerprintSkip"),
   };
 }
 

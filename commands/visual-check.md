@@ -73,7 +73,12 @@ Read `$ARGUMENTS` and set three shell-ready values for §2 (default them to empt
 - `--all` present → **`ALL`** = `1` (full sweep — the source of truth; what CI uses).
 - `--since <ref>` present → **`SINCE`** = `<ref>` (scope the change against that git base instead of
   `HEAD`).
-- Nothing (the common case) → all three empty → **change-scoped** vs `HEAD`.
+- `--skip-unchanged` present → **`SKIP`** = `1`. This is the explicit, per-invocation opt-in to copy a
+  baseline forward instead of re-screenshotting a render whose inputs are byte-identical to approval
+  (capture fingerprint-skip). It is REQUIRED to skip under `--all` — a plain `--all` always stays a true
+  full capture (the backstop). In a scoped run, the persisted config `scope.fingerprintSkip: true`
+  enables it without the flag.
+- Nothing (the common case) → all empty → **change-scoped** vs `HEAD`.
 
 Then surface the changed UI files as context: run `git diff --name-only HEAD` and
 `git ls-files --others --exclude-standard`, keep the ones matching the config's `uiGlobs`, and show
@@ -102,10 +107,12 @@ export PLAYWRIGHT_BROWSERS_PATH="${CLAUDE_PLUGIN_DATA}/browsers"
 RUNNER="${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx"
 SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
 SCOPE_FILE="$PWD/.visual-guard/scope.json"
+FP_FILE="$PWD/.visual-guard/fingerprints-current.json"
 
 EXPLICIT=""   # <- §1: a bare component target, or empty
 ALL=""        # <- §1: "1" if --all, else empty
 SINCE=""      # <- §1: a git ref if --since <ref>, else empty
+SKIP=""       # <- §1: "1" if --skip-unchanged, else empty
 
 # Start a managed (VG-scaffolded) harness if the config has one, and ALWAYS stop it on exit — even on
 # failure. No-op when there's no managed target. The harness is only needed during capture/scope.
@@ -118,7 +125,7 @@ trap '"$RUNNER" "$SCRIPTS/managed-serve.ts" stop --config "$CONFIG" --cwd "$PWD"
 if [ -n "$EXPLICIT" ]; then
   set -- --target "$EXPLICIT"               # explicit component → no change-scoping
 else
-  rm -f "$SCOPE_FILE"                        # never read a stale decision from a prior run
+  rm -f "$SCOPE_FILE" "$FP_FILE"             # never read a stale scope decision OR stale fingerprints from a prior run
   set -- --config "$CONFIG" --cwd "$PWD"
   [ -n "$ALL" ]   && set -- "$@" --all
   [ -n "$SINCE" ] && set -- "$@" --since "$SINCE"
@@ -132,6 +139,16 @@ else
   fi
   set --                                     # reset, then build the capture args
   [ "$MODE" = "scoped" ] && set -- --scope-file "$SCOPE_FILE"   # mode "all" → no flag → full sweep
+  # Fingerprint-skip: ALWAYS hand capture the scope-emitted fingerprints (so it persists them
+  # run-scoped for /visual-baseline to record the approved fp↔PNG pairing — enabling FUTURE skips),
+  # but only ENABLE skipping when opted in. scope.fingerprintSkip enables it for a scoped run; a full
+  # `--all` sweep skips ONLY with an explicit `--skip-unchanged` (the plain `--all` backstop is never
+  # silently weakened). Capture treats an absent/empty fingerprints file as "skip nothing".
+  [ -f "$FP_FILE" ] && set -- "$@" --fingerprints "$FP_FILE"
+  CFG_SKIP="$(node -e 'try{process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).scope?.fingerprintSkip===true))}catch(e){process.stdout.write("false")}' "$CONFIG")"
+  if [ -n "$SKIP" ] || { [ "$CFG_SKIP" = "true" ] && [ "$MODE" = "scoped" ]; }; then
+    set -- "$@" --skip-unchanged
+  fi
 fi
 
 "$RUNNER" "$SCRIPTS/capture.ts" --config "$CONFIG" --run "$RUN_ID" "$@"

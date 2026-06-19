@@ -61,7 +61,7 @@ describe("evaluateGate is a pure function of the manifest (never the studio DB)"
     generatedAt: "2026-06-16T00:00:00.000Z",
     gates: { threshold: 0.1, maxDiffRatio: 0.01 },
     changedFiles: [],
-    summary: { targets: 1, images: 1, pass: 1, fail: 0, new: 0, error: 0 },
+    summary: { targets: 1, images: 1, pass: 1, fail: 0, new: 0, error: 0, skipped: 0 },
     targets: [{ instance: "sb", target: "Button", status: "pass", changedFiles: [], images: [] }],
   };
 

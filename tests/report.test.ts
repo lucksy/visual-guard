@@ -212,8 +212,26 @@ describe("buildManifest", () => {
   it("leaves a per-image verdict placeholder and echoes gates + summary", () => {
     expect(manifest.targets.every((t) => t.images.every((i) => i.verdict === null))).toBe(true);
     expect(manifest.gates).toEqual({ threshold: 0.1, maxDiffRatio: 0.01 });
-    expect(manifest.summary).toEqual({ targets: 4, images: 5, pass: 2, fail: 1, new: 1, error: 1 });
+    expect(manifest.summary).toEqual({ targets: 4, images: 5, pass: 2, fail: 1, new: 1, error: 1, skipped: 0 });
     expect(manifest.version).toBe(2);
+  });
+
+  it("counts fingerprint-skipped renders (copied-forward) honestly: summary.skipped + per-image flag", () => {
+    const renders: RendersMap = rendersFixture();
+    renders["components/Button/default@1280.png"] = {
+      ...renders["components/Button/default@1280.png"]!,
+      skipped: true, // inputs unchanged → baseline copied forward (still status:pass)
+    };
+    const m = buildManifest(compareFixture(), CHANGED, config, {
+      generatedAt: "2026-06-13T00:00:00.000Z",
+      runDir: RUN_DIR,
+      renders,
+    });
+    expect(m.summary.skipped).toBe(1);
+    const btn = m.targets.find((t) => t.target === "Button");
+    const img = btn?.images.find((i) => i.state === "default");
+    expect(img?.skipped).toBe(true);
+    expect(img?.status).toBe("pass"); // a skip is a pass, just trusted not re-shot
   });
 
   it("surfaces a capture-time render error (failFast:false) as a synthetic error image", () => {

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,7 @@ import {
   latestRunId,
   parseArgs,
   planBaseline,
+  recordApprovedFingerprints,
   runBaseline,
   type BaselineCopy,
 } from "../scripts/baseline";
@@ -226,5 +228,62 @@ describe("runBaseline", () => {
     expect(() => runBaseline(config, { target: "Button", outRoot, baselineDir })).toThrow(
       /no runs/,
     );
+  });
+});
+
+describe("recordApprovedFingerprints (capture fingerprint-skip approve-record)", () => {
+  const BTN = "components/Button/default@1280.png";
+  const STAR = "icons/Star/default@1280.png";
+  const sha1 = (buf: Buffer): string => createHash("sha1").update(buf).digest("hex");
+  const writeRunFps = (renders: Record<string, { fp: string }>): void => {
+    const runDir = join(runsDir, "RUN1");
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "fingerprints.json"), JSON.stringify({ version: 1, renders }));
+  };
+  const approved = (): Record<string, { fp: string; png?: string }> =>
+    JSON.parse(readFileSync(join(baselineDir, "fingerprints.json"), "utf8")).renders;
+
+  it("records {fp, png} pairing the run fp with the approved baseline PNG's own hash", () => {
+    put(baselineDir, BTN, "solid-10x10.png");
+    writeRunFps({ [BTN]: { fp: "FP-BTN" } });
+    recordApprovedFingerprints(join(runsDir, "RUN1"), baselineDir, [BTN]);
+    expect(approved()[BTN]).toEqual({ fp: "FP-BTN", png: sha1(fixture("solid-10x10.png")) });
+  });
+
+  it("DROPS a written key that has no run fingerprint (not fingerprintable → never skip-eligible)", () => {
+    put(baselineDir, BTN, "solid-10x10.png");
+    // a pre-existing stale approved entry for BTN must be removed when BTN has no current fp
+    mkdirSync(baselineDir, { recursive: true });
+    writeFileSync(
+      join(baselineDir, "fingerprints.json"),
+      JSON.stringify({ version: 1, renders: { [BTN]: { fp: "STALE", png: "x" } } }),
+    );
+    writeRunFps({}); // no fp for BTN
+    recordApprovedFingerprints(join(runsDir, "RUN1"), baselineDir, [BTN]);
+    expect(approved()[BTN]).toBeUndefined();
+  });
+
+  it("MERGES into existing entries (a partial approval keeps other targets' fps) and prunes gone PNGs", () => {
+    put(baselineDir, BTN, "solid-10x10.png");
+    // Star has a prior approved entry + PNG; a later prior entry 'Ghost' has NO png on disk → pruned.
+    put(baselineDir, STAR, "patch-2x2.png");
+    writeFileSync(
+      join(baselineDir, "fingerprints.json"),
+      JSON.stringify({ version: 1, renders: { [STAR]: { fp: "FP-STAR", png: sha1(fixture("patch-2x2.png")) }, "gone/x@1.png": { fp: "G", png: "g" } } }),
+    );
+    writeRunFps({ [BTN]: { fp: "FP-BTN" } });
+    recordApprovedFingerprints(join(runsDir, "RUN1"), baselineDir, [BTN]); // only approve BTN
+    const a = approved();
+    expect(a[BTN]).toEqual({ fp: "FP-BTN", png: sha1(fixture("solid-10x10.png")) }); // newly recorded
+    expect(a[STAR]).toEqual({ fp: "FP-STAR", png: sha1(fixture("patch-2x2.png")) }); // preserved
+    expect(a["gone/x@1.png"]).toBeUndefined(); // pruned (no PNG on disk)
+  });
+
+  it("runBaseline writes the committed approved fingerprints when a run fingerprints.json exists", () => {
+    writeRunFps({ [BTN]: { fp: "FP-BTN" }, "components/Button/hover@1280.png": { fp: "FP-HOV" } });
+    runBaseline(config, { target: "Button", outRoot, baselineDir });
+    const a = approved();
+    expect(a[BTN]?.fp).toBe("FP-BTN");
+    expect(a[BTN]?.png).toBe(sha1(fixture("solid-10x10.png")));
   });
 });

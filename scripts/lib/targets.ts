@@ -42,6 +42,16 @@ export interface RenderTarget {
   storyFile?: string;
 }
 
+/**
+ * The shared relative key for a render — the path it lives under in current/, baseline/, and diff/,
+ * and the key in renders.json / scope's fingerprints. Lives here (not capture.ts) so both the
+ * capture engine AND scope.ts can key by it WITHOUT scope pulling in Playwright via capture.ts.
+ * `coverage.ts` mirrors this with a drift-guard test; capture.ts re-exports it for back-compat.
+ */
+export function renderRelPath(render: RenderTarget): string {
+  return `${render.instance}/${render.name}/${render.state}@${render.viewport}.png`;
+}
+
 /** Minimal structural subset of the DOM `Response` that this module needs. */
 export interface FetchResponse {
   ok: boolean;
