@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadConfig } from "../lib/config";
+import { ensureBrowsersPath } from "../lib/browsers-path";
 import { captureAll } from "../capture";
 import { openDb, SCHEMA_VERSION } from "../lib/studio/db";
 import { studioDbPath, DEFAULT_OUT_ROOT } from "../lib/studio/keys";
@@ -98,6 +99,11 @@ function openBrowser(url: string): void {
 
 async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
+  // The in-app Sync button (`POST /api/sync` → captureAll) renders via Playwright, which needs the
+  // pinned Chromium at `${CLAUDE_PLUGIN_DATA}/browsers`. The server is launched detached (no caller
+  // exports PLAYWRIGHT_BROWSERS_PATH), so resolve it here — without this, Sync fails "browser not
+  // found" even on a healthy engine.
+  ensureBrowsersPath();
   const config = loadConfig(args.config);
   const baselineDir = config.baselineDir;
   mkdirSync(args.outRoot, { recursive: true });

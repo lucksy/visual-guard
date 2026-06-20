@@ -29,7 +29,11 @@ lives in the desktop app; only non-secret ids/names/paths/images are stored, all
   (`$STATE.engineDeps` + `$STATE.browser`), *why* (render screenshots of the UI locally), *where*
   (`$STATE.dataDir`), and *size* (~150 MB, one-time). On **Install now** → run
   `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once it exits `0`; on **Not
-  now** → **stop**. When `$STATE.installed` is true, continue.
+  now** → **stop**. When `$STATE.installed` is true, continue — but if `$STATE.healthy` is **false**
+  (`$STATE.brokenNatives` lists the broken addons), the engine's native bindings (the studio loads
+  `better-sqlite3`) didn't load; run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to repair
+  them in place, then continue (if `brokenNatives` is still non-empty afterward, relay it and **stop** —
+  the code sync would otherwise crash with `ERR_DLOPEN_FAILED`).
 - **Figma is optional.** The workflow itself probes the Figma desktop MCP and, if it's unavailable,
   syncs code and leaves Figma-linked components `figma-pending` — never a hard failure. Code-only
   projects (no `figma` in config) sync fully with no Figma at all.

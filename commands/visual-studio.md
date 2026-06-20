@@ -48,6 +48,11 @@ Then lay out the plan in plain language, so the user knows what's coming before 
   `Read` the one-line JSON. If `.installed` is **false**, run the `/visual-setup` consent flow inline
   (AskUserQuestion: *what* / *why* / *where* / *size ~150 MB*); on **Install now** run
   `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue on exit `0`; on **Not now** stop.
+- **Native health — the studio loads SQLite (`better-sqlite3`), so this matters here.** If `.installed`
+  is true but `.healthy` is **false** (`.brokenNatives` lists the broken addons), the bindings didn't
+  load from the tree the scripts use; run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to
+  repair them in place, then continue (if `brokenNatives` is still non-empty afterward, relay it and
+  **stop** — launching anyway would crash with `ERR_DLOPEN_FAILED`).
 - Resolve `$CONFIG`: the first that exists of `visual.config.json`, `config/visual.config.json`, else
   `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`.
 - **Empty studio (advisory, never blocking).** If `.visual-guard/studio.db` does not exist, tell the

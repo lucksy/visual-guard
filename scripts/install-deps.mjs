@@ -171,13 +171,13 @@ export function resolveNpm(execPath = process.execPath, platform = process.platf
 
 /**
  * Build the child-process probe for one native addon. Requires the addon by its ABSOLUTE package dir
- * under `dataDir/node_modules` — NOT a bare specifier — so resolution is pinned to the data-dir deps
- * and can never be satisfied by a stray `node_modules` higher up the tree (which would mask a broken
- * install, or, in tests, resolve the repo's own copy). `require()` triggers the `.node` dlopen, the
- * actual failure point; better-sqlite3 also gets a tiny exercise to be sure the binding is usable.
+ * under `treeDir/node_modules` — NOT a bare specifier — so resolution is pinned to the EXACT tree we
+ * mean to test and can never be satisfied by a stray `node_modules` higher up (which would mask a
+ * broken install, or, in tests, resolve the repo's own copy). `require()` triggers the `.node` dlopen,
+ * the actual failure point; better-sqlite3 also gets a tiny exercise to be sure the binding is usable.
  */
-function probeFor(mod, dataDir) {
-  const dir = JSON.stringify(join(dataDir, "node_modules", mod));
+function probeFor(mod, treeDir) {
+  const dir = JSON.stringify(join(treeDir, "node_modules", mod));
   if (mod === "better-sqlite3") {
     return `const D=require(${dir});const db=new D(':memory:');db.prepare('select 1 as x').get();db.close();`;
   }
@@ -186,18 +186,22 @@ function probeFor(mod, dataDir) {
 
 /**
  * Load-test the native addons in a child Node process — `process.execPath`, so the probe runs under
- * the SAME Node (hence ABI) the engine will. Resolution is pinned to `dataDir/node_modules` (see
+ * the SAME Node (hence ABI) the engine will. Resolution is pinned to `treeDir/node_modules` (see
  * {@link probeFor}). Returns the addons that FAILED to load (empty ⇒ all healthy). Never throws.
  *
- * @param {string} dataDir  Install dir whose `node_modules` to probe.
+ * IMPORTANT: pass the tree the SCRIPTS ACTUALLY LOAD FROM — `${pluginRoot}/node_modules` (a real dir
+ * OR the bridge symlink) — not the data dir. Probing the data-dir copy while the scripts resolve a
+ * separate, broken plugin-root copy is the "split-brain" bug that let a missing `.node` slip through.
+ *
+ * @param {string} treeDir  Dir whose `node_modules` to probe (the runtime tree at the call sites).
  * @param {NodeJS.ProcessEnv} env
  * @returns {string[]}
  */
-export function verifyNativeModules(dataDir, env) {
+export function verifyNativeModules(treeDir, env) {
   const failures = [];
   for (const mod of NATIVE_MODULES) {
-    const result = spawnSync(process.execPath, ["-e", probeFor(mod, dataDir)], {
-      cwd: dataDir,
+    const result = spawnSync(process.execPath, ["-e", probeFor(mod, treeDir)], {
+      cwd: treeDir,
       env,
       stdio: "ignore",
     });
@@ -219,21 +223,28 @@ export function verifyNativeModules(dataDir, env) {
  *     the current ABI (or compiles, with `--build-from-source`).
  * npm is pinned to the engine's Node via {@link resolveNpm} so the binary targets the right ABI.
  */
-async function repairNative(mod, dataDir, env, npm) {
-  if (mod === "sharp") {
+async function repairNative(mod, treeDir, env, npm) {
+  const present = existsSync(join(treeDir, "node_modules", mod, "package.json"));
+  // `npm rebuild` re-runs a package's build/fetch step but is a NO-OP for a package that is ABSENT from
+  // node_modules (a shipped/copied tree can drop the whole `node_modules/<mod>` dir, not just the
+  // binary). And sharp's binary lives in an OPTIONAL `@img/sharp-*` subpackage that rebuild can't
+  // re-resolve. So use `npm install <pkg>@<ver> --include=optional` (fetches the package AND its native
+  // binary) for sharp OR any addon that's missing entirely; reserve `npm rebuild` for the
+  // present-but-binaryless node-gyp case (e.g. better-sqlite3 shipped without its `.node`).
+  if (mod === "sharp" || !present) {
     await runStep(
-      "▸ Repairing sharp (reinstall platform package)…",
+      `▸ Repairing ${mod} (${present ? "reinstall platform package" : "install missing package"})…`,
       npm.command,
       [
         ...npm.prefix,
         "install",
-        `sharp@${ENGINE_DEPS.sharp}`,
+        `${mod}@${ENGINE_DEPS[mod]}`,
         "--include=optional",
         "--no-save",
         "--no-audit",
         "--no-fund",
       ],
-      { cwd: dataDir, env },
+      { cwd: treeDir, env },
     );
     return;
   }
@@ -241,17 +252,17 @@ async function repairNative(mod, dataDir, env, npm) {
     `▸ Repairing ${mod} (re-fetch prebuilt binary)…`,
     npm.command,
     [...npm.prefix, "rebuild", mod],
-    { cwd: dataDir, env },
+    { cwd: treeDir, env },
   );
 }
 
 /** Last resort for a source-buildable addon: compile from source via node-gyp (pinned npm/Node). */
-async function rebuildFromSource(mod, dataDir, env, npm) {
+async function rebuildFromSource(mod, treeDir, env, npm) {
   await runStep(
     `▸ Repairing ${mod} (compile from source)…`,
     npm.command,
     [...npm.prefix, "rebuild", mod, "--build-from-source"],
-    { cwd: dataDir, env },
+    { cwd: treeDir, env },
   );
 }
 
@@ -276,18 +287,21 @@ function nativeFailureMessage(failed) {
 }
 
 /**
- * Ensure every native addon actually loads — repairing in place if not. npm exits 0 even when a
- * prebuilt binary silently fails to download, so a plain install can record a *broken* engine as
- * "installed"; this is what makes the studio crash later with `ERR_DLOPEN_FAILED`. Escalation:
- * per-addon repair ({@link repairNative}) → compile-from-source for source-buildable addons → throw
- * with tailored guidance if still broken (the caller removes the marker so the next session retries
- * from clean). Returns once all addons load.
+ * Ensure every native addon in `treeDir` actually loads — repairing IN PLACE if not. npm exits 0 even
+ * when a prebuilt binary silently fails to download (and a shipped plugin-root tree may carry the JS
+ * package with NO `.node` at all), so a tree can look "installed" yet be unloadable — the root cause of
+ * the studio's `ERR_DLOPEN_FAILED`. Escalation: per-addon repair ({@link repairNative}, `npm` run with
+ * `cwd: treeDir` so it repairs THIS tree) → compile-from-source for source-buildable addons → throw
+ * with tailored guidance if still broken (the caller removes the marker so the next session retries).
  *
- * @param {string} dataDir
+ * Call with the RUNTIME tree (`${pluginRoot}/node_modules`, real or symlinked) so the tree that's
+ * repaired is the tree the scripts load.
+ *
+ * @param {string} treeDir
  * @param {NodeJS.ProcessEnv} env
  */
-async function ensureNativeModules(dataDir, env) {
-  let failed = verifyNativeModules(dataDir, env);
+async function ensureNativeModules(treeDir, env) {
+  let failed = verifyNativeModules(treeDir, env);
   if (failed.length === 0) {
     return;
   }
@@ -296,18 +310,18 @@ async function ensureNativeModules(dataDir, env) {
     `[visual-guard] Native bindings did not load (${failed.join(", ")}) — repairing…\n`,
   );
   for (const mod of failed) {
-    await repairNative(mod, dataDir, env, npm);
+    await repairNative(mod, treeDir, env, npm);
   }
-  failed = verifyNativeModules(dataDir, env);
+  failed = verifyNativeModules(treeDir, env);
   if (failed.length === 0) {
     return;
   }
 
   // Still broken after the re-fetch/reinstall: compile from source for addons that support it.
   for (const mod of failed.filter((m) => SOURCE_BUILDABLE.has(m))) {
-    await rebuildFromSource(mod, dataDir, env, npm);
+    await rebuildFromSource(mod, treeDir, env, npm);
   }
-  failed = verifyNativeModules(dataDir, env);
+  failed = verifyNativeModules(treeDir, env);
   if (failed.length === 0) {
     return;
   }
@@ -684,6 +698,8 @@ async function main() {
         JSON.stringify({
           dataDir: null,
           installed: false,
+          healthy: false,
+          brokenNatives: [],
           depsPresent: false,
           browserPresent: false,
           markerMatches: false,
@@ -697,7 +713,14 @@ async function main() {
       );
       process.exit(0);
     }
-    process.stdout.write(JSON.stringify(computeInstallState(dataDir)) + "\n");
+    const state = computeInstallState(dataDir);
+    // computeInstallState is pure fs-existence; on its own it reported installed:true while the engine
+    // was actually unloadable. Additionally LOAD-TEST the runtime tree (`${pluginRoot}/node_modules` —
+    // what the scripts resolve) and surface `healthy` / `brokenNatives`, so a command's preflight can
+    // self-repair (`node install-deps.mjs`) or fail with guidance instead of crashing mid-run.
+    const brokenNatives = state.installed ? verifyNativeModules(pluginRoot, process.env) : [];
+    const healthy = state.installed && brokenNatives.length === 0;
+    process.stdout.write(JSON.stringify({ ...state, healthy, brokenNatives }) + "\n");
     process.exit(0);
   }
 
@@ -746,13 +769,15 @@ async function main() {
   // Chromium must resolve to the same path at install time and at capture time.
   const env = { ...process.env, PLAYWRIGHT_BROWSERS_PATH: browsersDir };
 
-  // Fast path: already bootstrapped AND the native bindings still load under THIS Node. The marker's
-  // nativeRuntime fingerprint catches a Node/OS/arch/libc change; this cheap re-verify ADDITIONALLY
-  // catches a marker that matches but whose binary is missing/corrupt/built-for-a-different-Node
-  // (partial node_modules loss, an install interrupted before it verified, a copied data dir). On a
-  // clean verify we just re-assert the bridge and no-op; otherwise we fall through to repair.
+  // Fast path: already bootstrapped AND the native bindings load FROM THE TREE THE SCRIPTS USE. The
+  // engine's `scripts/*.ts` resolve their imports from `${pluginRoot}/node_modules` (a real dir OR the
+  // bridge symlink) — so THAT, not the data dir, is the tree we must load-test. Verifying the data dir
+  // was the split-brain bug: a healthy data-dir copy let SessionStart no-op while the plugin-root copy
+  // the scripts actually loaded was missing its `.node` (→ ERR_DLOPEN_FAILED, and a restart didn't fix
+  // it). The marker's nativeRuntime fingerprint catches a Node/OS/arch/libc change; this re-verify
+  // additionally catches a missing/corrupt/wrong-tree binary. Clean → re-assert the link and no-op.
   if (isInstalled()) {
-    if (verifyNativeModules(dataDir, env).length === 0) {
+    if (verifyNativeModules(pluginRoot, env).length === 0) {
       refreshBridge(); // self-heals a wiped/relocated link
       process.exit(0); // already bootstrapped — silent no-op
     }
@@ -774,14 +799,30 @@ async function main() {
 
   const npm = resolveNpm();
   let exitCode = 0;
+  // Track whether THIS run wrote the data-dir marker (a fresh install). A plugin-root-only repair
+  // failure must NOT wipe a HEALTHY data-dir marker — doing so makes the next session redo a useless
+  // full data-dir install and then hit the same plugin-root repair failure, looping every session.
+  let markerWritten = false;
   try {
-    // Re-check under the lock: a holder we waited behind may have just finished a healthy install.
-    if (isInstalled() && verifyNativeModules(dataDir, env).length === 0) {
+    // Re-check under the lock against the RUNTIME tree (`${pluginRoot}/node_modules` — what the
+    // scripts load), not the data dir.
+    if (isInstalled() && verifyNativeModules(pluginRoot, env).length === 0) {
+      // Fully healthy — a holder we waited behind may have just finished. Just re-assert the link.
       refreshBridge();
+    } else if (isInstalled()) {
+      // Deps + browser ARE installed (marker matches) but the runtime tree's native bindings don't
+      // load — the split-brain case: a REAL plugin-root `node_modules` whose better-sqlite3/sharp
+      // binary is missing (shipped without its `.node`), or a bridged tree whose binary was deleted.
+      // Repair the tree the scripts load from IN PLACE; no need to redo the npm install / Chromium.
+      process.stderr.write("[visual-guard] Repairing the engine's native bindings in the plugin tree…\n");
+      refreshBridge();
+      await ensureNativeModules(pluginRoot, env);
     } else {
       mkdirSync(dataDir, { recursive: true });
-      // The marker must exist for `npm install` to read it, but must NOT survive a failure.
+      // The marker must exist for `npm install` to read it, but must NOT survive a failure of THIS
+      // fresh install (tracked so the catch only wipes a marker this run created).
       writeFileSync(markerPath, manifest);
+      markerWritten = true;
 
       process.stderr.write(
         "[visual-guard] Setting up the engine (one-time): runtime deps + a pinned Chromium " +
@@ -809,14 +850,11 @@ async function main() {
         env,
       });
 
-      // npm can exit 0 with a native addon's binary silently missing — load-test and repair BEFORE
-      // trusting the install, so a broken binding is never recorded as "installed" (the root cause of
-      // the studio's ERR_DLOPEN_FAILED crash). Throws (→ marker removed → retry) if unfixable.
-      await ensureNativeModules(dataDir, env);
-
-      // Wire the deps to the plugin root, then CONFIRM the wiring actually resolves. On a filesystem
-      // that can't create symlinks the bridge silently fails; treat that as a failed install (throw →
-      // marker removed) rather than marking a permanently-unrunnable engine "ready".
+      // Wire the deps to the plugin root FIRST, then load-test/repair the tree the scripts actually
+      // resolve from (`${pluginRoot}/node_modules` — the bridge symlink OR a real dir). Verifying the
+      // RUNTIME tree (not the data dir) is what closes the split-brain: npm can exit 0 with a binary
+      // silently missing, and a real plugin-root copy may ship without its `.node` at all. Throws
+      // (→ marker removed → retry) if unfixable.
       refreshBridge();
       if (!bridgeReachable(rootNodeModules, nodeModulesDir)) {
         throw new Error(
@@ -824,15 +862,28 @@ async function main() {
             "symlinks). The bundled engine scripts cannot resolve their dependencies without this link.",
         );
       }
+      await ensureNativeModules(pluginRoot, env);
 
       process.stderr.write("[visual-guard] ✓ Engine ready — deps + Chromium installed.\n");
     }
   } catch (err) {
-    // Leave NO marker behind so the next session retries from a clean slate.
-    rmSync(markerPath, { force: true });
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[visual-guard] Dependency bootstrap failed: ${message}`);
-    console.error("[visual-guard] Will retry on the next session.");
+    if (markerWritten) {
+      // A fresh install failed — leave NO marker so the next session retries from a clean slate.
+      rmSync(markerPath, { force: true });
+      console.error(`[visual-guard] Dependency bootstrap failed: ${message}`);
+      console.error("[visual-guard] Will retry on the next session.");
+    } else {
+      // A plugin-root native repair failed but the data-dir install is intact — KEEP its marker (so the
+      // next session doesn't redo a useless full install) and just retry the in-place repair. This is
+      // the unrepairable-plugin-tree case (offline + no prebuilt + no compiler, or a shipped tree
+      // missing the package entirely): guide the user to reinstall the plugin rather than loop silently.
+      console.error(`[visual-guard] Could not repair the engine's native bindings: ${message}`);
+      console.error(
+        "[visual-guard] If this persists, reinstall/update the plugin (`/plugin` → update visual-guard) " +
+          "so its bundled tree is rebuilt for this machine.",
+      );
+    }
     exitCode = 1;
   } finally {
     releaseInstallLock(lock);

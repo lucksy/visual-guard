@@ -36,9 +36,18 @@ const BATCH = 6; // Figma nodes captured per subagent (bounded fan-out; no rate 
 const PREFLIGHT_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["engineReady", "figmaReady"],
+  required: ["engineReady", "engineHealthy", "figmaReady"],
   properties: {
     engineReady: { type: "boolean", description: "install-deps.mjs --check .installed" },
+    engineHealthy: {
+      type: "boolean",
+      description: "the FINAL --check .healthy (after an in-place repair, if one was needed)",
+    },
+    brokenNatives: {
+      type: "array",
+      items: { type: "string" },
+      description: "addons still failing to load after repair (empty when healthy)",
+    },
     figmaReady: { type: "boolean", description: "Figma desktop MCP answered get_metadata" },
   },
 };
@@ -105,14 +114,40 @@ const CAPTURE_SCHEMA = {
   },
 };
 
+// Forces the code-sync subagent to report whether it ACTUALLY ran the fixed command (vs. investigating
+// and returning prose). `ran` gates the fail-fast below.
+const CODE_SCHEMA = {
+  type: "object",
+  additionalProperties: true,
+  required: ["ran"],
+  properties: {
+    ran: {
+      type: "boolean",
+      description: "true ONLY if you executed the exact command and it printed its JSON summary",
+    },
+    components: { type: "number" },
+    currentSnapshots: { type: "number" },
+    error: { type: ["string", "null"], description: "the command's stderr if it exited non-zero" },
+  },
+};
+
 phase("Preflight");
 
 const pre = await agent(
-  "Check readiness for a Component Studio sync. (1) Engine: run " +
-    "'node " + pluginRoot + "/scripts/install-deps.mjs --check' and read the one-line JSON; " +
-    "engineReady = its .installed. (2) Figma: call the mcp__figma-desktop__get_metadata tool with " +
-    "NO nodeId; figmaReady = it answers (lists pages or a selection) rather than erroring that the " +
-    "server/file is unavailable. Return { engineReady, figmaReady }.",
+  "Check readiness for a Component Studio sync. You are a COMMAND RUNNER for the engine checks — run " +
+    "the EXACT commands below with the Bash tool, verbatim; do not substitute paths.\n" +
+    "(1) Engine: run 'node " + pluginRoot + "/scripts/install-deps.mjs --check' and read the one-line " +
+    "JSON. engineReady = its .installed.\n" +
+    "    - If .installed is true but .healthy is false (.brokenNatives lists broken native addons), the " +
+    "engine's native bindings are broken in the tree the scripts load (the code sync would crash " +
+    "ERR_DLOPEN_FAILED). REPAIR in place: run 'node " + pluginRoot + "/scripts/install-deps.mjs' (NO " +
+    "--check — it repairs), then run '--check' again. Set engineHealthy = the FINAL .healthy and " +
+    "brokenNatives = the FINAL .brokenNatives.\n" +
+    "    - If .installed is true and .healthy is true, engineHealthy = true, brokenNatives = [].\n" +
+    "    - If .installed is false, engineReady = false (engineHealthy = false).\n" +
+    "(2) Figma: call the mcp__figma-desktop__get_metadata tool with NO nodeId; figmaReady = it answers " +
+    "(lists pages or a selection) rather than erroring that the server/file is unavailable.\n" +
+    "Return { engineReady, engineHealthy, brokenNatives, figmaReady }.",
   { label: "preflight", phase: "Preflight", schema: PREFLIGHT_SCHEMA },
 );
 
@@ -121,18 +156,51 @@ if (!pre || !pre.engineReady) {
   return { error: "engine-not-installed" };
 }
 
+// Health gate (mirrors the command's prose preflight, because the SAVED `/visual-sync` workflow runs
+// DIRECTLY — bypassing that prose). If the engine is installed but its native bindings still don't load
+// after the in-place repair, STOP before the Code phase (which loads better-sqlite3) — entering it would
+// just crash ERR_DLOPEN_FAILED with no recovery.
+if (pre.engineHealthy === false) {
+  const broken = (pre.brokenNatives || []).join(", ") || "native addons";
+  log(
+    "Engine native bindings (" + broken + ") could not be repaired — stopping. Reinstall/update the " +
+      "plugin (`/plugin` → update visual-guard) so its tree is rebuilt for this machine.",
+  );
+  return { error: "engine-native-broken", brokenNatives: pre.brokenNatives || [] };
+}
+
 phase("Code");
 
-// Code-first: the headless engine populates code snapshots even when Figma is unavailable.
+// Code-first: the headless engine populates code snapshots even when Figma is unavailable. This is a
+// FIXED, deterministic command — but the workflow runtime can't run Bash itself, so it must hand it to
+// a subagent. Past failure: the subagent "investigated" project-relative tooling instead of running
+// the absolute command it was given, ran ~76 min, and recorded nothing. So constrain it to a pure
+// command-runner contract + a forced result schema, and FAIL FAST below if it didn't actually run.
+const codeCmd =
+  tsx + " " + pluginRoot + "/scripts/studio/sync.ts --config " + configPath +
+  baselineFlag + targetFlag + " --out " + outRoot;
 const code = await agent(
-  "Run the headless Component Studio code sync from the project root: " +
-    "'" + tsx + " " + pluginRoot + "/scripts/studio/sync.ts --config " + configPath +
-    baselineFlag + targetFlag + " --out " + outRoot + "'. " +
-    "If it fails with 'could not reach', relay that verbatim (the dev server/Storybook is down) and " +
-    "stop. Otherwise return the parsed summary JSON it prints.",
-  { label: "code-sync", phase: "Code" },
+  "You are a COMMAND RUNNER, not an investigator. Use the Bash tool to execute this command EXACTLY, " +
+    "verbatim — do NOT change, shorten, or substitute any path (the absolute paths are correct), do " +
+    "NOT look for project-relative tooling (no `./node_modules`, no relative `scripts/…`), do NOT " +
+    "`cd` elsewhere or explore the repo. Run it ONCE:\n\n  " + codeCmd + "\n\n" +
+    'It prints a one-line JSON summary like {"command":"sync","components":N,"currentSnapshots":M,...}. ' +
+    "On success return { ran: true, ...that parsed JSON }. If the command itself exits non-zero, return " +
+    '{ ran: false, error: "<its stderr>" } — e.g. a "could not reach" error means the dev ' +
+    "server/Storybook is down. Do not retry with different paths.",
+  { label: "code-sync", phase: "Code", schema: CODE_SCHEMA },
 );
-log("Code snapshots synced.");
+
+// Fail-fast: if the deterministic code sync didn't actually run, STOP — never proceed into the Figma
+// fan-out (where the wasted time/tokens compounded). Surface the exact command so the user can run it.
+if (!code || code.ran !== true) {
+  log("Code sync did not run — stopping. Run it directly:\n  " + codeCmd);
+  return { error: "code-sync-failed", code: code || null };
+}
+log(
+  "Code snapshots synced" +
+    (typeof code.components === "number" ? " (" + code.components + " component(s))" : "") + ".",
+);
 
 // Figma is interactive-only: if the desktop app/MCP isn't available, code is still synced and any
 // Figma-linked components remain figma-pending for the next run. Never treat this as a failure.

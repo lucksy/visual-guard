@@ -51,7 +51,10 @@ Then lay out the plan in plain language, so the user knows what's coming before 
   (`$STATE.engineDeps` + `$STATE.browser`), *why* (render screenshots of the UI locally), *where*
   (`$STATE.dataDir` — the plugin's data dir, **not** your project), and *size* (~150 MB, one-time).
   On **Install now** → run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once
-  it exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed` is true, continue.
+  it exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed` is true, continue —
+  but if `$STATE.healthy` is **false** (`$STATE.brokenNatives` lists the broken addons), the engine's
+  native bindings didn't load; run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to repair
+  them in place, then continue (if `brokenNatives` is still non-empty afterward, relay it and **stop**).
 - Resolve `$CONFIG` — the first that exists of `visual.config.json`,
   `config/visual.config.json`, else `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`.
 

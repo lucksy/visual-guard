@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadConfig, type Config } from "../lib/config";
+import { ensureBrowsersPath } from "../lib/browsers-path";
 import { captureAll, readPngDimensions } from "../capture";
 import { classify, isSafeKey, walkPngFiles } from "../compare";
 import { diffImages } from "../lib/diff";
@@ -384,6 +385,11 @@ export function parseArgs(argv: string[]): SyncCliArgs {
 
 async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
+  // Code capture renders via Playwright, which needs the pinned Chromium at
+  // `${CLAUDE_PLUGIN_DATA}/browsers`. sync.ts is run STANDALONE (the /visual-sync workflow subagent, a
+  // direct CLI call) where no caller sets PLAYWRIGHT_BROWSERS_PATH — resolve it so the sync finds the
+  // pinned browser instead of Playwright's default cache ("browser not found").
+  ensureBrowsersPath();
   const config = loadConfig(args.config);
   const baselineDir = args.baselineDir ?? config.baselineDir;
 

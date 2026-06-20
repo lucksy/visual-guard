@@ -76,6 +76,24 @@ describe("visual-sync workflow template", () => {
     expect(template).toMatch(/engine-not-installed/);
   });
 
+  it("gates on native HEALTH (not just installed) and repairs in place — the saved workflow bypasses the prose preflight", () => {
+    expect(template).toMatch(/engineHealthy/);
+    expect(template).toMatch(/brokenNatives/);
+    expect(template).toMatch(/engineHealthy === false/); // hard gate before the Code phase
+    expect(template).toMatch(/engine-native-broken/);
+    // The preflight must attempt an in-place repair (install-deps.mjs without --check) before gating.
+    expect(template).toMatch(/REPAIR in place/);
+  });
+
+  it("constrains the deterministic code-sync subagent and fails fast if it didn't run", () => {
+    // Defect C: the code-sync is a fixed command; the subagent must run it verbatim (not investigate),
+    // report `ran`, and the workflow must STOP rather than proceed into the Figma fan-out on failure.
+    expect(template).toMatch(/CODE_SCHEMA/);
+    expect(template).toMatch(/COMMAND RUNNER/);
+    expect(template).toMatch(/ran:\s*true|\.ran !== true/); // forced result + fail-fast gate
+    expect(template).toMatch(/code-sync-failed/); // fail-fast return, not a 76-min thrash
+  });
+
   it("captures component-set variants, finalizes figma-pending, and prefers the configured file key", () => {
     expect(template).toMatch(/\.variants/); // carries enumerated variants into capture
     expect(template).toMatch(/--variant/); // records each variant child as a distinct lane

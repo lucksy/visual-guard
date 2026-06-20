@@ -56,7 +56,10 @@ inline (the same one `/visual-setup` performs): with **AskUserQuestion**, show *
 (`$STATE.engineDeps` + `$STATE.browser`), *why* (render screenshots of the UI locally), *where*
 (`$STATE.dataDir` — the plugin's data dir, **not** your project), and *size* (~150 MB, one-time). On
 **Install now** → run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once it
-exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed` is true, continue.
+exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed` is true, continue — but
+if `$STATE.healthy` is **false** (`$STATE.brokenNatives` lists the broken addons), the engine's native
+bindings didn't load; run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to repair them in
+place, then continue (if `brokenNatives` is still non-empty afterward, relay it and **stop**).
 
 > In a non-interactive CI run (no one to approve), don't prompt — assume the engine is provisioned by
 > the pipeline (a prior session or `node install-deps.mjs` step) and let the capture fail loudly if not.

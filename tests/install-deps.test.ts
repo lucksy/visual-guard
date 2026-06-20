@@ -37,6 +37,9 @@ interface InstallState {
   engineDeps: Record<string, string>;
   nativeRuntime: NativeRuntime;
   browser: string;
+  /** Added to the `--check` CLI output (not computeInstallState): runtime-tree native load-test. */
+  healthy?: boolean;
+  brokenNatives?: string[];
 }
 
 const installDepsSpecifier = "../scripts/install-deps.mjs";
@@ -545,6 +548,9 @@ describe("resolveDataDir — mid-session fallback (no CLAUDE_PLUGIN_DATA needed)
       const state = JSON.parse(out) as InstallState;
       expect(state.installed).toBe(false);
       expect(state.dataDir).toContain(join("plugins", "data", "visual-guard-lucksy"));
+      // Defect B: --check now surfaces runtime-tree native health, not just fs-existence.
+      expect(state.healthy).toBe(false); // not installed ⇒ not healthy
+      expect(state.brokenNatives).toEqual([]); // no load-test attempted when not installed
     } finally {
       rmSync(cfg, { recursive: true, force: true });
     }

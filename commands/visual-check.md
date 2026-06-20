@@ -60,6 +60,10 @@ and browser live. Before running anything:
   `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once it exits `0`; on **Not
   now** → **stop** (nothing changes). When `$STATE.installed` is true, just continue. Never improvise
   another runner or download anything yourself.
+- **Native health (every run).** If `$STATE.installed` is true but `$STATE.healthy` is **false**
+  (`$STATE.brokenNatives` lists the broken addons), the engine's native bindings didn't load from the
+  tree the scripts use; run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to repair them in
+  place, then continue (if `brokenNatives` is still non-empty afterward, relay it and **stop**).
 - Resolve the project's config — the first that exists of `visual.config.json`,
   `config/visual.config.json`, else the bundled default
   `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`. Call it `$CONFIG`.

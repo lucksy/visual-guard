@@ -48,6 +48,10 @@ Then lay out the plan in plain language, so the user knows what's coming before 
   `Read` the one-line JSON. If `.installed` is **false**, run the `/visual-setup` consent flow inline
   (AskUserQuestion: *what* / *why* / *where* / *size ~150 MB*); on **Install now** run
   `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue on exit `0`; on **Not now** stop.
+- **Native health — code sync loads SQLite (`better-sqlite3`).** If `.installed` is true but `.healthy`
+  is **false** (`.brokenNatives` lists the broken addons), run
+  `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to repair the bindings in place, then continue
+  (if `brokenNatives` is still non-empty afterward, relay it and **stop** — sync would crash otherwise).
 - **Figma-MCP availability (advisory, never blocking).** Probe the desktop app: call
   **`mcp__figma-desktop__get_metadata`** with no node id. If it lists pages/a selection → Figma is
   ready. If it errors that the server/file is unavailable → tell the user *"Open your Figma file in the
