@@ -289,6 +289,47 @@ as advisory levels (not pass/fail); `/visual-ci` provably ignores conformance; a
 
 ---
 
+## Phase 6 — Triage & review surface (diff tooling · approve · search/nav · freshness)
+
+**Goal.** Turn the read-only viewer into a triage + sign-off surface by SURFACING data the engine already
+computes (the largest data-model-vs-UI gap), and add the navigation/automation a real design-system team
+needs. Four themes, all built on the existing schema/API/SPA — one additive migration (v4).
+
+**Deliverables.**
+- **Diff & comparison.** Schema **v4** adds advisory `regressions.{dimension_delta, palette_delta}` (the
+  figma↔code conformance breakdown). The detail payload carries the latest comparison per axis; the detail
+  view renders the **pixel-diff %**, a **drift sparkline** (`GET /api/components/:id/regressions`), an
+  Overlay caption that says WHICH axis drifted (size vs color), **shift-click A/B** timeline compare, and a
+  **served pixel-diff overlay** — `GET /api/diff?from=&to=` streams the engine's real changed-pixels image
+  (`diff.ts`, red over a grayscale base), behind a "Show changed pixels" toggle in Diff mode; the overlay
+  is content-addressed (cached under `.visual-guard/cache/diffs/`) with an immutable ETag.
+- **Approve / review.** `POST /api/snapshots/:id/approve` promotes a captured render to the committed code
+  baseline — the durable `/visual-baseline` action, reachable from the page; CSRF-guarded + path-confined
+  under `baselineDir`, reusing the `applyBaseline` boundary. The studio's SECOND mutating route.
+- **Search, nav & keyboard.** Faceted `ListFilter` (sync-state, parity, has-figma/has-code) + broadened
+  search corpus (description); an app-wide keyboard layer (`/` search, `j/k` cards, `g` gallery, `?` help)
+  and deep-linked detail state (`#/component/:id?variant=&mode=`).
+- **Analytics & freshness.** `GET /api/summary` (GROUP-BY rollups); gallery **auto-refresh** (cheap health
+  poll detects an external sync); `sync --watch` (re-syncs on source change, near-free via the fingerprint
+  skip); pidfile reuse now **health-probes** the candidate before reusing it (recycled-PID guard).
+
+**Depends on.** P1 (schema), P3 (API), P4 (SPA), P5 (conformance/fingerprint).
+
+**Testing.** Unit (pure, coverage): the v4 migration; `latestRegression`/`componentRegressions`/
+`summaryCounts`/faceted `ListFilter`; `approveSnapshotAsBaseline` (promote + idempotent + reject
+figma/no-variant/no-code + path confinement) over a temp dir; view-model `formatDiffRatio`/
+`regressionSeries`/`sparklinePath`/`describeParityDrift`; `clampWatchIntervalMs` + `--watch` arg parse.
+e2e: `/api/summary`, `/api/components/:id/regressions`, the detail `comparisons`, and approve (success +
+the promoted baseline image **serves** + cross-site 403 + wrong-verb 405 + figma-reject 409). Browser-
+validated via chrome-devtools against `serve.ts`. CI invariant preserved: `figma_vs_code` never gates.
+
+**Exit criteria.** A component page shows the diff %, drift sparkline, and (for a linked pair) which axis
+drifted; Approve writes a committed baseline and clears the regression in place, and that baseline's image
+serves; `/api/summary` + faceted filters + the keyboard layer work; `sync --watch` re-syncs on change;
+all gates pass (typecheck, lint, ≥80% coverage, plugin validate).
+
+---
+
 ## Riskiest items & where they're de-risked
 
 | Risk | De-risk phase | Mitigation |

@@ -5,6 +5,8 @@ argument-hint: ""
 
 # /visual-config — change sources & preferences (reconfigure)
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 Edit an **existing** `visual.config.json` after the first-run `/visual-init`. Use this to **add or
 remove a Figma library**, **add a Storybook/Ladle target**, **regenerate stories** for components added
 since you scaffolded a harness, or **change preferences** (viewports / states / thresholds) — all while
@@ -15,7 +17,7 @@ Use the **AskUserQuestion** tool for every choice. This command rewrites exactly
 touches a baseline and sends nothing external. (For a brand-new project with no config, use
 `/visual-init` instead.)
 
-## Show this first — banner + plan
+## Show this first — the banner
 
 Open your response with this banner, **printed verbatim in a code block**, before any tool call:
 
@@ -31,15 +33,7 @@ Open your response with this banner, **printed verbatim in a code block**, befor
          ▀██▀
 ```
 
-Then lay out the plan in plain language:
-
-- **1 · Preflight** — engine ready + an existing config found (read-only)
-- **2 · Review** — show your current sources (targets · tokens · Figma)
-- **3 · Change** — pick what to add / remove / adjust
-- **4 · Write** — save the updated `visual.config.json` (only after your final yes)
-
-**Narrate as you go.** Before each tool call, print a one-line `▸ Step N/4 · <name>` that says in plain
-words what it does and whether it changes anything (read-only vs writes).
+Then go straight to work — no upfront plan and no numbered step list. Before each action, print one short line of what it is doing and whether it only reads or also changes things, then run it. Keep the running output to those short progress lines plus the final result, as the Output style note above describes.
 
 ## 0. Preflight
 

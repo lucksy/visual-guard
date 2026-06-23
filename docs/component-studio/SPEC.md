@@ -143,7 +143,7 @@ contradictory across sub-designs). Each is a **decision**, not an option.
 ```sql
 PRAGMA journal_mode = WAL;     -- local server reads while a capture writes
 PRAGMA foreign_keys = ON;
-PRAGMA user_version = 1;        -- migration counter
+PRAGMA user_version = 4;        -- migration counter (current schema version)
 
 CREATE TABLE components (
   id INTEGER PRIMARY KEY,
@@ -204,6 +204,8 @@ CREATE TABLE regressions (
   from_snapshot INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
   to_snapshot   INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
   diff_ratio REAL,                       -- 0..1 from diff.ts (NULL for new/error)
+  dimension_delta REAL,                  -- v4: figma↔code size delta 0..1 (advisory; NULL otherwise)
+  palette_delta REAL,                    -- v4: figma↔code color delta 0..1 (advisory; NULL otherwise)
   status TEXT NOT NULL CHECK (status IN ('same','changed','regression','new','error')),
   computed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -307,10 +309,15 @@ surfaced as `figma-only` / `code-only` (never dropped). Accepted pairs persist a
 - **Server:** `scripts/studio/server.ts` — tiny `node:http`, run via bundled `tsx`, **no new deps**.
   `server.listen(0, "127.0.0.1")` (loopback, ephemeral port), pidfile single-instance guard, launched
   **backgrounded/detached** so the agent turn completes; SIGINT/SIGTERM closes server + DB + pidfile.
-- **API (read-mostly):** `GET /api/health`, `/api/components` (`?status=&q=`),
-  `/api/components/:id`, `/api/components/:id/history?source=`, `/api/components/:id/variants`,
-  `/api/snapshots/:id`, `/api/snapshots/:id/image` (PNG stream, immutable cache). `POST /api/sync`
-  triggers a sync. Error contract `{ error: { code, message } }`.
+- **API (read-mostly):** `GET /api/health`, `/api/summary` (P6 — bucketed status/sync-state/presence
+  rollups), `/api/components` (`?status=&q=`), `/api/components/:id` (detail now also carries the latest
+  comparison per axis — pixel-diff + conformance breakdown), `/api/components/:id/history?source=`,
+  `/api/components/:id/variants`, `/api/components/:id/regressions?axis=` (P6 — drift history for the
+  sparkline), `/api/snapshots/:id`, `/api/snapshots/:id/image` (PNG stream, immutable cache),
+  `/api/diff?from=&to=` (P6 — the engine's pixel-diff overlay between two snapshots, changed pixels in
+  red; content-addressed cache + immutable ETag).
+  **Mutating (CSRF-guarded):** `POST /api/sync` triggers a code sync; `POST /api/snapshots/:id/approve`
+  (P6) promotes a captured render to the committed code baseline. Error contract `{ error: { code, message } }`.
 - **Image serving:** by DB key, **path-confined** — normalize and hard-refuse any path outside
   `.visual-baselines/` or `.visual-guard/` (mirrors `baseline.ts`; a `..`-escape test is mandatory).
 - **Security:** CSP `default-src 'self'; img-src 'self' data:; connect-src 'self'; script-src 'self';

@@ -168,7 +168,7 @@ export async function pollTarget(target, fetchImpl, timeoutMs = PROBE_TIMEOUT_MS
 
 // --- Formatting + transition logic (pure) ---------------------------------
 
-const STATUS_ICON = { ready: "✓", degraded: "✗", unreachable: "…" };
+const STATUS_ICON = { ready: "ok", degraded: "!!", unreachable: "??" };
 
 /** A single human line for a target's current status (delivered to Claude as a notification). */
 export function formatLine(target, result) {

@@ -5,6 +5,8 @@ argument-hint: "[target]"
 
 # /visual-ci — gate a change + generate the PR report
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 Run Visual Guard as a **gate**: capture → compare → report, then turn the run's `manifest.json` into
 (1) a pass/fail decision with a process exit code, and (2) a PR-comment Markdown report. This command
 is **read-only** on source (never edits a file to pass, never approves a baseline) and **local-only**
@@ -16,7 +18,7 @@ is **read-only** on source (never edits a file to pass, never approves a baselin
 > (could not run). In an interactive session this command *reports* the gate result; in CI you run
 > `scripts/ci.ts` directly (see §5) so the pipeline actually fails.
 
-## Show this first — banner + plan
+## Show this first — the banner
 
 Open your response with this banner, **printed verbatim in a code block**, before any tool call:
 
@@ -32,14 +34,7 @@ Open your response with this banner, **printed verbatim in a code block**, befor
          ▀██▀
 ```
 
-Then lay out the plan in plain language, so the user knows what's coming before anything runs:
-
-- **1 · Preflight** — engine ready (read-only)
-- **2 · Capture + Diff** — run the full check
-- **3 · Gate** — pass/fail from the run manifest (CI exit `0` / `1` / `2`)
-- **4 · Report** — generate the PR-comment Markdown (this command doesn't post it — your CI does)
-
-**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/4 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+Then go straight to work — no upfront plan and no numbered step list. Before each action, print one short line of what it is doing and whether it only reads or also changes things, then run it. Keep the running output to those short progress lines plus the final result, as the Output style note above describes.
 
 ## 0. Preflight
 
@@ -58,8 +53,9 @@ inline (the same one `/visual-setup` performs): with **AskUserQuestion**, show *
 **Install now** → run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once it
 exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed` is true, continue — but
 if `$STATE.healthy` is **false** (`$STATE.brokenNatives` lists the broken addons), the engine's native
-bindings didn't load; run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to repair them in
-place, then continue (if `brokenNatives` is still non-empty afterward, relay it and **stop**).
+bindings didn't load; run the exact command in **`$STATE.repair`** (the sanctioned in-place self-heal —
+do **NOT** improvise a manual `npm rebuild` in a guessed directory), then continue. If still unhealthy
+— or `$STATE.systemSupported` is **false** — relay `$STATE.reason` and **stop**.
 
 > In a non-interactive CI run (no one to approve), don't prompt — assume the engine is provisioned by
 > the pipeline (a prior session or `node install-deps.mjs` step) and let the capture fail loudly if not.
@@ -75,7 +71,7 @@ under `.visual-guard/runs/<id>/`, gitignored). Doing it in one analyzable comman
 `export`/`$?` in the prompt — is also what keeps this to a single permission prompt.
 
 Append `--target <name>` if `$ARGUMENTS` named one; add `--allow-new` / `--allow-error` only to relax
-the gate for a first-baseline bootstrap. Echo `▸ Step 2/4 · Capture + Diff + Gate — render, compare to baseline, decide pass/fail (writes only under .visual-guard/).` then run:
+the gate for a first-baseline bootstrap. Print one short line — e.g. `Capturing, diffing, and gating the change (writes only under .visual-guard/)…` — then run:
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx" "${CLAUDE_PLUGIN_ROOT}/scripts/ci-run.ts" --config "$CONFIG" --cwd "$PWD"

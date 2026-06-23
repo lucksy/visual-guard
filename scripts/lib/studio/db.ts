@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 export type DB = Database.Database;
 
 /** The schema version this build knows how to produce (mirrors `PRAGMA user_version`). */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 // schema.sql sits beside this module both in source and when shipped in the plugin, so resolve it
 // relative to the module URL (works under tsx, vitest, and the bridged plugin runtime alike).
@@ -75,11 +75,12 @@ export function migrate(db: DB): void {
   const schema = readFileSync(SCHEMA_PATH, "utf8");
   const apply = db.transaction(() => {
     if (from === 0) {
-      // Fresh DB: schema.sql already contains the current (v3) shape, indexes + columns included.
+      // Fresh DB: schema.sql already contains the current (v4) shape — every index + column, including
+      // the v3 render_url and the v4 conformance-breakdown columns — so this single exec covers them all.
       db.exec(schema);
     } else {
       // Older DB: run EVERY incremental step from `from` up to current — cumulative (NOT one step keyed
-      // on the exact `from`), so a v1 DB gets both the v2 index AND the v3 column, not just the first.
+      // on the exact `from`), so a v1 DB gets the v2 index, the v3 render_url column, AND the v4 columns.
       if (from < 2) {
         // v1 → v2: add the regression lookup index a v1 DB was built without. IF NOT EXISTS so a
         // hand-rebuilt DB can never trip on a name it already has. (component_usages needs no new index —
@@ -93,6 +94,17 @@ export function migrate(db: DB): void {
         // v2 → v3: the live-preview harness URL per code variant. Guarded by a column-existence check
         // (SQLite has no ADD COLUMN IF NOT EXISTS) so a partially-migrated/hand-rebuilt DB can't crash.
         db.exec(`ALTER TABLE variants ADD COLUMN render_url TEXT;`);
+      }
+      if (from < 4) {
+        // v3 → v4: the advisory conformance breakdown (dimension vs palette delta) on the figma↔code
+        // axis, so the UI can explain WHICH axis drifted. Both nullable + column-guarded (no ADD COLUMN
+        // IF NOT EXISTS in SQLite), so a partially-migrated/hand-rebuilt DB never trips the ALTER.
+        if (!columnExists(db, "regressions", "dimension_delta")) {
+          db.exec(`ALTER TABLE regressions ADD COLUMN dimension_delta REAL;`);
+        }
+        if (!columnExists(db, "regressions", "palette_delta")) {
+          db.exec(`ALTER TABLE regressions ADD COLUMN palette_delta REAL;`);
+        }
       }
     }
     db.pragma(`user_version = ${SCHEMA_VERSION}`);

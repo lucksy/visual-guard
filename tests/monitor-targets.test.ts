@@ -244,17 +244,17 @@ describe("formatLine + statusKey", () => {
 
   it("formats each status with its icon", () => {
     expect(formatLine(target, { status: "ready", detail: "42 stories" })).toBe(
-      "✓ storybook localhost:6006 ready (42 stories)",
+      "ok storybook localhost:6006 ready (42 stories)",
     );
     expect(formatLine(target, { status: "unreachable", detail: "" })).toBe(
-      "… storybook localhost:6006 unreachable (http://localhost:6006)",
+      "?? storybook localhost:6006 unreachable (http://localhost:6006)",
     );
     expect(
       formatLine(
         { kind: "app", label: "web", origin: "http://localhost:3000" },
         { status: "degraded", detail: "/checkout → HTTP 500" },
       ),
-    ).toBe("✗ app web /checkout → HTTP 500");
+    ).toBe("!! app web /checkout → HTTP 500");
   });
 
   it("statusKey changes when status or detail changes", () => {
@@ -285,7 +285,7 @@ describe("runOnce / runPass", () => {
       }),
       log: (line) => lines.push(line),
     });
-    expect(lines).toEqual(["✓ storybook sb ready (1 story)"]);
+    expect(lines).toEqual(["ok storybook sb ready (1 story)"]);
   });
 
   it("runPass logs only on a status transition", async () => {

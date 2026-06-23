@@ -6,12 +6,14 @@ argument-hint: "[target-glob]"
 
 # /visual-review — fan-out review + adversarial verify → one report
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 This skill orchestrates Visual Guard's Phase-1 deep review as a **dynamic workflow**. Plugins can't
 bundle a workflow directly, so this skill ships the orchestration as a **script template**
 (`workflow.template.js`, next to this file) and launches it for you with the Workflow tool. It is
 read-only on source and sends nothing to an external service — all capture, diff, and review is local.
 
-## Show this first — banner + plan
+## Show this first — the banner
 
 Open your response with this banner, **printed verbatim in a code block**, before any tool call:
 
@@ -27,13 +29,7 @@ Open your response with this banner, **printed verbatim in a code block**, befor
          ▀██▀
 ```
 
-Then lay out the plan in plain language, so the user knows what's coming before anything runs:
-
-- **1 · Preflight** — engine ready (read-only)
-- **2 · Review** — fan out the visual-reviewer + token-auditor subagents in parallel
-- **3 · Verify** — adversarially check every finding, then synthesize one report
-
-**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/3 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+Then go straight to work — no upfront plan and no numbered step list. Before each action, print one short line of what it is doing and whether it only reads or also changes things, then run it. Keep the running output to those short progress lines plus the final result, as the Output style note above describes.
 
 ## 0. Preflight — engine check (every run)
 

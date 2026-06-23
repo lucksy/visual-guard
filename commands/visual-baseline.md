@@ -5,6 +5,8 @@ argument-hint: "[target]"
 
 # /visual-baseline — approve current renders as the new baseline
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 Approve the most recent run's renders as the committed baseline for a target. This is a
 **deliberate sign-off**: only ever run it when the user explicitly invokes `/visual-baseline`
 — never as a step inside `/visual-check` or any other flow, and never to "make a check pass".
@@ -12,7 +14,7 @@ It writes **only** under the configured `baselineDir`; it touches nothing else.
 
 The optional target is `$ARGUMENTS` (a component name, an instance label, or `instance/name`).
 
-## Show this first — banner + plan
+## Show this first — the banner
 
 Open your response with this banner, **printed verbatim in a code block**, before any tool call:
 
@@ -28,13 +30,7 @@ Open your response with this banner, **printed verbatim in a code block**, befor
          ▀██▀
 ```
 
-Then lay out the plan in plain language, so the user knows what's coming before anything runs:
-
-- **1 · Preflight** — engine + the latest run found (read-only)
-- **2 · Review** — show exactly which renders would become the new baseline
-- **3 · Approve** — write the baseline, only on your explicit go-ahead
-
-**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/3 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+Then go straight to work — no upfront plan and no numbered step list. Before each action, print one short line of what it is doing and whether it only reads or also changes things, then run it. Keep the running output to those short progress lines plus the final result, as the Output style note above describes.
 
 ## 0. Preflight (same contract as /visual-check)
 
@@ -53,8 +49,9 @@ Then lay out the plan in plain language, so the user knows what's coming before 
   On **Install now** → run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once
   it exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed` is true, continue —
   but if `$STATE.healthy` is **false** (`$STATE.brokenNatives` lists the broken addons), the engine's
-  native bindings didn't load; run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to repair
-  them in place, then continue (if `brokenNatives` is still non-empty afterward, relay it and **stop**).
+  native bindings didn't load; run the exact command in **`$STATE.repair`** (the sanctioned in-place
+  self-heal — do **NOT** improvise a manual `npm rebuild`), then continue. If still unhealthy — or
+  `$STATE.systemSupported` is **false** — relay `$STATE.reason` and **stop**.
 - Resolve `$CONFIG` — the first that exists of `visual.config.json`,
   `config/visual.config.json`, else `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`.
 

@@ -119,7 +119,7 @@ export function evaluateGate(manifest: Manifest, policy: GatePolicy): GateResult
   const suffix = allowedNotes.length > 0 ? ` (${allowedNotes.join(", ")})` : "";
   const summaryLine =
     `${PREFIX}: ${manifest.targets.length} target(s) — ${counts.fail} fail, ${counts.new} new, ` +
-    `${counts.error} error, ${counts.pass} pass → ${ok ? "clean ✅" : "BLOCKED ❌"}${suffix}`;
+    `${counts.error} error, ${counts.pass} pass → ${ok ? "clean" : "BLOCKED"}${suffix}`;
 
   return { ok, exitCode: ok ? 0 : 1, blocking, counts, blockingTargets, summaryLine };
 }
@@ -233,7 +233,7 @@ function main(argv: string[]): void {
   } else {
     console.log(result.summaryLine);
     for (const target of result.blockingTargets) {
-      console.log(`  ✗ ${target.instance}/${target.target} — ${target.status}`);
+      console.log(`  - ${target.instance}/${target.target} — ${target.status}`);
     }
   }
   // The whole point of the gate: a non-zero exit so CI fails on an unapproved regression.

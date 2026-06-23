@@ -79,6 +79,11 @@ export function blobPath(sha256: string, outRoot: string = DEFAULT_OUT_ROOT): st
   return join(blobsDir(outRoot), `${sha256}.png`);
 }
 
+/** Content-addressed cache dir for on-demand pixel-diff overlay images (server `GET /api/diff`). */
+export function diffsDir(outRoot: string = DEFAULT_OUT_ROOT): string {
+  return join(outRoot, "cache", "diffs");
+}
+
 /** Committed Figma baselines live under `<baselineDir>/.figma/`. */
 export function figmaBaselineDir(baselineDir: string): string {
   return join(baselineDir, ".figma");

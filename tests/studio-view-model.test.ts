@@ -3,12 +3,16 @@ import {
   cardAriaLabel,
   countByBadge,
   deriveBadge,
+  describeParityDrift,
   figmaDeepLink,
   filterComponents,
+  formatDiffRatio,
   freshness,
   isCodeRegressed,
   livePreviewUrl,
+  regressionSeries,
   sortComponents,
+  sparklinePath,
   storyLink,
   timelineTicks,
   variantUnion,
@@ -211,5 +215,75 @@ describe("livePreviewUrl", () => {
     expect(livePreviewUrl("http://192.168.1.5:61000/?story=x")).toBeNull();
     expect(livePreviewUrl("javascript:alert(1)")).toBeNull();
     expect(livePreviewUrl("not a url")).toBeNull();
+  });
+});
+
+// --- P6: diff & comparison helpers -----------------------------------------
+
+describe("filterComponents — broadened search corpus (P6)", () => {
+  it("matches the description, not just name/key", () => {
+    const list = [
+      comp({ name: "Button", key: "btn", description: "the main call to action" }),
+      comp({ name: "Card", key: "card", description: "a surface container" }),
+    ];
+    expect(filterComponents(list, { q: "call to action" }).map((c) => c.name)).toEqual(["Button"]);
+    expect(filterComponents(list, { q: "surface" }).map((c) => c.name)).toEqual(["Card"]);
+    // A null description never throws and just doesn't match.
+    expect(filterComponents([comp({ name: "X", key: "x" })], { q: "anything" })).toEqual([]);
+  });
+});
+
+describe("formatDiffRatio", () => {
+  it("formats a 0..1 ratio as a 2-decimal percentage, null for non-numbers", () => {
+    expect(formatDiffRatio(0.0123)).toBe("1.23%");
+    expect(formatDiffRatio(0)).toBe("0.00%");
+    expect(formatDiffRatio(1)).toBe("100.00%");
+    expect(formatDiffRatio(null)).toBeNull();
+    expect(formatDiffRatio(undefined)).toBeNull();
+    expect(formatDiffRatio(NaN)).toBeNull();
+  });
+});
+
+describe("regressionSeries", () => {
+  it("reverses newest-first rows to oldest→newest and coerces NULL ratios to 0", () => {
+    const rows = [
+      { diff_ratio: 0.3, status: "regression", computed_at: "t3" },
+      { diff_ratio: null, status: "new", computed_at: "t2" },
+      { diff_ratio: 0.1, status: "changed", computed_at: "t1" },
+    ];
+    const s = regressionSeries(rows);
+    expect(s.map((p) => p.ratio)).toEqual([0.1, 0, 0.3]);
+    expect(s.map((p) => p.at)).toEqual(["t1", "t2", "t3"]);
+    expect(regressionSeries(null)).toEqual([]);
+    expect(regressionSeries(undefined)).toEqual([]);
+  });
+});
+
+describe("sparklinePath", () => {
+  it("returns '' for empty, a flat 2-point line for a single sample", () => {
+    expect(sparklinePath([], 100, 24)).toBe("");
+    expect(sparklinePath([0.5], 100, 24)).toBe("0,0.00 100,0.00"); // single point → top line at its own max
+  });
+
+  it("maps a series across the width with y inverted and normalized to its own max", () => {
+    const pts = sparklinePath([0, 0.5, 1], 100, 20).split(" ");
+    expect(pts).toHaveLength(3);
+    // x spreads 0..100; y inverts (max value → 0, zero → height).
+    expect(pts[0]).toBe("0.00,20.00"); // 0 → bottom
+    expect(pts[2]).toBe("100.00,0.00"); // max → top
+  });
+
+  it("draws an all-zero series along the bottom (no divide-by-zero)", () => {
+    expect(sparklinePath([0, 0, 0], 60, 30)).toBe("0.00,30.00 30.00,30.00 60.00,30.00");
+  });
+});
+
+describe("describeParityDrift", () => {
+  it("names which conformance axis drifted (advisory)", () => {
+    expect(describeParityDrift(null, null)).toBeNull();
+    expect(describeParityDrift(0.01, 0.01)).toMatch(/aligned/);
+    expect(describeParityDrift(0.3, 0.01)).toMatch(/size drifts/);
+    expect(describeParityDrift(0.01, 0.3)).toMatch(/color drifts/);
+    expect(describeParityDrift(0.3, 0.3)).toMatch(/size and color/);
   });
 });

@@ -115,6 +115,26 @@ describe("openDb / migrate", () => {
     db.close();
   });
 
+  const regressionColumns = (db: Database.Database): string[] =>
+    (db.pragma("table_info(regressions)") as { name: string }[]).map((c) => c.name);
+
+  it("migrates a v3 DB up to v4 — adds the conformance breakdown columns (guarded, idempotent)", () => {
+    const db = openDb(":memory:");
+    db.exec("ALTER TABLE regressions DROP COLUMN dimension_delta");
+    db.exec("ALTER TABLE regressions DROP COLUMN palette_delta");
+    db.pragma("user_version = 3");
+    expect(regressionColumns(db)).not.toContain("dimension_delta");
+
+    migrate(db);
+
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(regressionColumns(db)).toContain("dimension_delta");
+    expect(regressionColumns(db)).toContain("palette_delta");
+    // Re-migrating must not trip the ALTER again (columnExists guard).
+    expect(() => migrate(db)).not.toThrow();
+    db.close();
+  });
+
   it("is idempotent — re-migrating a current DB changes nothing", () => {
     const db = openDb(":memory:");
     const count = () =>

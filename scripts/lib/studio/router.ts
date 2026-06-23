@@ -164,12 +164,16 @@ export function contentTypeFor(filePath: string): string {
 
 export type Route =
   | { kind: "health" }
+  | { kind: "summary" }
+  | { kind: "diffImage" }
   | { kind: "components" }
   | { kind: "component"; id: number }
   | { kind: "componentHistory"; id: number }
   | { kind: "componentVariants"; id: number }
+  | { kind: "componentRegressions"; id: number }
   | { kind: "snapshot"; id: number }
   | { kind: "snapshotImage"; id: number }
+  | { kind: "snapshotApprove"; id: number }
   | { kind: "sync" }
   /** A non-`/api/*` GET — resolved against `public/` by the server (SPA app shell). */
   | { kind: "static"; path: string }
@@ -201,6 +205,13 @@ export function matchRoute(method: string, pathname: string): Route {
   if (pathname === "/api/health") {
     return verb === "GET" ? { kind: "health" } : { kind: "methodNotAllowed", allow: "GET" };
   }
+  if (pathname === "/api/summary") {
+    return verb === "GET" ? { kind: "summary" } : { kind: "methodNotAllowed", allow: "GET" };
+  }
+  if (pathname === "/api/diff") {
+    // The from/to snapshot ids live in the query string (parsed + validated by the handler).
+    return verb === "GET" ? { kind: "diffImage" } : { kind: "methodNotAllowed", allow: "GET" };
+  }
   if (pathname === "/api/components") {
     return verb === "GET" ? { kind: "components" } : { kind: "methodNotAllowed", allow: "GET" };
   }
@@ -208,8 +219,8 @@ export function matchRoute(method: string, pathname: string): Route {
     return verb === "POST" ? { kind: "sync" } : { kind: "methodNotAllowed", allow: "POST" };
   }
 
-  // /api/components/:id[/history|/variants]
-  const comp = /^\/api\/components\/([^/]+)(?:\/(history|variants))?$/.exec(pathname);
+  // /api/components/:id[/history|/variants|/regressions]
+  const comp = /^\/api\/components\/([^/]+)(?:\/(history|variants|regressions))?$/.exec(pathname);
   if (comp) {
     const id = parseId(comp[1] ?? "");
     if (id === null) {
@@ -224,15 +235,22 @@ export function matchRoute(method: string, pathname: string): Route {
     if (comp[2] === "variants") {
       return { kind: "componentVariants", id };
     }
+    if (comp[2] === "regressions") {
+      return { kind: "componentRegressions", id };
+    }
     return { kind: "component", id };
   }
 
-  // /api/snapshots/:id[/image]
-  const snap = /^\/api\/snapshots\/([^/]+)(?:\/(image))?$/.exec(pathname);
+  // /api/snapshots/:id[/image|/approve]
+  const snap = /^\/api\/snapshots\/([^/]+)(?:\/(image|approve))?$/.exec(pathname);
   if (snap) {
     const id = parseId(snap[1] ?? "");
     if (id === null) {
       return { kind: "notFound" };
+    }
+    // /approve is the one mutating snapshot route → POST; everything else under /snapshots is GET.
+    if (snap[2] === "approve") {
+      return verb === "POST" ? { kind: "snapshotApprove", id } : { kind: "methodNotAllowed", allow: "POST" };
     }
     if (verb !== "GET") {
       return { kind: "methodNotAllowed", allow: "GET" };

@@ -99,6 +99,7 @@ describe("the P3 server serves the committed SPA", () => {
     server = createStudioServer({
       db,
       projectRoot: process.cwd(),
+      baselineDir: ".visual-baselines",
       publicDir: PUBLIC,
       schemaVersion: SCHEMA_VERSION,
       onSync: async () => ({}),
@@ -133,6 +134,7 @@ describe("the P3 server serves the committed SPA", () => {
     const srv = createStudioServer({
       db,
       projectRoot: process.cwd(),
+      baselineDir: ".visual-baselines",
       publicDir: PUBLIC,
       schemaVersion: SCHEMA_VERSION,
       onSync: async () => ({}),
@@ -154,6 +156,7 @@ describe("the P3 server serves the committed SPA", () => {
     const srv = createStudioServer({
       db,
       projectRoot: process.cwd(),
+      baselineDir: ".visual-baselines",
       publicDir: PUBLIC,
       schemaVersion: SCHEMA_VERSION,
       frameOrigins: ["http://localhost:61000"],

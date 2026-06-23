@@ -7,7 +7,7 @@ import { loadConfig } from "../lib/config";
 import { ensureBrowsersPath } from "../lib/browsers-path";
 import { captureAll } from "../capture";
 import { openDb, SCHEMA_VERSION } from "../lib/studio/db";
-import { studioDbPath, DEFAULT_OUT_ROOT } from "../lib/studio/keys";
+import { studioDbPath, diffsDir, DEFAULT_OUT_ROOT } from "../lib/studio/keys";
 import {
   decidePidfileAction,
   formatPidfile,
@@ -87,6 +87,30 @@ export function parseArgs(argv: string[]): ServeCliArgs {
   return { config, outRoot, port, open };
 }
 
+/**
+ * Probe a candidate existing studio for liveness BEFORE reusing it. `decidePidfileAction` only proves the
+ * recorded pid is alive — but a recycled PID could be an unrelated process, which would make the launcher
+ * open a dead URL. A quick `GET /api/health` confirms it's actually our studio on the same schema; on any
+ * failure (timeout, non-OK, recycled PID, schema mismatch) we fall through and start fresh. Loopback +
+ * short timeout, so this never hangs the launch.
+ */
+async function probeStudioHealth(url: string, expectedSchema: number): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1500);
+  try {
+    const res = await fetch(new URL("api/health", url), { signal: controller.signal });
+    if (!res.ok) {
+      return false;
+    }
+    const body = (await res.json()) as { status?: unknown; schemaVersion?: unknown };
+    return body.status === "ok" && body.schemaVersion === expectedSchema;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Spawn the platform browser-open command, fully detached so it never blocks server shutdown. */
 function openBrowser(url: string): void {
   const { cmd, args } = browserOpenCommand(process.platform, url);
@@ -114,11 +138,16 @@ async function main(argv: string[]): Promise<void> {
     ? parsePidfile(readFileSync(pidfilePath, "utf8"))
     : null;
   if (decidePidfileAction(existing, isPidAlive) === "reuse" && existing !== null) {
-    if (args.open) {
-      openBrowser(existing.url);
+    // The pid is alive — but confirm it's actually our studio (not a recycled PID) before reusing it.
+    if (await probeStudioHealth(existing.url, SCHEMA_VERSION)) {
+      if (args.open) {
+        openBrowser(existing.url);
+      }
+      console.log(JSON.stringify({ reused: true, ...existing }));
+      return;
     }
-    console.log(JSON.stringify({ reused: true, ...existing }));
-    return;
+    // Alive pid but not a healthy same-schema studio (recycled PID / crashed instance) → start fresh,
+    // overwriting the stale pidfile below.
   }
 
   const dbPath = studioDbPath(args.outRoot);
@@ -144,6 +173,11 @@ async function main(argv: string[]): Promise<void> {
   const server = createStudioServer({
     db,
     projectRoot: process.cwd(),
+    baselineDir,
+    // On-demand pixel-diff overlays (GET /api/diff): same sensitivity as the engine gate, cached under
+    // the gitignored .visual-guard/cache/diffs/ (content-addressed; best-effort).
+    diffThreshold: config.threshold,
+    diffCacheDir: join(process.cwd(), diffsDir(args.outRoot)),
     publicDir: PUBLIC_DIR,
     schemaVersion: SCHEMA_VERSION,
     storybookBaseUrl: storybookTarget ? storybookTarget.url : null,

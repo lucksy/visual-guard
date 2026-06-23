@@ -1,8 +1,11 @@
-import { createReadStream, statSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
+import { diffImages } from "../lib/diff";
 import type { DB } from "../lib/studio/db";
 import {
+  componentRegressions,
   componentTimeline,
   componentUsages,
   componentVariants,
@@ -10,11 +13,15 @@ import {
   countSnapshots,
   getComponentById,
   getSnapshotById,
+  latestRegression,
   latestSnapshotForSource,
   listComponentsWithThumbs,
+  summaryCounts,
   type ComponentStatus,
+  type RegressionAxis,
   type SnapshotSource,
 } from "../lib/studio/store";
+import { approveSnapshotAsBaseline } from "../lib/studio/approve";
 import {
   contentTypeFor,
   cspWithFrameSources,
@@ -34,9 +41,11 @@ import { resolveServableImage } from "../lib/studio/images";
  * an un-listened `http.Server` so it is integration-testable over a seeded temp DB (`serve.ts` adds the
  * loopback listen, pidfile, signals, and browser open).
  *
- * Read-mostly. The single mutating route, `POST /api/sync`, re-runs the **code** capture via an injected
- * `onSync` (the engine — agent-free); Figma capture stays in the `/visual-sync` MCP workflow. Concurrent
- * syncs are rejected with 409 (single-flight). Every response carries the same-origin CSP (SPEC §10).
+ * Read-mostly. Two mutating routes, both CSRF-guarded (Sec-Fetch-Site / Origin): `POST /api/sync` re-runs
+ * the **code** capture via an injected `onSync` (the engine — agent-free; concurrent syncs are 409'd,
+ * single-flight), and `POST /api/snapshots/:id/approve` (P6) promotes a captured render to the committed
+ * code baseline. Figma capture stays in the `/visual-sync` MCP workflow. Every response carries the
+ * same-origin CSP (SPEC §10).
  */
 
 const STATUSES: ReadonlySet<string> = new Set([
@@ -59,6 +68,13 @@ export interface StudioServerOptions {
   db: DB;
   /** Project root for resolving repo-relative image paths (the path-traversal boundary). */
   projectRoot: string;
+  /** Committed baseline dir (config.baselineDir) — the confined write target for "approve as baseline". */
+  baselineDir: string;
+  /** pixelmatch sensitivity for the on-demand `/api/diff` overlay (config.threshold). Default 0.1. */
+  diffThreshold?: number;
+  /** Absolute dir to cache generated diff overlays under (content-addressed). Omit to skip the disk cache
+   *  (the strong ETag still makes a browser re-request a 304). */
+  diffCacheDir?: string;
   /** Directory of the prebuilt SPA (`scripts/studio/public`, P4). May not exist yet → built-in shell. */
   publicDir: string;
   /** Schema version surfaced by `/api/health` (from `db.ts` `SCHEMA_VERSION`). */
@@ -156,7 +172,147 @@ function handleComponentDetail(res: ServerResponse, db: DB, id: number): void {
       code: latestSnapshotForSource(db, id, "code") ?? null,
       current: latestSnapshotForSource(db, id, "current") ?? null,
     },
+    // The latest comparison per axis — the data the engine already computes but P4 never surfaced: the
+    // code pixel-diff magnitude + the advisory figma↔code conformance breakdown (dimension vs palette).
+    comparisons: {
+      code: latestRegression(db, id, "current_vs_baseline") ?? null,
+      parity: latestRegression(db, id, "figma_vs_code") ?? null,
+    },
   });
+}
+
+const REGRESSION_AXES: ReadonlySet<string> = new Set(["current_vs_baseline", "figma_vs_code"]);
+/** Cap on regression-history rows returned (the sparkline never needs more). */
+const REGRESSIONS_LIMIT = 100;
+
+function handleRegressions(req: IncomingMessage, res: ServerResponse, db: DB, id: number): void {
+  if (getComponentById(db, id) === undefined) {
+    sendError(res, 404, "not_found", `no component with id ${id}.`);
+    return;
+  }
+  const axisParam = new URL(req.url ?? "/", "http://localhost").searchParams.get("axis");
+  if (axisParam !== null && !REGRESSION_AXES.has(axisParam)) {
+    sendError(res, 400, "bad_request", `axis must be current_vs_baseline|figma_vs_code (got ${axisParam}).`);
+    return;
+  }
+  const axis = (axisParam as RegressionAxis | null) ?? "current_vs_baseline";
+  sendJson(res, 200, { axis, regressions: componentRegressions(db, id, axis, REGRESSIONS_LIMIT) });
+}
+
+/** Map an `approveSnapshotAsBaseline` failure code to an HTTP status. */
+const APPROVE_STATUS: Readonly<Record<string, number>> = Object.freeze({
+  not_found: 404,
+  not_approvable: 409,
+  image_unavailable: 404,
+  bad_request: 400,
+  forbidden: 403,
+});
+
+function handleApprove(res: ServerResponse, opts: StudioServerOptions, id: number): void {
+  let result: ReturnType<typeof approveSnapshotAsBaseline>;
+  try {
+    result = approveSnapshotAsBaseline({
+      db: opts.db,
+      projectRoot: opts.projectRoot,
+      baselineDir: opts.baselineDir,
+      snapshotId: id,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[visual-studio] approve failed: ${message}`);
+    sendError(res, 500, "approve_failed", message);
+    return;
+  }
+  if (!result.ok) {
+    sendError(res, APPROVE_STATUS[result.code] ?? 400, result.code, result.message);
+    return;
+  }
+  sendJson(res, 200, result);
+}
+
+/** Parse a query value as a positive integer snapshot id, or null. */
+function parsePositiveIntParam(v: string | null): number | null {
+  if (v === null || !/^[0-9]+$/.test(v)) {
+    return null;
+  }
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * Stream the engine's pixel-diff overlay (changed pixels marked red over a grayscale base — `diff.ts`)
+ * between two snapshots given by `?from=&to=`. Deterministic for a (fromHash, toHash, threshold) triple,
+ * so it carries a strong immutable ETag and is cached content-addressed under `diffCacheDir` (best-effort).
+ * Both source images go through the same path-confinement (`resolveServableImage`) as the raw image route.
+ */
+async function handleDiffImage(req: IncomingMessage, res: ServerResponse, opts: StudioServerOptions): Promise<void> {
+  const params = new URL(req.url ?? "/", "http://localhost").searchParams;
+  const fromId = parsePositiveIntParam(params.get("from"));
+  const toId = parsePositiveIntParam(params.get("to"));
+  if (fromId === null || toId === null) {
+    sendError(res, 400, "bad_request", "from and to must be positive snapshot ids.");
+    return;
+  }
+  const from = getSnapshotById(opts.db, fromId);
+  const to = getSnapshotById(opts.db, toId);
+  if (from === undefined || to === undefined) {
+    sendError(res, 404, "not_found", "one or both snapshots do not exist.");
+    return;
+  }
+  const threshold = opts.diffThreshold ?? 0.1;
+  // The diff is fully determined by the two content hashes + the threshold → content-address it.
+  const cacheKey = createHash("sha256")
+    .update(`${from.image_hash}:${to.image_hash}:${threshold}:v1`)
+    .digest("hex");
+  const etag = `"${cacheKey}"`;
+  applySecurityHeaders(res);
+  if (req.headers["if-none-match"] === etag) {
+    res.statusCode = 304;
+    res.setHeader("ETag", etag);
+    res.end();
+    return;
+  }
+
+  const cachePath = opts.diffCacheDir ? join(opts.diffCacheDir, `${cacheKey}.png`) : null;
+  let bytes: Buffer | undefined;
+  if (cachePath !== null && existsSync(cachePath)) {
+    try {
+      bytes = readFileSync(cachePath);
+    } catch {
+      bytes = undefined; // a torn cache file — fall through and recompute
+    }
+  }
+  if (bytes === undefined) {
+    const fromAbs = resolveServableImage(opts.projectRoot, from.image_path);
+    const toAbs = resolveServableImage(opts.projectRoot, to.image_path);
+    if (fromAbs === null || toAbs === null) {
+      sendError(res, 404, "image_unavailable", "a source image is missing or out of bounds.");
+      return;
+    }
+    try {
+      const result = await diffImages(readFileSync(fromAbs), readFileSync(toAbs), threshold);
+      bytes = result.diffImage;
+    } catch (err) {
+      sendError(res, 500, "diff_failed", err instanceof Error ? err.message : String(err));
+      return;
+    }
+    if (cachePath !== null && opts.diffCacheDir !== undefined) {
+      try {
+        mkdirSync(opts.diffCacheDir, { recursive: true });
+        writeFileSync(cachePath, bytes);
+      } catch {
+        /* the disk cache is best-effort — serving the freshly-computed bytes still works */
+      }
+    }
+  }
+
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "image/png");
+  res.setHeader("Content-Length", String(bytes.byteLength));
+  res.setHeader("ETag", etag);
+  // Deterministic for the (from, to, threshold) triple — safe to cache immutably.
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  res.end(bytes);
 }
 
 function handleHistory(req: IncomingMessage, res: ServerResponse, db: DB, id: number): void {
@@ -286,6 +442,12 @@ function makeHandler(opts: StudioServerOptions): (req: IncomingMessage, res: Ser
           counts: { components: countComponents(db), snapshots: countSnapshots(db) },
         });
         return;
+      case "summary":
+        sendJson(res, 200, { summary: summaryCounts(db) });
+        return;
+      case "diffImage":
+        await handleDiffImage(req, res, opts);
+        return;
       case "components": {
         const params = new URL(req.url ?? "/", "http://localhost").searchParams;
         const status = params.get("status");
@@ -312,6 +474,9 @@ function makeHandler(opts: StudioServerOptions): (req: IncomingMessage, res: Ser
       case "componentHistory":
         handleHistory(req, res, db, route.id);
         return;
+      case "componentRegressions":
+        handleRegressions(req, res, db, route.id);
+        return;
       case "componentVariants": {
         if (getComponentById(db, route.id) === undefined) {
           sendError(res, 404, "not_found", `no component with id ${route.id}.`);
@@ -332,6 +497,16 @@ function makeHandler(opts: StudioServerOptions): (req: IncomingMessage, res: Ser
       case "snapshotImage":
         handleSnapshotImage(req, res, opts, route.id);
         return;
+      case "snapshotApprove": {
+        // Approve writes a committed baseline PNG — the studio's second mutating capability. Guard it
+        // with the SAME CSRF defense as POST /api/sync so a cross-site page can never promote a baseline.
+        if (!isAllowedMutationOrigin(headerStr(req, "sec-fetch-site"), headerStr(req, "origin"))) {
+          sendError(res, 403, "forbidden", "cross-origin approve is not allowed.");
+          return;
+        }
+        handleApprove(res, opts, route.id);
+        return;
+      }
       case "sync": {
         // CSRF defense for the one mutating route: a cross-site request must not be able to drive the
         // engine. Reject anything not provably same-origin (Sec-Fetch-Site / Origin) before running.

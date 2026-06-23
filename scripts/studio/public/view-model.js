@@ -66,13 +66,20 @@ export function countByBadge(components) {
 
 // --- Filter + sort (SPEC §11.2) --------------------------------------------
 
-/** Filter by a case-insensitive name/key substring and/or a derived badge key (`all` = no badge filter). */
+/**
+ * Filter by a case-insensitive substring over name + key + description and/or a derived badge key
+ * (`all` = no badge filter). The search corpus is broadened past name/key (P6) so a user can find a
+ * component by what its description says (e.g. "checkout", "deprecated") — descriptions already render on
+ * the card, so this just searches what's shown.
+ */
 export function filterComponents(components, options = {}) {
   let out = components;
   const q = options.q;
   if (q) {
     const needle = q.toLowerCase();
-    out = out.filter((c) => `${c.name} ${c.key}`.toLowerCase().includes(needle));
+    out = out.filter((c) =>
+      `${c.name} ${c.key} ${c.description || ""}`.toLowerCase().includes(needle),
+    );
   }
   const badge = options.badge;
   if (badge && badge !== "all") {
@@ -262,4 +269,83 @@ export function storyLink(baseUrl, storyId) {
     return null;
   }
   return `${String(baseUrl).replace(/\/$/, "")}/?path=/story/${encodeURIComponent(storyId)}`;
+}
+
+// --- Diff & comparison (P6) ------------------------------------------------
+
+/**
+ * Format a 0..1 diff ratio as a percentage string ("1.23%"), or null when there's no numeric ratio (a
+ * `new`/`error` comparison records NULL). Two decimals — sub-percent pixel deltas are the common case.
+ */
+export function formatDiffRatio(ratio) {
+  if (typeof ratio !== "number" || Number.isNaN(ratio)) {
+    return null;
+  }
+  return `${(ratio * 100).toFixed(2)}%`;
+}
+
+/**
+ * Map a regression-history array (newest-first, as the API returns it) to an oldest→newest series for the
+ * drift sparkline: `{ ratio, status, at }` per point, ratio coerced to a finite number (NULL → 0). Pure.
+ */
+export function regressionSeries(regressions) {
+  return [...(regressions || [])]
+    .reverse()
+    .map((r) => ({
+      ratio: typeof r.diff_ratio === "number" && !Number.isNaN(r.diff_ratio) ? r.diff_ratio : 0,
+      status: r.status,
+      at: r.computed_at || null,
+    }));
+}
+
+/**
+ * Build an SVG `<polyline>` `points` string for a drift sparkline from a numeric series (0..1 ratios),
+ * scaled into a `width`×`height` box (y inverted so higher diff = higher line). The series is normalized
+ * to its own max (a flat-but-nonzero series still reads as a line near the top, not a baseline). Returns
+ * "" for an empty series and a single centered point for one sample. Pure + unit-tested.
+ */
+export function sparklinePath(values, width, height) {
+  const xs = (values || []).map((v) =>
+    typeof v === "number" && !Number.isNaN(v) ? Math.max(0, v) : 0,
+  );
+  if (xs.length === 0) {
+    return "";
+  }
+  const w = width > 0 ? width : 100;
+  const h = height > 0 ? height : 24;
+  const max = Math.max(...xs, 0);
+  const y = (v) => (max <= 0 ? h : h - (v / max) * h);
+  if (xs.length === 1) {
+    return `0,${y(xs[0]).toFixed(2)} ${w},${y(xs[0]).toFixed(2)}`;
+  }
+  const step = w / (xs.length - 1);
+  return xs.map((v, i) => `${(i * step).toFixed(2)},${y(v).toFixed(2)}`).join(" ");
+}
+
+/**
+ * Describe the advisory figma↔code conformance breakdown (dimension vs palette delta) in plain words for
+ * the Overlay caption — so a "Changed" parity badge says WHICH axis drifted. Both deltas are 0..1;
+ * null/absent (a code-axis comparison, or a pre-v4 row) yields null. Pure + unit-tested.
+ */
+export function describeParityDrift(dimensionDelta, paletteDelta) {
+  const dim = typeof dimensionDelta === "number" && !Number.isNaN(dimensionDelta) ? dimensionDelta : null;
+  const pal = typeof paletteDelta === "number" && !Number.isNaN(paletteDelta) ? paletteDelta : null;
+  if (dim === null && pal === null) {
+    return null;
+  }
+  const d = dim ?? 0;
+  const p = pal ?? 0;
+  const NOISE = 0.06; // below the "minor" conformance threshold — treat as aligned on that axis
+  const dimDrift = d > NOISE;
+  const palDrift = p > NOISE;
+  if (!dimDrift && !palDrift) {
+    return "aligned with the design (size and color within tolerance)";
+  }
+  if (dimDrift && palDrift) {
+    return "size and color both drift from the design";
+  }
+  if (dimDrift) {
+    return "size drifts from the design (color is aligned)";
+  }
+  return "color drifts from the design (size is aligned)";
 }

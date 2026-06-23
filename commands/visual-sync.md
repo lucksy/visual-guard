@@ -5,13 +5,15 @@ argument-hint: "[target]"
 
 # /visual-sync — populate the studio (code = engine · Figma = MCP)
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 Run Component Studio's dual sync now. This command does the **engine + Figma-MCP preflight**, then
 launches the bundled **visual-sync** dynamic workflow (the orchestration lives in
 `skills/visual-sync/`). The optional `$ARGUMENTS` is a `--target` filter (a component name, an
 instance label, or `instance/name`) that narrows the code capture. **No token** is involved — Figma
 is read through the desktop app's MCP; only non-secret ids/names/paths/images are stored, under your repo.
 
-## Show this first — banner + plan
+## Show this first — the banner
 
 Open your response with this banner, **printed verbatim in a code block**, before any tool call:
 
@@ -27,13 +29,7 @@ Open your response with this banner, **printed verbatim in a code block**, befor
          ▀██▀
 ```
 
-Then lay out the plan in plain language, so the user knows what's coming before anything runs:
-
-- **1 · Preflight** — engine + Figma-desktop-MCP check (no token, ever)
-- **2 · Capture** — code via the headless engine, Figma via the desktop MCP
-- **3 · Index** — build the studio DB (idempotent; leaves components figma-pending if Figma is closed)
-
-**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/3 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+Then go straight to work — no upfront plan and no numbered step list. Before each action, print one short line of what it is doing and whether it only reads or also changes things, then run it. Keep the running output to those short progress lines plus the final result, as the Output style note above describes.
 
 ## 0. Preflight
 
@@ -49,9 +45,10 @@ Then lay out the plan in plain language, so the user knows what's coming before 
   (AskUserQuestion: *what* / *why* / *where* / *size ~150 MB*); on **Install now** run
   `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue on exit `0`; on **Not now** stop.
 - **Native health — code sync loads SQLite (`better-sqlite3`).** If `.installed` is true but `.healthy`
-  is **false** (`.brokenNatives` lists the broken addons), run
-  `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to repair the bindings in place, then continue
-  (if `brokenNatives` is still non-empty afterward, relay it and **stop** — sync would crash otherwise).
+  is **false** (`.brokenNatives` lists the broken addons), run the exact command in **`.repair`** (the
+  sanctioned in-place self-heal — do **NOT** improvise a manual `npm rebuild` in a guessed directory),
+  then continue. If still unhealthy — or `.systemSupported` is **false** — relay `.reason` and **stop**
+  (sync would crash otherwise).
 - **Figma-MCP availability (advisory, never blocking).** Probe the desktop app: call
   **`mcp__figma-desktop__get_metadata`** with no node id. If it lists pages/a selection → Figma is
   ready. If it errors that the server/file is unavailable → tell the user *"Open your Figma file in the

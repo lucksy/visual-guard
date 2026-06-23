@@ -6,6 +6,8 @@ argument-hint: "[target]"
 
 # /visual-sync — populate the studio (code = engine · Figma = MCP workflow)
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 This skill orchestrates Component Studio's sync as a **dynamic workflow**. Plugins can't bundle a
 workflow directly, so it ships the orchestration as a **script template** (`workflow.template.js`,
 next to this file) and launches it for you with the Workflow tool. **Code capture is the headless
@@ -31,9 +33,10 @@ lives in the desktop app; only non-secret ids/names/paths/images are stored, all
   `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once it exits `0`; on **Not
   now** → **stop**. When `$STATE.installed` is true, continue — but if `$STATE.healthy` is **false**
   (`$STATE.brokenNatives` lists the broken addons), the engine's native bindings (the studio loads
-  `better-sqlite3`) didn't load; run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to repair
-  them in place, then continue (if `brokenNatives` is still non-empty afterward, relay it and **stop** —
-  the code sync would otherwise crash with `ERR_DLOPEN_FAILED`).
+  `better-sqlite3`) didn't load; run the exact command in **`$STATE.repair`** (the sanctioned in-place
+  self-heal — do **NOT** improvise a manual `npm rebuild`), then continue. If still unhealthy — or
+  `$STATE.systemSupported` is **false** — relay `$STATE.reason` and **stop** (the code sync would
+  otherwise crash with `ERR_DLOPEN_FAILED`).
 - **Figma is optional.** The workflow itself probes the Figma desktop MCP and, if it's unavailable,
   syncs code and leaves Figma-linked components `figma-pending` — never a hard failure. Code-only
   projects (no `figma` in config) sync fully with no Figma at all.

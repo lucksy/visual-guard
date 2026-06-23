@@ -5,6 +5,8 @@ argument-hint: ""
 
 # /visual-setup — install the engine, with consent
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 Get Visual Guard's engine ready to run. The engine (a few runtime packages plus a pinned Chromium,
 ~150MB) normally installs itself on the **first session** via the `SessionStart` hook. But if you
 added the plugin **mid-session**, that hook never ran, so `/visual-check` and friends will report the
@@ -14,7 +16,7 @@ would be installed (what / why / where / size), **asks** for your approval, and 
 Use the **AskUserQuestion** tool for the approval gate. This command installs **only** into the
 plugin's own data dir — never your project — and sends nothing external.
 
-## Show this first — banner + plan
+## Show this first — the banner
 
 Open your response with this banner, **printed verbatim in a code block**, before any tool call:
 
@@ -30,13 +32,7 @@ Open your response with this banner, **printed verbatim in a code block**, befor
          ▀██▀
 ```
 
-Then lay out the plan in plain language, so the user knows what's coming before anything runs:
-
-- **1 · Detect** — check what's already installed (read-only)
-- **2 · Explain** — show exactly what would download: what · why · where · ~150 MB
-- **3 · Install** — only after you approve, into the plugin's data dir (never your project)
-
-**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/3 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+Then go straight to work — no upfront plan and no numbered step list. Before each action, print one short line of what it is doing and whether it only reads or also changes things, then run it. Keep the running output to those short progress lines plus the final result, as the Output style note above describes.
 
 ## 0. Preflight
 

@@ -46,9 +46,25 @@ export function getHistory(id, source) {
   return getJson(`/api/components/${id}/history${q}`).then((b) => b.history);
 }
 
+/** GET /api/components/:id/regressions(?axis=) → regression[] (newest-first), for the drift sparkline. */
+export function getRegressions(id, axis) {
+  const q = axis ? `?axis=${encodeURIComponent(axis)}` : "";
+  return getJson(`/api/components/${id}/regressions${q}`).then((b) => b.regressions);
+}
+
+/** GET /api/summary → { total, byStatus, bySyncState, presence } — the cheap rollup for the header. */
+export function getSummary() {
+  return getJson("/api/summary").then((b) => b.summary);
+}
+
 /** The same-origin image URL for a snapshot (immutable; safe in <img src>). */
 export function imageUrl(snapshotId) {
   return `/api/snapshots/${snapshotId}/image`;
+}
+
+/** Same-origin URL for the engine's pixel-diff overlay between two snapshots (changed pixels in red). */
+export function diffImageUrl(fromId, toId) {
+  return `/api/diff?from=${encodeURIComponent(fromId)}&to=${encodeURIComponent(toId)}`;
 }
 
 /**
@@ -64,6 +80,24 @@ export async function postSync() {
   if (!res.ok) {
     const err = body && body.error ? body.error : {};
     throw new ApiError(res.status, err.code || "error", err.message || `sync failed (${res.status})`);
+  }
+  return body;
+}
+
+/**
+ * POST /api/snapshots/:id/approve → promote a captured render to the committed code baseline (the durable
+ * sign-off). Same-origin, so the server's CSRF guard admits it; failures throw an ApiError carrying the
+ * contract's code/message (e.g. `not_approvable` for a Figma snapshot).
+ */
+export async function approveSnapshot(snapshotId) {
+  const res = await fetch(`/api/snapshots/${snapshotId}/approve`, {
+    method: "POST",
+    headers: { "X-Requested-By": "visual-studio" },
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = body && body.error ? body.error : {};
+    throw new ApiError(res.status, err.code || "error", err.message || `approve failed (${res.status})`);
   }
   return body;
 }

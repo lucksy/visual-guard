@@ -62,6 +62,37 @@ describe("matchRoute — API table", () => {
     expect(matchRoute("get", "/api/health")).toEqual({ kind: "health" });
     expect(matchRoute("post", "/api/sync")).toEqual({ kind: "sync" });
   });
+
+  it("routes the P6 endpoints (summary, diff, regressions, approve) with the right verbs", () => {
+    expect(matchRoute("GET", "/api/summary")).toEqual({ kind: "summary" });
+    expect(matchRoute("POST", "/api/summary")).toEqual({ kind: "methodNotAllowed", allow: "GET" });
+
+    // /api/diff takes from/to in the query string, so the route carries no id.
+    expect(matchRoute("GET", "/api/diff")).toEqual({ kind: "diffImage" });
+    expect(matchRoute("POST", "/api/diff")).toEqual({ kind: "methodNotAllowed", allow: "GET" });
+
+    expect(matchRoute("GET", "/api/components/42/regressions")).toEqual({
+      kind: "componentRegressions",
+      id: 42,
+    });
+    expect(matchRoute("POST", "/api/components/42/regressions")).toEqual({
+      kind: "methodNotAllowed",
+      allow: "GET",
+    });
+
+    // /approve is the one POST under /snapshots; GET on it is 405 (allow POST).
+    expect(matchRoute("POST", "/api/snapshots/7/approve")).toEqual({ kind: "snapshotApprove", id: 7 });
+    expect(matchRoute("GET", "/api/snapshots/7/approve")).toEqual({
+      kind: "methodNotAllowed",
+      allow: "POST",
+    });
+    // The image sub-route stays GET-only — a POST to it is 405 (allow GET), NOT mistaken for approve.
+    expect(matchRoute("POST", "/api/snapshots/7/image")).toEqual({
+      kind: "methodNotAllowed",
+      allow: "GET",
+    });
+    expect(matchRoute("GET", "/api/snapshots/abc/approve")).toEqual({ kind: "notFound" });
+  });
 });
 
 describe("resolveStaticAsset — URL traversal guard + SPA fallback", () => {

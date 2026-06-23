@@ -17,6 +17,7 @@ export interface Badge {
 export interface ComponentLike {
   name: string;
   key: string;
+  description?: string | null;
   figma_file_key?: string | null;
   figma_node_id?: string | null;
   code_instance?: string | null;
@@ -24,6 +25,19 @@ export interface ComponentLike {
   status?: string | null;
   parity_status?: string | null;
   updated_at?: string | null;
+}
+
+/** The subset of a `regressions` row the view-model reads (mirrors store.ts `RegressionRow`). */
+export interface RegressionLike {
+  diff_ratio?: number | null;
+  status?: string | null;
+  computed_at?: string | null;
+}
+
+export interface RegressionSeriesPoint {
+  ratio: number;
+  status: string | null | undefined;
+  at: string | null;
 }
 
 export interface VariantLike {
@@ -71,6 +85,17 @@ export function filterComponents(
   components: ComponentLike[],
   options?: { q?: string; badge?: string },
 ): ComponentLike[];
+export function formatDiffRatio(ratio: number | null | undefined): string | null;
+export function regressionSeries(regressions: RegressionLike[] | null | undefined): RegressionSeriesPoint[];
+export function sparklinePath(
+  values: Array<number | null | undefined>,
+  width: number,
+  height: number,
+): string;
+export function describeParityDrift(
+  dimensionDelta: number | null | undefined,
+  paletteDelta: number | null | undefined,
+): string | null;
 export function sortComponents(
   components: ComponentLike[],
   mode?: "urgency" | "name" | "recent",

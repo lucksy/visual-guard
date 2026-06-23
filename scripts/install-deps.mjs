@@ -102,6 +102,42 @@ export function detectLibc(proc = process) {
   }
 }
 
+/** The Node major the engine requires (SPEC §Runtime + package.json `engines`). */
+export const NODE_MAJOR_FLOOR = 20;
+
+/**
+ * Up-front "is this system supported?" check — the high-confidence, USER-ACTIONABLE preconditions that
+ * a fresh install/repair cannot fix on its own. Right now that's the Node version floor: the native
+ * addons (better-sqlite3, sharp) ship prebuilt binaries only for supported Node majors, so on Node < 20
+ * a rebuild can't help — the user must upgrade Node. Returns `{ supported, issues[] }`.
+ *
+ * Deliberately conservative: platform/arch/libc support is NOT hard-checked here (the actual load-test
+ * in {@link verifyNativeModules} is the real arbiter, and false-blocking a working-but-uncommon arch
+ * would be worse than letting the load-test decide). Those surface in the repair-failure diagnosis.
+ */
+export function systemSupport(proc = process) {
+  const issues = [];
+  const major = Number(String(proc.versions.node).split(".")[0]);
+  if (Number.isFinite(major) && major < NODE_MAJOR_FLOOR) {
+    issues.push(
+      `Node ${proc.versions.node} is below the required Node ${NODE_MAJOR_FLOOR}+. The engine's native ` +
+        `bindings have no prebuilt for this Node — upgrade to Node ${NODE_MAJOR_FLOOR}+ and start a fresh session.`,
+    );
+  }
+  return { supported: issues.length === 0, issues };
+}
+
+/**
+ * The ONE sanctioned self-heal command. When a native binding is broken, agents must run THIS (which
+ * repairs the RUNTIME tree — `${pluginRoot}/node_modules` — in place) rather than improvise a raw
+ * `npm rebuild` in a guessed directory: rebuilding the wrong tree (data dir vs the bridged/real plugin
+ * tree the scripts actually load) is precisely what produced the split-brain. Emitted in `--check`
+ * output as `repair` so every consumer is handed the correct command.
+ */
+export function repairCommand() {
+  return `node ${JSON.stringify(join(pluginRoot, "scripts", "install-deps.mjs"))}`;
+}
+
 /**
  * Fingerprint of the runtime the native addons must match. better-sqlite3's prebuilt binary is keyed
  * by Node's ABI (`process.versions.modules`); both addons select platform/arch/libc-specific binaries
@@ -269,6 +305,12 @@ async function rebuildFromSource(mod, treeDir, env, npm) {
 /** Per-addon guidance when repair couldn't make a binding load (sharp ≠ a compiler problem). */
 function nativeFailureMessage(failed) {
   const parts = [`Native bindings failed to load after repair: ${failed.join(", ")}.`];
+  // Lead with the high-confidence, user-actionable cause when the SYSTEM itself is unsupported (e.g.
+  // Node too old) — no rebuild can fix that, so say so before suggesting a compiler/network check.
+  const sys = systemSupport();
+  if (!sys.supported) {
+    parts.push(...sys.issues);
+  }
   if (failed.includes("sharp")) {
     parts.push(
       "sharp's platform package (@img/sharp-…) could not be installed — check network access, that " +
@@ -573,7 +615,7 @@ export function runStep(label, command, args, opts) {
     child.on("error", (err) => finish(rejectStep, err));
     child.on("close", (code) => {
       if (code === 0) {
-        process.stderr.write(`[visual-guard]   ✓ done (${elapsed()}s)\n`);
+        process.stderr.write(`[visual-guard]   done (${elapsed()}s)\n`);
         finish(resolveStep, undefined);
       } else {
         finish(rejectStep, new Error(`${command} exited with code ${code}`));
@@ -693,6 +735,8 @@ async function main() {
 
   if (checkOnly) {
     // STDOUT (not stderr): the consent gate parses this. No install, no bridge, no fs writes.
+    const sys = systemSupport();
+    const repair = repairCommand();
     if (dataDir === null) {
       process.stdout.write(
         JSON.stringify({
@@ -700,6 +744,9 @@ async function main() {
           installed: false,
           healthy: false,
           brokenNatives: [],
+          systemSupported: sys.supported,
+          systemIssues: sys.issues,
+          repair,
           depsPresent: false,
           browserPresent: false,
           markerMatches: false,
@@ -716,11 +763,33 @@ async function main() {
     const state = computeInstallState(dataDir);
     // computeInstallState is pure fs-existence; on its own it reported installed:true while the engine
     // was actually unloadable. Additionally LOAD-TEST the runtime tree (`${pluginRoot}/node_modules` —
-    // what the scripts resolve) and surface `healthy` / `brokenNatives`, so a command's preflight can
-    // self-repair (`node install-deps.mjs`) or fail with guidance instead of crashing mid-run.
+    // what the scripts resolve) and surface `healthy` / `brokenNatives`, plus `systemSupported` and the
+    // exact `repair` command, so a command's preflight can self-repair (run `repair`) or fail with a
+    // user-actionable reason instead of crashing mid-run or improvising a wrong-tree `npm rebuild`.
     const brokenNatives = state.installed ? verifyNativeModules(pluginRoot, process.env) : [];
     const healthy = state.installed && brokenNatives.length === 0;
-    process.stdout.write(JSON.stringify({ ...state, healthy, brokenNatives }) + "\n");
+    // A single human-readable reason the agent can relay: system-unsupported wins (no rebuild fixes it),
+    // else the broken-native explanation pointing at the repair command.
+    let reason;
+    if (!sys.supported) {
+      reason = sys.issues.join(" ");
+    } else if (state.installed && !healthy) {
+      reason =
+        `The engine's native bindings (${brokenNatives.join(", ")}) did not load for this runtime ` +
+        `(Node ${process.version}, ${process.platform}/${process.arch}). Run \`${repair}\` to rebuild ` +
+        `them in place (it repairs the tree the scripts load — do NOT npm rebuild a guessed directory).`;
+    }
+    process.stdout.write(
+      JSON.stringify({
+        ...state,
+        healthy,
+        brokenNatives,
+        systemSupported: sys.supported,
+        systemIssues: sys.issues,
+        repair,
+        ...(reason ? { reason } : {}),
+      }) + "\n",
+    );
     process.exit(0);
   }
 
@@ -864,7 +933,7 @@ async function main() {
       }
       await ensureNativeModules(pluginRoot, env);
 
-      process.stderr.write("[visual-guard] ✓ Engine ready — deps + Chromium installed.\n");
+      process.stderr.write("[visual-guard] Engine ready — deps + Chromium installed.\n");
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

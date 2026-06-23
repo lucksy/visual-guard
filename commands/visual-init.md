@@ -5,6 +5,8 @@ argument-hint: ""
 
 # /visual-init — guided setup wizard
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 Walk the user through creating a project-specific `visual.config.json` so their **first**
 `/visual-check` runs against *their* servers and tokens instead of the sample defaults. The flow is
 **detect → confirm → fill the gaps → write**: probe for what's already running, show the user what
@@ -16,7 +18,7 @@ Use the **AskUserQuestion** tool for every choice below. This command writes exa
 explicit confirmation**. It is otherwise read-only: it never touches source, never captures or
 approves a baseline, and sends nothing external.
 
-## Show this first — banner + plan
+## Show this first — the banner
 
 Open your response with this banner, **printed verbatim in a code block**, before any tool call:
 
@@ -32,14 +34,7 @@ Open your response with this banner, **printed verbatim in a code block**, befor
          ▀██▀
 ```
 
-Then lay out the plan in plain language, so the user knows what's coming before anything runs:
-
-- **1 · Preflight** — confirm the engine is installed (read-only, nothing changes)
-- **2 · Detect** — find your running dev servers and design-token files
-- **3 · Confirm** — you approve each target, token source, and optional Figma link
-- **4 · Write** — save `visual.config.json` (only after your final yes)
-
-**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/4 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+Then go straight to work — no upfront plan and no numbered step list. Before each action, print one short line of what it is doing and whether it only reads or also changes things, then run it. Keep the running output to those short progress lines plus the final result, as the Output style note above describes.
 
 ## 0. Preflight
 
@@ -58,6 +53,15 @@ Then lay out the plan in plain language, so the user knows what's coming before 
   (`$STATE.dataDir` — the plugin's data dir, **not** your project), and *size* (~150 MB, one-time).
   On **Install now** → run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue once
   it exits `0`; on **Not now** → **stop** (nothing changes). When `$STATE.installed` is true, continue.
+- **If installed but `$STATE.healthy` is `false`** (`$STATE.brokenNatives` lists broken native addons):
+  `/visual-init` itself doesn't use them (detection + writing the config don't touch SQLite), so this
+  does **not** block init — but the studio/sync would crash later. **Auto-repair it now, don't ask and
+  don't improvise:** run the exact command in **`$STATE.repair`** (the sanctioned in-place self-heal —
+  it rebuilds the tree the engine actually loads, only inside the plugin's own dir). Do **NOT** run a
+  manual `npm rebuild` in a guessed directory. If it still reports unhealthy (or
+  `$STATE.systemSupported` is `false` — e.g. `$STATE.systemIssues` says Node is too old), relay
+  `$STATE.reason` and continue with init anyway (config setup still works; flag that studio/sync need
+  the fix first).
 
 ## 1. Detect (writes nothing)
 
@@ -291,13 +295,11 @@ Confirm success from the result JSON (`written: true`, the `configPath`).
 
 ## 5. What's next
 
-- Tell the user where the config was written and remind them to **review/edit** it (add `name`s,
-  tune `viewports`, adjust app `routes`).
-- Hand off the first run: once their Storybook / dev server is up, run **`/visual-check`** to capture
-  and diff, then **`/visual-baseline`** to approve the first renders.
-- **If they connected Figma:** with the Figma desktop app open on the library file, run
-  **`/visual-sync`** to populate the design baselines, then **`/visual-studio`** to browse parity.
-- Remind them to **commit** `visual.config.json` so the whole team shares the same targets and gates.
+Keep this to two short lines, no bullet lists: say where the config was written, then the single next
+step — start the Storybook / dev server, run `/visual-check` to capture and diff, then `/visual-baseline`
+to approve. Mention once, briefly, that they should commit `visual.config.json`. (Only if they connected
+Figma: with the Figma app open, `/visual-sync` then `/visual-studio`.) Don't reprint the config or list
+options to tune.
 
 ## Boundaries
 

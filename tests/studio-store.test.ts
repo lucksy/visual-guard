@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { openDb, type DB } from "../scripts/lib/studio/db";
 import {
   appendSnapshot,
+  componentRegressions,
   componentTimeline,
   componentUsages,
   componentVariants,
@@ -10,7 +11,9 @@ import {
   getComponentById,
   getComponentByKey,
   getSnapshotById,
+  getVariantById,
   latestLaneStatus,
+  latestRegression,
   latestSnapshot,
   latestSnapshotForSource,
   listComponents,
@@ -21,6 +24,7 @@ import {
   recordUsage,
   setFigmaLink,
   setSyncState,
+  summaryCounts,
   upsertComponent,
   upsertVariant,
 } from "../scripts/lib/studio/store";
@@ -505,3 +509,196 @@ describe("setSyncState", () => {
     db.close();
   });
 });
+
+// --- P6: comparison reads, conformance breakdown, facets, summary -----------
+
+/** Seed a component with a code variant + a `current` snapshot, returning ids for comparison tests. */
+function seedForComparison(db: DB): { cid: number; vid: number; snapId: number } {
+  const cid = upsertComponent(db, { key: "k", name: "K", codeInstance: "i", codeTarget: "t" });
+  const vid = upsertVariant(db, { componentId: cid, source: "code", name: "Default@1280" });
+  const snap = appendSnapshot(db, {
+    componentId: cid,
+    variantId: vid,
+    source: "current",
+    imagePath: "p",
+    imageHash: "h1",
+  });
+  return { cid, vid, snapId: snap.id };
+}
+
+describe("recordComparison — conformance breakdown (v4) + latestRegression", () => {
+  it("persists dimension/palette deltas and reads back the newest row per axis with the to-snapshot lane", () => {
+    const db = fresh();
+    const { cid, vid, snapId } = seedForComparison(db);
+    recordComparison(db, {
+      componentId: cid,
+      axis: "current_vs_baseline",
+      fromSnapshot: snapId,
+      toSnapshot: snapId,
+      diffRatio: 0.0123,
+      status: "regression",
+    });
+    recordComparison(db, {
+      componentId: cid,
+      axis: "figma_vs_code",
+      fromSnapshot: snapId,
+      toSnapshot: snapId,
+      diffRatio: 0.2,
+      dimensionDelta: 0.2,
+      paletteDelta: 0.01,
+      status: "changed",
+    });
+
+    const code = latestRegression(db, cid, "current_vs_baseline");
+    expect(code?.diff_ratio).toBeCloseTo(0.0123);
+    expect(code?.status).toBe("regression");
+    expect(code?.variant_id).toBe(vid); // joined from the `to` snapshot's lane
+    expect(code?.dimension_delta).toBeNull(); // the code axis records no breakdown
+
+    const parity = latestRegression(db, cid, "figma_vs_code");
+    expect(parity?.dimension_delta).toBeCloseTo(0.2);
+    expect(parity?.palette_delta).toBeCloseTo(0.01);
+    db.close();
+  });
+
+  it("latestRegression returns undefined when there is no comparison on that axis", () => {
+    const db = fresh();
+    const { cid } = seedForComparison(db);
+    expect(latestRegression(db, cid, "current_vs_baseline")).toBeUndefined();
+    db.close();
+  });
+});
+
+describe("componentRegressions — drift history (bounded, newest-first)", () => {
+  it("returns the axis history newest-first and caps the row count", () => {
+    const db = fresh();
+    const { cid, snapId } = seedForComparison(db);
+    for (let i = 0; i < 5; i++) {
+      recordComparison(db, {
+        componentId: cid,
+        axis: "current_vs_baseline",
+        fromSnapshot: snapId,
+        toSnapshot: snapId,
+        diffRatio: i / 100,
+        status: "changed",
+      });
+    }
+    const rows = componentRegressions(db, cid, "current_vs_baseline");
+    expect(rows).toHaveLength(5);
+    expect(rows[0]!.id).toBeGreaterThan(rows[rows.length - 1]!.id); // newest-first
+    expect(componentRegressions(db, cid, "current_vs_baseline", 2)).toHaveLength(2);
+    expect(componentRegressions(db, cid, "figma_vs_code")).toHaveLength(0); // only this axis
+    db.close();
+  });
+});
+
+describe("getVariantById", () => {
+  it("returns the variant row, or undefined when absent", () => {
+    const db = fresh();
+    const cid = upsertComponent(db, { key: "k", name: "K" });
+    const vid = upsertVariant(db, { componentId: cid, source: "code", name: "Default@1280" });
+    expect(getVariantById(db, vid)?.name).toBe("Default@1280");
+    expect(getVariantById(db, 9999)).toBeUndefined();
+    db.close();
+  });
+});
+
+describe("ListFilter facets (P6) — sync state, parity, presence, broadened search", () => {
+  function seedFacets(db: DB): void {
+    const both = upsertComponent(db, {
+      key: "btn/primary",
+      name: "Primary Button",
+      description: "the main call to action",
+      figmaFileKey: "F",
+      figmaNodeId: "1:1",
+      codeInstance: "i",
+      codeTarget: "primary",
+    });
+    db.prepare(`UPDATE components SET parity_status='same' WHERE id=?`).run(both);
+    upsertComponent(db, { key: "figma/F/2:2", name: "Ghost", figmaFileKey: "F", figmaNodeId: "2:2" });
+    setSyncState(db, getComponentByKey(db, "figma/F/2:2")!.id, "figma-pending");
+    upsertComponent(db, {
+      key: "btn/link",
+      name: "Link",
+      description: "deprecated",
+      codeInstance: "i",
+      codeTarget: "link",
+    });
+  }
+
+  it("filters by hasFigma / hasCode presence", () => {
+    const db = fresh();
+    seedFacets(db);
+    expect(listComponents(db, { hasFigma: true }).map((c) => c.key).sort()).toEqual([
+      "btn/primary",
+      "figma/F/2:2",
+    ]);
+    expect(listComponents(db, { hasCode: false }).map((c) => c.key)).toEqual(["figma/F/2:2"]);
+    expect(listComponents(db, { hasFigma: true, hasCode: true }).map((c) => c.key)).toEqual([
+      "btn/primary",
+    ]);
+    db.close();
+  });
+
+  it("filters by sync state and parity (incl. NULL parity)", () => {
+    const db = fresh();
+    seedFacets(db);
+    expect(listComponents(db, { syncState: "figma-pending" }).map((c) => c.key)).toEqual([
+      "figma/F/2:2",
+    ]);
+    expect(listComponents(db, { parity: "same" }).map((c) => c.key)).toEqual(["btn/primary"]);
+    expect(listComponents(db, { parity: null }).map((c) => c.key).sort()).toEqual([
+      "btn/link",
+      "figma/F/2:2",
+    ]);
+    db.close();
+  });
+
+  it("broadens the q search to the description (not just name/key) and applies on the thumbs query", () => {
+    const db = fresh();
+    seedFacets(db);
+    expect(listComponents(db, { q: "call to action" }).map((c) => c.key)).toEqual(["btn/primary"]);
+    expect(listComponents(db, { q: "deprecated" }).map((c) => c.key)).toEqual(["btn/link"]);
+    expect(listComponentsWithThumbs(db, { hasCode: true }).map((c) => c.key).sort()).toEqual([
+      "btn/link",
+      "btn/primary",
+    ]);
+    db.close();
+  });
+});
+
+describe("summaryCounts — health rollup", () => {
+  it("buckets by status, sync state, and figma/code presence", () => {
+    const db = fresh();
+    const a = upsertComponent(db, {
+      key: "a",
+      name: "A",
+      figmaFileKey: "F",
+      figmaNodeId: "1:1",
+      codeInstance: "i",
+      codeTarget: "a",
+    });
+    db.prepare(`UPDATE components SET status='regression' WHERE id=?`).run(a);
+    const b = upsertComponent(db, { key: "b", name: "B", figmaFileKey: "F", figmaNodeId: "2:2" });
+    setSyncState(db, b, "figma-pending");
+    upsertComponent(db, { key: "c", name: "C", codeInstance: "i", codeTarget: "c" });
+
+    const s = summaryCounts(db);
+    expect(s.total).toBe(3);
+    expect(s.byStatus.regression).toBe(1);
+    expect(s.byStatus.unknown).toBe(2); // schema default for the other two
+    expect(s.bySyncState["figma-pending"]).toBe(1);
+    expect(s.bySyncState.synced).toBe(2);
+    expect(s.presence).toEqual({ both: 1, figmaOnly: 1, codeOnly: 1, neither: 0 });
+    db.close();
+  });
+
+  it("reports all-zero buckets on an empty DB", () => {
+    const db = fresh();
+    const s = summaryCounts(db);
+    expect(s.total).toBe(0);
+    expect(s.presence).toEqual({ both: 0, figmaOnly: 0, codeOnly: 0, neither: 0 });
+    db.close();
+  });
+});
+

@@ -9,7 +9,7 @@
 
 import { el, setChildren } from "./dom.js";
 import { getHealth } from "./api.js";
-import { renderGallery, resetGalleryCaches } from "./gallery.js";
+import { renderGallery, resetGalleryCaches, maybeAutoRefresh } from "./gallery.js";
 import { renderDetail } from "./detail.js";
 
 const THEME_KEY = "vg-studio-theme";
@@ -52,9 +52,28 @@ function parseRoute() {
   };
   const m = /^\/component\/(\d+)$/.exec(pathPart);
   if (m) {
-    return { path: "component", id: Number(m[1]), query };
+    // Detail views carry their own shareable state (selected variant + compare mode).
+    return {
+      path: "component",
+      id: Number(m[1]),
+      detailQuery: { variant: usp.get("variant") || "", mode: usp.get("mode") || "" },
+      query,
+    };
   }
   return { path: "gallery", query };
+}
+
+/** Build a deep-linkable detail hash from the live detail state (variant + compare mode). */
+function buildDetailHash(id, detailQuery) {
+  const usp = new URLSearchParams();
+  if (detailQuery.variant) {
+    usp.set("variant", detailQuery.variant);
+  }
+  if (detailQuery.mode) {
+    usp.set("mode", detailQuery.mode);
+  }
+  const qs = usp.toString();
+  return `#/component/${id}${qs ? `?${qs}` : ""}`;
 }
 
 let viewEl;
@@ -118,10 +137,170 @@ function route() {
   if (r.path === "component") {
     // Ensure the Storybook base URL is loaded (cached) before rendering, so the launchpad's
     // "Open the story" link can appear for Storybook-sourced components.
-    ensureHealth().then(() => renderDetail(viewEl, r.id, { storyBaseUrl }));
+    ensureHealth().then(() =>
+      renderDetail(viewEl, r.id, {
+        storyBaseUrl,
+        detailQuery: r.detailQuery,
+        // Reflect variant/mode into the URL (no history spam) so the view is a shareable permalink.
+        writeDetailUrl: (q) => history.replaceState(null, "", buildDetailHash(r.id, q)),
+      }),
+    );
   } else {
     renderGallery(viewEl, r.query, helpers);
   }
+}
+
+// --- Keyboard layer (P6) ---------------------------------------------------
+
+/** Is focus in a text-entry control? (Don't hijack typing for single-key shortcuts.) */
+function isTypingTarget(t) {
+  if (!t) {
+    return false;
+  }
+  const tag = t.tagName;
+  return Boolean(t.isContentEditable) || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+}
+
+function focusSearch() {
+  const s = document.querySelector("input.search");
+  if (s) {
+    s.focus();
+    if (typeof s.select === "function") {
+      s.select();
+    }
+    return true;
+  }
+  return false;
+}
+
+let helpOpen = false;
+// The element focused before the help modal opened — focus is restored to it on close (a11y).
+let helpOpener = null;
+/** Toggle (or force) the keyboard-shortcuts help overlay. */
+function toggleHelp(force) {
+  helpOpen = typeof force === "boolean" ? force : !helpOpen;
+  const existing = document.getElementById("help-overlay");
+  if (!helpOpen) {
+    if (existing) {
+      existing.remove();
+    }
+    // Restore focus to whatever opened the dialog (if it's still in the document).
+    if (helpOpener && document.contains(helpOpener) && typeof helpOpener.focus === "function") {
+      helpOpener.focus();
+    }
+    helpOpener = null;
+    return;
+  }
+  if (existing) {
+    return;
+  }
+  helpOpener = document.activeElement;
+  const rows = [
+    ["/", "Search components"],
+    ["j / k", "Next / previous component"],
+    ["Enter", "Open the focused component"],
+    ["g", "Go to the gallery"],
+    ["?", "Toggle this help"],
+    ["Esc", "Close / clear focus"],
+  ];
+  const closeBtn = el("button", { class: "btn", id: "help-close", type: "button", onClick: () => toggleHelp(false) }, "Close");
+  const overlay = el(
+    "div",
+    { id: "help-overlay", class: "help-overlay", role: "dialog", "aria-modal": "true", "aria-label": "Keyboard shortcuts" },
+    el(
+      "div",
+      { class: "help-card" },
+      el("h2", {}, "Keyboard shortcuts"),
+      el("dl", { class: "help-list" }, rows.flatMap(([k, d]) => [el("dt", {}, k), el("dd", {}, d)])),
+      closeBtn,
+    ),
+  );
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) {
+      toggleHelp(false);
+    }
+  });
+  document.body.append(overlay);
+  // Move focus INTO the dialog so the keyboard/SR user is placed in the modal, not left behind it.
+  closeBtn.focus();
+}
+
+/** Move keyboard focus to the next/previous gallery card (j/k). */
+function moveCardFocus(delta) {
+  const cards = [...document.querySelectorAll("a.card")];
+  if (!cards.length) {
+    return;
+  }
+  const idx = cards.indexOf(document.activeElement);
+  const next = idx === -1 ? (delta > 0 ? 0 : cards.length - 1) : Math.min(cards.length - 1, Math.max(0, idx + delta));
+  cards[next].focus();
+}
+
+function onKeydown(e) {
+  if (e.metaKey || e.ctrlKey || e.altKey) {
+    return; // never shadow browser/OS chords
+  }
+  // While the help modal is open it is a genuine modal: it OWNS the keyboard. Escape closes it, Tab is
+  // trapped to the dialog, and every other key is swallowed so nothing leaks to the page behind it (which
+  // has no `inert` support across all targets) — honoring the aria-modal=true contract.
+  if (helpOpen) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      toggleHelp(false);
+    } else if (e.key === "Tab") {
+      e.preventDefault();
+      const close = document.getElementById("help-close");
+      if (close) {
+        close.focus(); // only one focusable control → keep focus on it
+      }
+    }
+    return;
+  }
+  if (e.key === "Escape") {
+    if (isTypingTarget(document.activeElement)) {
+      document.activeElement.blur();
+    }
+    return;
+  }
+  if (isTypingTarget(document.activeElement)) {
+    return; // let the field handle the key
+  }
+  if (e.key === "?") {
+    e.preventDefault();
+    toggleHelp();
+    return;
+  }
+  if (e.key === "/") {
+    if (focusSearch()) {
+      e.preventDefault();
+    }
+    return;
+  }
+  if (e.key === "g") {
+    e.preventDefault();
+    location.hash = "#/";
+    return;
+  }
+  if ((e.key === "j" || e.key === "k") && parseRoute().path === "gallery") {
+    e.preventDefault();
+    moveCardFocus(e.key === "j" ? 1 : -1);
+  }
+}
+
+/** Poll for external data changes so the gallery stays a live mirror (10s; cheap health check). */
+const AUTO_REFRESH_MS = 10000;
+function startAutoRefresh() {
+  setInterval(() => {
+    // Don't rebuild the gallery while the help modal is open, off the gallery, or — critically — while the
+    // user is typing in the search box: a rerender destroys + recreates that input, dropping focus and the
+    // in-flight keystroke. Defer to a later tick (after the field blurs).
+    if (helpOpen || parseRoute().path !== "gallery" || isTypingTarget(document.activeElement)) {
+      return;
+    }
+    maybeAutoRefresh(helpers).catch(() => {
+      /* transient — try again next tick */
+    });
+  }, AUTO_REFRESH_MS);
 }
 
 function mount() {
@@ -164,6 +343,8 @@ function mount() {
   }
 
   window.addEventListener("hashchange", route);
+  window.addEventListener("keydown", onKeydown);
+  startAutoRefresh();
   route();
 }
 

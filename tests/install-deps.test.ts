@@ -40,6 +40,10 @@ interface InstallState {
   /** Added to the `--check` CLI output (not computeInstallState): runtime-tree native load-test. */
   healthy?: boolean;
   brokenNatives?: string[];
+  systemSupported?: boolean;
+  systemIssues?: string[];
+  repair?: string;
+  reason?: string;
 }
 
 const installDepsSpecifier = "../scripts/install-deps.mjs";
@@ -47,10 +51,13 @@ const {
   ensureBridgeLink,
   ENGINE_DEPS,
   NATIVE_MODULES,
+  NODE_MAJOR_FLOOR,
   computeInstallState,
   desiredManifest,
   nativeRuntime,
   detectLibc,
+  systemSupport,
+  repairCommand,
   resolveNpm,
   verifyNativeModules,
   acquireInstallLock,
@@ -65,10 +72,13 @@ const {
   ) => "created" | "repaired" | "kept-existing";
   ENGINE_DEPS: Record<string, string>;
   NATIVE_MODULES: string[];
+  NODE_MAJOR_FLOOR: number;
   computeInstallState: (dataDir: string) => InstallState;
   desiredManifest: () => string;
   nativeRuntime: (proc?: unknown) => NativeRuntime;
   detectLibc: (proc?: unknown) => string | null;
+  systemSupport: (proc?: unknown) => { supported: boolean; issues: string[] };
+  repairCommand: () => string;
   resolveNpm: (
     execPath?: string,
     platform?: string,
@@ -499,6 +509,33 @@ describe("bridgeReachable — the engine's deps actually resolve from the plugin
   });
 });
 
+describe("systemSupport — up-front unsupported-system detection", () => {
+  const mk = (node: string) => ({ versions: { node, modules: "127" }, platform: "darwin", arch: "x64" });
+
+  it("supports the current runtime (the test runs on a supported Node)", () => {
+    expect(systemSupport()).toEqual({ supported: true, issues: [] });
+  });
+
+  it(`flags Node below the floor (${"<"} ${"NODE_MAJOR_FLOOR"}) with an upgrade instruction`, () => {
+    const r = systemSupport(mk(`${NODE_MAJOR_FLOOR - 2}.0.0`));
+    expect(r.supported).toBe(false);
+    expect(r.issues[0]).toMatch(new RegExp(`Node ${NODE_MAJOR_FLOOR}\\+`));
+    expect(r.issues[0]).toMatch(/upgrade/i);
+  });
+
+  it("supports exactly the floor and above", () => {
+    expect(systemSupport(mk(`${NODE_MAJOR_FLOOR}.0.0`)).supported).toBe(true);
+    expect(systemSupport(mk(`${NODE_MAJOR_FLOOR + 4}.1.0`)).supported).toBe(true);
+  });
+
+  it("repairCommand is the sanctioned install-deps.mjs self-heal (not a raw npm rebuild)", () => {
+    const cmd = repairCommand();
+    expect(cmd).toMatch(/install-deps\.mjs/);
+    expect(cmd).toMatch(/^node /);
+    expect(cmd).not.toMatch(/npm rebuild/);
+  });
+});
+
 describe("runStep — streamed install phase with heartbeat", () => {
   const opts = { cwd: process.cwd(), env: process.env };
 
@@ -551,6 +588,11 @@ describe("resolveDataDir — mid-session fallback (no CLAUDE_PLUGIN_DATA needed)
       // Defect B: --check now surfaces runtime-tree native health, not just fs-existence.
       expect(state.healthy).toBe(false); // not installed ⇒ not healthy
       expect(state.brokenNatives).toEqual([]); // no load-test attempted when not installed
+      // System-support + sanctioned repair command are always present so an agent never improvises.
+      expect(state.systemSupported).toBe(true); // CI/test runs on a supported Node
+      expect(state.systemIssues).toEqual([]);
+      expect(state.repair).toMatch(/install-deps\.mjs/);
+      expect(state.repair).not.toMatch(/npm rebuild/);
     } finally {
       rmSync(cfg, { recursive: true, force: true });
     }

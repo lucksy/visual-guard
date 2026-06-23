@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { latestRunId } from "./baseline";
 import { evaluateGate, type GatePolicy } from "./ci";
-import type { ComparisonStatus } from "./compare";
 import { STATUS_RANK, type Manifest, type ManifestImage, type ManifestTarget, type Verdict } from "./report";
 
 /**
@@ -25,13 +24,6 @@ const PREFIX = "Visual Guard PR report";
 function fail(message: string): never {
   throw new Error(`${PREFIX}: ${message}`);
 }
-
-const STATUS_ICON: Record<ComparisonStatus, string> = {
-  pass: "✅",
-  fail: "❌",
-  new: "🆕",
-  error: "⚠️",
-};
 
 /** A changed-pixel ratio as a percentage, or "—" when there is no ratio (new / error). */
 function pct(ratio: number | null): string {
@@ -113,7 +105,7 @@ function verdictCell(target: ManifestTarget): string {
 /** Render one image's evidence-then-verdict bullet block. */
 function renderImage(image: ManifestImage, gates: Manifest["gates"]): string[] {
   const lines: string[] = [];
-  const head = `- **${image.state} @ ${image.viewport}** — ${STATUS_ICON[image.status]} ${image.status}`;
+  const head = `- **${image.state} @ ${image.viewport}** — ${image.status}`;
   if (image.status === "new") {
     lines.push(`${head} · no baseline yet (first render)`);
     return lines;
@@ -169,10 +161,10 @@ export function renderPrComment(manifest: Manifest, options: PrCommentOptions = 
 
   // Header.
   if (gate.ok) {
-    out.push(`## ✅ Visual Guard — 0 regressions`);
+    out.push(`## Visual Guard — 0 regressions`);
   } else {
     const n = gate.blockingTargets.length;
-    out.push(`## 🛑 Visual Guard — ${n} blocking change${n === 1 ? "" : "s"}`);
+    out.push(`## Visual Guard — ${n} blocking change${n === 1 ? "" : "s"}`);
   }
   out.push("");
   out.push(gate.summaryLine);
@@ -188,7 +180,7 @@ export function renderPrComment(manifest: Manifest, options: PrCommentOptions = 
   out.push("| --- | --- | --- | --- |");
   for (const target of manifest.targets) {
     out.push(
-      `| \`${target.instance}/${target.target}\` | ${STATUS_ICON[target.status]} ${target.status} ` +
+      `| \`${target.instance}/${target.target}\` | ${target.status} ` +
         `| ${changeCell(target)} | ${verdictCell(target)} |`,
     );
   }
@@ -198,7 +190,7 @@ export function renderPrComment(manifest: Manifest, options: PrCommentOptions = 
     out.push(`All ${manifest.targets.length} target(s) match their baseline.`);
   } else {
     for (const target of flagged) {
-      out.push(`### ${STATUS_ICON[target.status]} \`${target.instance}/${target.target}\` — ${target.status}`);
+      out.push(`### \`${target.instance}/${target.target}\` — ${target.status}`);
       out.push("");
       if (target.changedFiles.length > 0) {
         out.push(`**Changed files:** ${target.changedFiles.map((f) => `\`${f}\``).join(", ")}`);

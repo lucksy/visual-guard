@@ -117,8 +117,8 @@ describe("renderCoverageText", () => {
     const text = renderCoverageText(map, ".visual-baselines");
     expect(text).toContain("1/2 cell(s) covered");
     expect(text).toContain("sample/Button");
-    expect(text).toContain("✓");
-    expect(text).toContain("·"); // the uncovered 1280 cell
+    // The matrix row for the "default" state: covered (x) at 375, gap (.) at 1280.
+    expect(text).toContain("default  x  .");
   });
 
   it("lists orphan baselines", () => {

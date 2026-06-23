@@ -135,7 +135,7 @@ export async function runCoverage(
 
 // --- Text rendering -------------------------------------------------------
 
-/** Render the coverage map as a human-readable matrix (✓ covered · · gap), per target. */
+/** Render the coverage map as a human-readable matrix (x = covered, . = gap), per target. */
 export function renderCoverageText(map: CoverageMap, baselineDir: string): string {
   const out: string[] = [];
   const { summary } = map;
@@ -154,7 +154,7 @@ export function renderCoverageText(map: CoverageMap, baselineDir: string): strin
     out.push(`  ${target.instance}/${target.target}`);
     out.push(`    ${["state \\ vw", ...viewports.map(String)].join("  ")}`);
     for (const state of states) {
-      const row = viewports.map((vw) => (lookup.get(`${state}@${vw}`) ? "✓" : "·"));
+      const row = viewports.map((vw) => (lookup.get(`${state}@${vw}`) ? "x" : "."));
       out.push(`    ${[state, ...row].join("  ")}`);
     }
   }

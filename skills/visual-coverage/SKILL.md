@@ -6,13 +6,15 @@ argument-hint: "[--json]"
 
 # /visual-coverage — the state × component coverage map
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 Show what Visual Guard actually covers: cross the config's **resolved render grid** (every target ×
 state/story × viewport that `/visual-check` would capture) with the committed baselines on disk, and
 report covered cells, **gaps** (expected but unbaselined), and **orphans** (a baseline no config
 render expects). This is **read-only** — it captures nothing, approves no baseline, and sends nothing
 to any external service.
 
-## Show this first — banner + plan
+## Show this first — the banner
 
 Open your response with this banner, **printed verbatim in a code block**, before any tool call:
 
@@ -28,13 +30,7 @@ Open your response with this banner, **printed verbatim in a code block**, befor
          ▀██▀
 ```
 
-Then lay out the plan in plain language, so the user knows what's coming before anything runs:
-
-- **1 · Preflight** — engine + config found (read-only)
-- **2 · Resolve** — expand the render grid and read the baselines on disk
-- **3 · Report** — covered cells, gaps (expected but unbaselined), and orphans
-
-**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/3 · <name>` that says in plain words what it does and whether it changes anything (this command is read-only throughout) — so a permission prompt is never a surprise. Never run a raw command without that context.
+Then go straight to work — no upfront plan and no numbered step list. Before each action, print one short line of what it is doing and whether it only reads or also changes things, then run it. Keep the running output to those short progress lines plus the final result, as the Output style note above describes.
 
 ## 0. Preflight
 
@@ -77,7 +73,7 @@ SCRIPTS="${CLAUDE_PLUGIN_ROOT}/scripts"
 Read the engine's output and present it plainly:
 
 - The **summary**: covered / expected cells, target count, gap count, orphan count.
-- The **per-target matrix** (states × viewports), with covered cells (`✓`) and gaps (`·`) called out.
+- The **per-target matrix** (states × viewports), with covered cells (`x`) and gaps (`.`) called out.
 - The **gaps**, grouped by target — these are states/viewports a regression could slip through
   because there's no baseline to diff against. Suggest the user capture + approve them:
   `/visual-check <target>` then `/visual-baseline <target>`.

@@ -12,7 +12,7 @@ import {
   getComponentByKey,
   setFigmaLink,
 } from "../scripts/lib/studio/store";
-import { syncCodeFromRun } from "../scripts/studio/sync";
+import { syncCodeFromRun, parseArgs, clampWatchIntervalMs } from "../scripts/studio/sync";
 
 const config: Config = parseConfig({ targets: [{ type: "storybook", url: "http://x" }] });
 const lenient: Config = parseConfig({ targets: [{ type: "storybook", url: "http://x" }], maxDiffRatio: 0.5 });
@@ -229,5 +229,35 @@ describe("syncCodeFromRun — code capture → compare → persist", () => {
     await sync(db); // only default renders now → the stale hover lane no longer pins status
     expect(getComponentByKey(db, "inst/Button")?.status).toBe("same");
     db.close();
+  });
+});
+
+// --- P6: watch-mode CLI parsing -------------------------------------------
+
+describe("clampWatchIntervalMs", () => {
+  it("defaults to 2s, clamps to [1s, 3600s], floors fractional seconds", () => {
+    expect(clampWatchIntervalMs(NaN)).toBe(2000);
+    expect(clampWatchIntervalMs(0)).toBe(2000);
+    expect(clampWatchIntervalMs(-5)).toBe(2000);
+    expect(clampWatchIntervalMs(0.5)).toBe(1000); // floors to 0 → min 1s
+    expect(clampWatchIntervalMs(5)).toBe(5000);
+    expect(clampWatchIntervalMs(99999)).toBe(3600 * 1000);
+  });
+});
+
+describe("parseArgs — --watch / --interval", () => {
+  it("defaults watch off with a 2s interval", () => {
+    const a = parseArgs([]);
+    expect(a.watch).toBe(false);
+    expect(a.intervalMs).toBe(2000);
+  });
+  it("parses --watch and a custom --interval (seconds → ms)", () => {
+    const a = parseArgs(["--watch", "--interval", "5"]);
+    expect(a.watch).toBe(true);
+    expect(a.intervalMs).toBe(5000);
+  });
+  it("rejects a non-positive --interval", () => {
+    expect(() => parseArgs(["--interval", "0"])).toThrow(/positive number of seconds/);
+    expect(() => parseArgs(["--interval", "abc"])).toThrow(/positive number of seconds/);
   });
 });

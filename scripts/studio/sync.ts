@@ -341,6 +341,18 @@ export interface SyncCliArgs {
   outRoot: string;
   /** Re-render even when the fingerprint is unchanged (override the incremental skip). */
   force: boolean;
+  /** Keep running, re-syncing whenever UI source changes (the incremental skip makes idle ticks cheap). */
+  watch: boolean;
+  /** Poll cadence for `--watch`, in milliseconds. */
+  intervalMs: number;
+}
+
+/** Clamp a watch poll interval (seconds) to a sane range and return milliseconds (default 2s). */
+export function clampWatchIntervalMs(seconds: number): number {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return 2000;
+  }
+  return Math.min(3600, Math.max(1, Math.floor(seconds))) * 1000;
 }
 
 export function parseArgs(argv: string[]): SyncCliArgs {
@@ -349,6 +361,8 @@ export function parseArgs(argv: string[]): SyncCliArgs {
   let baselineDir: string | undefined;
   let outRoot = DEFAULT_OUT_ROOT;
   let force = false;
+  let watch = false;
+  let intervalMs = 2000;
 
   const value = (index: number, flag: string): string => {
     const next = argv[index];
@@ -376,23 +390,37 @@ export function parseArgs(argv: string[]): SyncCliArgs {
       case "--force":
         force = true;
         break;
+      case "--watch":
+        watch = true;
+        break;
+      case "--interval": {
+        const raw = value(++i, "--interval");
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n <= 0) {
+          fail(`--interval must be a positive number of seconds (got ${JSON.stringify(raw)}).`);
+        }
+        intervalMs = clampWatchIntervalMs(n);
+        break;
+      }
       default:
         fail(`unknown argument ${JSON.stringify(arg)}.`);
     }
   }
-  return { config, target, baselineDir, outRoot, force };
+  return { config, target, baselineDir, outRoot, force, watch, intervalMs };
 }
 
-async function main(argv: string[]): Promise<void> {
-  const args = parseArgs(argv);
-  // Code capture renders via Playwright, which needs the pinned Chromium at
-  // `${CLAUDE_PLUGIN_DATA}/browsers`. sync.ts is run STANDALONE (the /visual-sync workflow subagent, a
-  // direct CLI call) where no caller sets PLAYWRIGHT_BROWSERS_PATH — resolve it so the sync finds the
-  // pinned browser instead of Playwright's default cache ("browser not found").
-  ensureBrowsersPath();
-  const config = loadConfig(args.config);
-  const baselineDir = args.baselineDir ?? config.baselineDir;
-
+/**
+ * Run ONE code sync (the body shared by the single-shot CLI and the `--watch` loop). Honors the
+ * incremental skip — when nothing changed it returns `{ skipped: true }` BEFORE spinning a browser, which
+ * is what makes a tight watch cadence cheap. `force` is OR-ed with the CLI flag so a watch loop can force
+ * the first pass while letting subsequent ticks skip-when-unchanged.
+ */
+async function runSyncOnce(
+  args: SyncCliArgs,
+  config: Config,
+  baselineDir: string,
+  force: boolean,
+): Promise<{ skipped: boolean }> {
   // Incremental skip (P5): when no UI source file changed and the target config is unchanged, the code
   // re-render is skipped entirely. Content-hash dedupe is the backstop, so this only saves cost, never
   // correctness. A `--target` subset or `--force` bypasses the skip (it fingerprints the whole project).
@@ -401,10 +429,10 @@ async function main(argv: string[]): Promise<void> {
     targetSignature: targetSignature(config),
     files: collectUiFiles(process.cwd(), config.uiGlobs),
   });
-  const plan = planSync(args.target, readStoredFingerprint(fingerprintPath), fingerprint, args.force);
+  const plan = planSync(args.target, readStoredFingerprint(fingerprintPath), fingerprint, force);
   if (plan.skip) {
     console.log(JSON.stringify({ command: "sync", skipped: true, reason: "unchanged", fingerprint }));
-    return;
+    return { skipped: true };
   }
 
   // Code capture is the engine (headless). Figma capture is the agent-driven /visual-sync workflow.
@@ -431,8 +459,44 @@ async function main(argv: string[]): Promise<void> {
       writeFileSync(fingerprintPath, JSON.stringify({ fingerprint, at: capture.runId }));
     }
     console.log(JSON.stringify({ command: "sync", runId: capture.runId, ...summary, pruned }));
+    return { skipped: false };
   } finally {
     db.close();
+  }
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function main(argv: string[]): Promise<void> {
+  const args = parseArgs(argv);
+  // Code capture renders via Playwright, which needs the pinned Chromium at
+  // `${CLAUDE_PLUGIN_DATA}/browsers`. sync.ts is run STANDALONE (the /visual-sync workflow subagent, a
+  // direct CLI call) where no caller sets PLAYWRIGHT_BROWSERS_PATH — resolve it so the sync finds the
+  // pinned browser instead of Playwright's default cache ("browser not found").
+  ensureBrowsersPath();
+  const config = loadConfig(args.config);
+  const baselineDir = args.baselineDir ?? config.baselineDir;
+
+  if (!args.watch) {
+    await runSyncOnce(args, config, baselineDir, args.force);
+    return;
+  }
+
+  // Watch: re-sync whenever UI source changes. The fingerprint skip means an unchanged tick does almost
+  // nothing (a cheap file walk, no browser), so a tight cadence is fine. The first pass honors --force;
+  // every later tick relies on the skip to no-op until something actually changes. Runs until SIGINT.
+  console.log(JSON.stringify({ command: "sync", watch: true, intervalMs: args.intervalMs }));
+  let first = true;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      await runSyncOnce(args, config, baselineDir, first ? args.force : false);
+    } catch (err) {
+      // A transient capture failure (dev server momentarily down) must not kill the watcher.
+      console.error(`[visual-sync] watch tick failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    first = false;
+    await sleep(args.intervalMs);
   }
 }
 

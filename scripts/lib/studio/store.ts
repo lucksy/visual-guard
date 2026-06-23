@@ -125,13 +125,23 @@ export function getComponentById(db: DB, id: number): ComponentRow | undefined {
 
 export interface ListFilter {
   status?: ComponentStatus;
-  /** Case-insensitive substring matched against key + name. */
+  /** Case-insensitive substring matched against key + name + description. */
   q?: string;
+  /** Resumable sync state (`synced` | `figma-pending` | `code-pending` | `error`). */
+  syncState?: SyncState;
+  /** Advisory figma↔code parity status; pass `null` to match rows with NO parity (no Figma link). */
+  parity?: ComponentStatus | null;
+  /** Require (true) / forbid (false) a Figma linkage. Omit to ignore. */
+  hasFigma?: boolean;
+  /** Require (true) / forbid (false) a code linkage. Omit to ignore. */
+  hasCode?: boolean;
 }
 
 /**
- * Build the shared `WHERE` for a {@link ListFilter} (status + literal name/key substring). `prefix`
- * qualifies the columns (`""` for a bare `components` query, `"c."` when components is aliased `c`).
+ * Build the shared `WHERE` for a {@link ListFilter} (status + literal name/key/description substring +
+ * sync-state, parity, and has-figma/has-code facets, all AND-ed). `prefix` qualifies the columns (`""`
+ * for a bare `components` query, `"c."` when components is aliased `c`). Every facet binds a parameter —
+ * the search term is escaped to a literal substring, never a wildcard.
  */
 function componentFilterSql(
   filter: ListFilter,
@@ -144,11 +154,32 @@ function componentFilterSql(
     params.status = filter.status;
   }
   if (filter.q !== undefined && filter.q.length > 0) {
-    clauses.push(`(${prefix}key LIKE @q ESCAPE '\\' OR ${prefix}name LIKE @q ESCAPE '\\')`);
+    clauses.push(
+      `(${prefix}key LIKE @q ESCAPE '\\' OR ${prefix}name LIKE @q ESCAPE '\\'` +
+        ` OR ${prefix}description LIKE @q ESCAPE '\\')`,
+    );
     // Escape LIKE metacharacters so q is a literal, case-insensitive substring (per this interface),
     // never a wildcard pattern. (The value is still bound, so this is about semantics, not injection.)
     const escaped = filter.q.replace(/[\\%_]/g, (ch) => `\\${ch}`);
     params.q = `%${escaped}%`;
+  }
+  if (filter.syncState !== undefined) {
+    clauses.push(`${prefix}sync_state = @syncState`);
+    params.syncState = filter.syncState;
+  }
+  if (filter.parity !== undefined) {
+    if (filter.parity === null) {
+      clauses.push(`${prefix}parity_status IS NULL`);
+    } else {
+      clauses.push(`${prefix}parity_status = @parity`);
+      params.parity = filter.parity;
+    }
+  }
+  if (filter.hasFigma !== undefined) {
+    clauses.push(`${prefix}figma_node_id IS ${filter.hasFigma ? "NOT NULL" : "NULL"}`);
+  }
+  if (filter.hasCode !== undefined) {
+    clauses.push(`${prefix}code_target IS ${filter.hasCode ? "NOT NULL" : "NULL"}`);
   }
   const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
   return { where, params, hasParams: clauses.length > 0 };
@@ -164,6 +195,75 @@ export function listComponents(db: DB, filter: ListFilter = {}): ComponentRow[] 
 /** Total component count — a cheap `COUNT(*)` for the health badge (never materializes the rows). */
 export function countComponents(db: DB): number {
   return (db.prepare(`SELECT COUNT(*) AS n FROM components`).get() as { n: number }).n;
+}
+
+/** Component rollup counts for `/api/summary` (SPEC §11.1) — the health dashboard. */
+export interface StudioSummary {
+  total: number;
+  /** Code-regression axis (`components.status`) buckets. */
+  byStatus: Record<ComponentStatus, number>;
+  /** Resumable sync-state buckets. */
+  bySyncState: Record<SyncState, number>;
+  /** Presence buckets (Figma/code linkage) — the DS owner's at-a-glance parity coverage. */
+  presence: { both: number; figmaOnly: number; codeOnly: number; neither: number };
+}
+
+/**
+ * Bucketed rollups over the indexed `status`/`sync_state` columns + the figma/code linkage — three cheap
+ * `GROUP BY`/`COUNT` scans, never materializing rows. This replaces the SPA's "fetch ALL components and
+ * bucket client-side" pattern for the header metrics, so a hundreds-of-component library doesn't ship a
+ * giant JSON just to draw counts.
+ */
+export function summaryCounts(db: DB): StudioSummary {
+  const byStatus: Record<ComponentStatus, number> = {
+    same: 0,
+    changed: 0,
+    regression: 0,
+    new: 0,
+    error: 0,
+    unknown: 0,
+  };
+  for (const row of db
+    .prepare(`SELECT status, COUNT(*) AS n FROM components GROUP BY status`)
+    .all() as { status: ComponentStatus; n: number }[]) {
+    if (row.status in byStatus) {
+      byStatus[row.status] = row.n;
+    }
+  }
+  const bySyncState: Record<SyncState, number> = {
+    synced: 0,
+    "figma-pending": 0,
+    "code-pending": 0,
+    error: 0,
+  };
+  for (const row of db
+    .prepare(`SELECT sync_state, COUNT(*) AS n FROM components GROUP BY sync_state`)
+    .all() as { sync_state: SyncState; n: number }[]) {
+    if (row.sync_state in bySyncState) {
+      bySyncState[row.sync_state] = row.n;
+    }
+  }
+  const presence = db
+    .prepare(
+      `SELECT
+         SUM(CASE WHEN figma_node_id IS NOT NULL AND code_target IS NOT NULL THEN 1 ELSE 0 END) AS both,
+         SUM(CASE WHEN figma_node_id IS NOT NULL AND code_target IS NULL THEN 1 ELSE 0 END) AS figmaOnly,
+         SUM(CASE WHEN figma_node_id IS NULL AND code_target IS NOT NULL THEN 1 ELSE 0 END) AS codeOnly,
+         SUM(CASE WHEN figma_node_id IS NULL AND code_target IS NULL THEN 1 ELSE 0 END) AS neither
+       FROM components`,
+    )
+    .get() as { both: number | null; figmaOnly: number | null; codeOnly: number | null; neither: number | null };
+  return {
+    total: countComponents(db),
+    byStatus,
+    bySyncState,
+    presence: {
+      both: presence.both ?? 0,
+      figmaOnly: presence.figmaOnly ?? 0,
+      codeOnly: presence.codeOnly ?? 0,
+      neither: presence.neither ?? 0,
+    },
+  };
 }
 
 export interface ComponentWithThumbs extends ComponentRow {
@@ -310,6 +410,11 @@ export function upsertVariant(db: DB, input: UpsertVariantInput): number {
       renderUrl: input.renderUrl ?? null,
     }) as { id: number };
   return row.id;
+}
+
+/** A single variant by id (for mapping a snapshot back to its lane), or undefined if absent. */
+export function getVariantById(db: DB, id: number): VariantRow | undefined {
+  return db.prepare(`SELECT * FROM variants WHERE id = ?`).get(id) as VariantRow | undefined;
 }
 
 /** Variants for a component (optionally one source), ordered source then name. */
@@ -525,6 +630,10 @@ export interface RecordComparisonInput {
   fromSnapshot: number;
   toSnapshot: number;
   diffRatio?: number | null;
+  /** Advisory conformance breakdown (figma_vs_code only): relative size delta 0..1. */
+  dimensionDelta?: number | null;
+  /** Advisory conformance breakdown (figma_vs_code only): perceptual color delta 0..1. */
+  paletteDelta?: number | null;
   status: RegressionStatus;
 }
 
@@ -532,8 +641,10 @@ export interface RecordComparisonInput {
 export function recordComparison(db: DB, input: RecordComparisonInput): number {
   const info = db
     .prepare(
-      `INSERT INTO regressions (component_id, axis, from_snapshot, to_snapshot, diff_ratio, status)
-       VALUES (@componentId, @axis, @fromSnapshot, @toSnapshot, @diffRatio, @status)`,
+      `INSERT INTO regressions
+         (component_id, axis, from_snapshot, to_snapshot, diff_ratio, dimension_delta, palette_delta, status)
+       VALUES
+         (@componentId, @axis, @fromSnapshot, @toSnapshot, @diffRatio, @dimensionDelta, @paletteDelta, @status)`,
     )
     .run({
       componentId: input.componentId,
@@ -541,9 +652,78 @@ export function recordComparison(db: DB, input: RecordComparisonInput): number {
       fromSnapshot: input.fromSnapshot,
       toSnapshot: input.toSnapshot,
       diffRatio: input.diffRatio ?? null,
+      dimensionDelta: input.dimensionDelta ?? null,
+      paletteDelta: input.paletteDelta ?? null,
       status: input.status,
     });
   return Number(info.lastInsertRowid);
+}
+
+/**
+ * A comparison row enriched with the variant lane of its `to` snapshot (so the detail view can match a
+ * regression to the variant tab the user is on). `dimension_delta`/`palette_delta` are non-null only on
+ * the advisory `figma_vs_code` axis (v4).
+ */
+export interface RegressionRow {
+  id: number;
+  component_id: number;
+  axis: RegressionAxis;
+  from_snapshot: number;
+  to_snapshot: number;
+  diff_ratio: number | null;
+  dimension_delta: number | null;
+  palette_delta: number | null;
+  status: RegressionStatus;
+  computed_at: string;
+  /** Variant lane of the `to` snapshot (NULL = default lane). */
+  variant_id: number | null;
+}
+
+const REGRESSION_SELECT = `SELECT r.id, r.component_id, r.axis, r.from_snapshot, r.to_snapshot,
+       r.diff_ratio, r.dimension_delta, r.palette_delta, r.status, r.computed_at,
+       s.variant_id AS variant_id
+     FROM regressions r JOIN snapshots s ON s.id = r.to_snapshot`;
+
+/**
+ * The most recent comparison on one axis for a component (newest by `computed_at`, then `id`), or
+ * undefined when none recorded. Served by `idx_regressions_component_axis`. This is the row the detail
+ * view reads to show the pixel-diff magnitude (`current_vs_baseline`) or the conformance breakdown
+ * (`figma_vs_code`) — data the engine already computes but the UI never surfaced before v4.
+ */
+export function latestRegression(
+  db: DB,
+  componentId: number,
+  axis: RegressionAxis,
+): RegressionRow | undefined {
+  return db
+    .prepare(
+      `${REGRESSION_SELECT}
+       WHERE r.component_id = @componentId AND r.axis = @axis
+       ORDER BY r.computed_at DESC, r.id DESC LIMIT 1`,
+    )
+    .get({ componentId, axis }) as RegressionRow | undefined;
+}
+
+/**
+ * A component's comparison history on one axis, newest-first, **bounded** to `limit` rows (default 100,
+ * hard-capped at 500). Powers the drift sparkline — the append-only `regressions` table already records a
+ * `diff_ratio` per real change, so this is a pure read over the existing index. The caller reverses to
+ * oldest→newest for the chart.
+ */
+export function componentRegressions(
+  db: DB,
+  componentId: number,
+  axis: RegressionAxis,
+  limit = 100,
+): RegressionRow[] {
+  const capped = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 500) : 100;
+  return db
+    .prepare(
+      `${REGRESSION_SELECT}
+       WHERE r.component_id = @componentId AND r.axis = @axis
+       ORDER BY r.computed_at DESC, r.id DESC LIMIT @limit`,
+    )
+    .all({ componentId, axis, limit: capped }) as RegressionRow[];
 }
 
 function latestRegressionStatus(

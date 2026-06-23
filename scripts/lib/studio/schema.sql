@@ -1,7 +1,7 @@
--- Component Studio schema (SPEC §7). v3 baseline.
+-- Component Studio schema (SPEC §7). v4 baseline.
 --
 -- This file is the FULL current-version DDL: db.ts `migrate()` applies it once on a fresh database and
--- then stamps user_version = SCHEMA_VERSION (currently 3). An existing older DB is brought forward by the
+-- then stamps user_version = SCHEMA_VERSION (currently 4). An existing older DB is brought forward by the
 -- incremental `if (from === N)` steps in migrate() instead. Connection-level PRAGMAs (journal_mode = WAL,
 -- foreign_keys = ON) are set by `openDb()` on EVERY connection, not here. The DB is a gitignored,
 -- rebuildable index; the source of truth is the committed PNGs under .visual-baselines/ plus
@@ -74,6 +74,11 @@ CREATE TABLE regressions (
   from_snapshot INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
   to_snapshot   INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
   diff_ratio REAL,                                    -- 0..1 from diff.ts (NULL for new/error)
+  -- Advisory conformance breakdown (figma_vs_code axis only; NULL for the code-regression axis). The
+  -- collapsed `diff_ratio` above is max(dimension_delta, palette_delta); these two record which axis
+  -- drove the verdict so the UI can say "size drifted" vs "color drifted" (v4).
+  dimension_delta REAL,                               -- relative size delta 0..1 (figma↔code)
+  palette_delta REAL,                                 -- perceptual color delta 0..1 (figma↔code)
   status TEXT NOT NULL CHECK (status IN ('same','changed','regression','new','error')),
   computed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

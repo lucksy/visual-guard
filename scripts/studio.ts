@@ -323,12 +323,17 @@ export async function runConformance(options: { db: DB; cwd?: string }): Promise
     }
     let status: "same" | "changed" | "regression" | "error";
     let diffRatio: number | null = null;
+    let dimensionDelta: number | null = null;
+    let paletteDelta: number | null = null;
     try {
       const result = await conformance(readFileSync(figmaAbs), readFileSync(codeAbs));
       status = levelToStatus(result.level);
       // Persist the level-DRIVING delta, not palette alone — else a component judged `divergent` purely
       // on a dimension mismatch would store a ~0 `diff_ratio` and read as "in sync" in the UI/timeline.
       diffRatio = Math.max(result.dimensionDelta, result.paletteDelta);
+      // Also keep the breakdown (v4) so the UI can explain WHICH axis drifted (size vs color).
+      dimensionDelta = result.dimensionDelta;
+      paletteDelta = result.paletteDelta;
       summary.byLevel[result.level] += 1;
       summary.scored += 1;
     } catch {
@@ -359,6 +364,8 @@ export async function runConformance(options: { db: DB; cwd?: string }): Promise
       fromSnapshot: figma.id,
       toSnapshot: code.id,
       diffRatio,
+      dimensionDelta,
+      paletteDelta,
       status,
     });
     // Update ONLY parity_status — scoring conformance must never move the code axis (SPEC §14).

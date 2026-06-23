@@ -5,13 +5,15 @@ argument-hint: ""
 
 # /visual-studio — open the Component Studio web app
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 Boot Component Studio's **localhost-only** web app and open it in the browser. The server reads the
 gitignored studio index (`.visual-guard/studio.db`) and streams the already-captured PNGs under
 `.visual-baselines/`/`.visual-guard/` — it makes **zero external calls** and there is **no token**
 anywhere. It is launched **backgrounded/detached** so this turn returns immediately while the server
 keeps running; a second `/visual-studio` reuses the running instance instead of double-starting.
 
-## Show this first — banner + plan
+## Show this first — the banner
 
 Open your response with this banner, **printed verbatim in a code block**, before any tool call:
 
@@ -27,13 +29,7 @@ Open your response with this banner, **printed verbatim in a code block**, befor
          ▀██▀
 ```
 
-Then lay out the plan in plain language, so the user knows what's coming before anything runs:
-
-- **1 · Preflight** — engine + studio index check (read-only; advisory if empty)
-- **2 · Launch** — start the localhost-only server, backgrounded
-- **3 · Open** — hand you the `127.0.0.1` URL (the browser opens automatically)
-
-**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/3 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+Then go straight to work — no upfront plan and no numbered step list. Before each action, print one short line of what it is doing and whether it only reads or also changes things, then run it. Keep the running output to those short progress lines plus the final result, as the Output style note above describes.
 
 ## 0. Preflight
 
@@ -50,9 +46,10 @@ Then lay out the plan in plain language, so the user knows what's coming before 
   `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` and continue on exit `0`; on **Not now** stop.
 - **Native health — the studio loads SQLite (`better-sqlite3`), so this matters here.** If `.installed`
   is true but `.healthy` is **false** (`.brokenNatives` lists the broken addons), the bindings didn't
-  load from the tree the scripts use; run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to
-  repair them in place, then continue (if `brokenNatives` is still non-empty afterward, relay it and
-  **stop** — launching anyway would crash with `ERR_DLOPEN_FAILED`).
+  load from the tree the scripts use; run the exact command in **`.repair`** (the sanctioned in-place
+  self-heal — do **NOT** improvise a manual `npm rebuild` in a guessed directory), then continue. If
+  still unhealthy — or `.systemSupported` is **false** (`.systemIssues`, e.g. Node too old) — relay
+  `.reason` and **stop** (launching anyway would crash with `ERR_DLOPEN_FAILED`).
 - Resolve `$CONFIG`: the first that exists of `visual.config.json`, `config/visual.config.json`, else
   `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`.
 - **Empty studio (advisory, never blocking).** If `.visual-guard/studio.db` does not exist, tell the
@@ -82,10 +79,20 @@ they can also paste the URL). Mention the next steps: **`/visual-sync`** to (re)
 parity, and the in-app **Sync** button which re-runs the **code** capture only (Figma capture needs
 the desktop MCP, so it stays in `/visual-sync`). To stop the server, `kill` the `pid` from the pidfile.
 
+Briefly point out what each component page now offers: the **pixel-diff %** and a **drift sparkline**
+(how much the code render moved from its baseline, and the trend over time), an **Approve as baseline**
+button that signs off the current render as the new committed baseline (the same durable action as
+`/visual-baseline`, right from the page), **shift-click two timeline points** to compare any two
+versions, and keyboard shortcuts (press **?** for the list). The gallery search also matches a
+component's description.
+
 ## Boundaries
 
 - **Localhost only** (`127.0.0.1`), **no token**, **zero external calls** — the page consumes only
   already-captured local images, under a strict same-origin CSP.
 - Reads `.visual-guard/studio.db` and streams images **path-confined** to `.visual-baselines/` /
   `.visual-guard/` — never your source, never anything outside those roots. Nothing is sent off-machine.
-- `POST /api/sync` (the in-app button) re-runs only the headless **code** capture; it never touches Figma.
+- Two mutating routes, both CSRF-guarded (same-origin only): `POST /api/sync` (the in-app **Sync** button)
+  re-runs only the headless **code** capture and never touches Figma; `POST /api/snapshots/:id/approve`
+  (the **Approve as baseline** button) writes ONE committed baseline PNG under `.visual-baselines/`
+  (path-confined) and mirrors it into the index — the only thing the studio ever writes to your repo.

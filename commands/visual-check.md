@@ -5,13 +5,15 @@ argument-hint: "[target] [--all] [--since <ref>]"
 
 # /visual-check — capture → pixel-diff → explain a UI change
 
+**Output style — keep it lean.** Write for a non-technical user, in plain text with no emoji or status icons; keep the banner (it is line-art). Before each action, print ONE short line of what it is doing and whether it only reads or also changes things — so a permission prompt is never a surprise — then report the result in a few plain lines. Never show raw JSON, internal variable names (`$STATE`, `$RUNNER`, `dataDir`, install markers), absolute plugin paths, or a technical health/diagnostics table. End with one short `Next: …` line. The steps below are your runbook: follow them exactly, but surface only what the user needs to see.
+
 Execute Visual Guard's Phase-0 visual regression check now, following the
 **gather → act → verify** loop below. Use `Bash` to run the engine and `Read` to read its
 JSON output. The optional target is `$ARGUMENTS` (a component name, an instance label, or
 `instance/name`). This command is **read-only** with respect to the user's source — never
 edit a file to "make the check pass", and never approve a baseline (that is `/visual-baseline`).
 
-## Show this first — banner + plan
+## Show this first — the banner
 
 Open your response with this banner, **printed verbatim in a code block**, before any tool call:
 
@@ -27,15 +29,7 @@ Open your response with this banner, **printed verbatim in a code block**, befor
          ▀██▀
 ```
 
-Then lay out the plan in plain language, so the user knows what's coming before anything runs:
-
-- **1 · Preflight** — engine ready + config found (read-only)
-- **2 · Scope** — decide what to capture: only the components your change affects (default), or everything (`--all`)
-- **3 · Capture** — screenshot the in-scope UI in a headless browser
-- **4 · Diff** — compare each render against its approved baseline
-- **5 · Explain** — what changed visually, and the likely cause
-
-**Narrate as you go.** Before each step's tool call, print a one-line `▸ Step N/5 · <name>` that says in plain words what it does and whether it changes anything (read-only vs writes) — so a permission prompt is never a surprise. Never run a raw command without that context.
+Then go straight to work — no upfront plan and no numbered step list. Before each action, print one short line of what it is doing and whether it only reads or also changes things, then run it. Keep the running output to those short progress lines plus the final result, as the Output style note above describes.
 
 ## 0. Preflight (fail fast, actionably)
 
@@ -62,8 +56,10 @@ and browser live. Before running anything:
   another runner or download anything yourself.
 - **Native health (every run).** If `$STATE.installed` is true but `$STATE.healthy` is **false**
   (`$STATE.brokenNatives` lists the broken addons), the engine's native bindings didn't load from the
-  tree the scripts use; run `node "${CLAUDE_PLUGIN_ROOT}/scripts/install-deps.mjs"` to repair them in
-  place, then continue (if `brokenNatives` is still non-empty afterward, relay it and **stop**).
+  tree the scripts use; run the exact command in **`$STATE.repair`** (the sanctioned in-place self-heal
+  — do **NOT** improvise a manual `npm rebuild` in a guessed directory), then continue. If it's still
+  unhealthy — or `$STATE.systemSupported` is **false** (`$STATE.systemIssues`, e.g. Node too old) —
+  relay `$STATE.reason` and **stop**.
 - Resolve the project's config — the first that exists of `visual.config.json`,
   `config/visual.config.json`, else the bundled default
   `${CLAUDE_PLUGIN_ROOT}/config/visual.config.json`. Call it `$CONFIG`.
@@ -105,7 +101,7 @@ From §1's intent, append **only the flags that apply** (each is a literal flag,
 - `--since <ref>` → `--since <ref>`
 - `--skip-unchanged` → `--skip-unchanged`
 
-Echo `▸ Step 2/5 · Capture + Diff — screenshot the in-scope UI and compare to baseline (writes only under .visual-guard/).` then run (append the §1 flags to this command):
+Print one short line — e.g. `Capturing the affected UI and diffing against the baseline (writes only under .visual-guard/)…` — then run (append the §1 flags to this command):
 
 ```bash
 "${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx" "${CLAUDE_PLUGIN_ROOT}/scripts/check.ts" \

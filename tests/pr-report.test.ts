@@ -93,11 +93,11 @@ describe("renderPrComment", () => {
     const md = renderPrComment(manifest);
 
     // Header + gate line.
-    expect(md).toContain("## 🛑 Visual Guard — 1 blocking change");
+    expect(md).toContain("## Visual Guard — 1 blocking change");
     expect(md).toContain("1 fail, 0 new, 0 error, 1 pass → BLOCKED");
     // Summary table has both targets.
-    expect(md).toContain("| `sample/Button` | ❌ fail |");
-    expect(md).toContain("| `sample/Badge` | ✅ pass |");
+    expect(md).toContain("| `sample/Button` | fail |");
+    expect(md).toContain("| `sample/Badge` | pass |");
     // Evidence first.
     expect(md).toContain("ratio **3.18%** (gate 1.00%)");
     expect(md).toContain("dimension **+0×+4 px**");
@@ -114,7 +114,7 @@ describe("renderPrComment", () => {
 
   it("renders a clean report when nothing is flagged", () => {
     const md = renderPrComment(mkManifest([mkTarget("Badge", "pass", [mkImage()])]));
-    expect(md).toContain("## ✅ Visual Guard — 0 regressions");
+    expect(md).toContain("## Visual Guard — 0 regressions");
     expect(md).toContain("→ clean");
     expect(md).toContain("All 1 target(s) match their baseline.");
     // No detail section for a passing target.
@@ -123,8 +123,8 @@ describe("renderPrComment", () => {
 
   it("treats a `new` target as flagged but not a verdict-bearing detail", () => {
     const md = renderPrComment(mkManifest([mkTarget("Fresh", "new", [mkImage({ status: "new" })])]));
-    expect(md).toContain("## 🛑 Visual Guard");
-    expect(md).toContain("| `sample/Fresh` | 🆕 new |");
+    expect(md).toContain("## Visual Guard");
+    expect(md).toContain("| `sample/Fresh` | new |");
     expect(md).toContain("no baseline yet");
   });
 
@@ -132,7 +132,7 @@ describe("renderPrComment", () => {
     const md = renderPrComment(mkManifest([mkTarget("Fresh", "new", [mkImage({ status: "new" })])]), {
       policy: { allowNew: true, allowError: false },
     });
-    expect(md).toContain("## ✅ Visual Guard — 0 regressions");
+    expect(md).toContain("## Visual Guard — 0 regressions");
     expect(md).toContain("1 new allowed");
   });
 
@@ -142,7 +142,7 @@ describe("renderPrComment", () => {
         mkTarget("Broken", "error", [mkImage({ status: "error", error: "could not decode PNG" })]),
       ]),
     );
-    expect(md).toContain("| `sample/Broken` | ⚠️ error |");
+    expect(md).toContain("| `sample/Broken` | error |");
     expect(md).toContain("could not decode PNG");
   });
 

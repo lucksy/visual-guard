@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { request as httpRequest, type Server } from "node:http";
 import { dirname, join } from "node:path";
@@ -29,6 +29,7 @@ let db: DB;
 let server: Server;
 let base = "";
 let figmaSnapId = 0;
+let currentSnapId = 0;
 let escapeSnapId = 0;
 let symlinkSnapId = 0;
 let port = 0;
@@ -158,6 +159,7 @@ beforeAll(async () => {
     width: 4,
     height: 4,
   });
+  currentSnapId = curSnap.id;
   recordComparison(db, {
     componentId: compAId,
     axis: "current_vs_baseline",
@@ -195,6 +197,9 @@ beforeAll(async () => {
   server = createStudioServer({
     db,
     projectRoot: tmp,
+    baselineDir: join(tmp, ".visual-baselines"),
+    diffThreshold: 0.1,
+    diffCacheDir: join(tmp, ".visual-guard", "cache", "diffs"),
     publicDir: join(tmp, "no-public-dir"), // absent → built-in shell
     schemaVersion: SCHEMA_VERSION,
     onSync: async () => {
@@ -288,6 +293,10 @@ describe("GET /api/components/:id (+ history, variants)", () => {
       { kind: "story", used_in: "default", detail: "inst" },
       { kind: "story", used_in: "hover", detail: "inst" },
     ]);
+    // P6: the latest comparison per axis is now surfaced — the engine-computed pixel-diff magnitude.
+    expect(body.comparisons.code.diff_ratio).toBeCloseTo(0.5);
+    expect(body.comparisons.code.status).toBe("regression");
+    expect(body.comparisons.parity).toBeNull(); // no figma_vs_code comparison was recorded
   });
 
   it("history can be scoped by source", async () => {
@@ -358,6 +367,122 @@ describe("GET /api/snapshots/:id (+ image)", () => {
   it("404s a missing snapshot id", async () => {
     expect((await fetch(`${base}/api/snapshots/999999`)).status).toBe(404);
     expect((await fetch(`${base}/api/snapshots/999999/image`)).status).toBe(404);
+  });
+});
+
+describe("GET /api/summary (P6 health rollup)", () => {
+  it("returns bucketed counts over status, sync state, and presence", async () => {
+    const res = await fetch(`${base}/api/summary`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const body = await j(res);
+    expect(body.summary.total).toBeGreaterThanOrEqual(2);
+    // compA is figma+code; compB is neither-linked.
+    expect(body.summary.presence.both).toBeGreaterThanOrEqual(1);
+    expect(typeof body.summary.byStatus.regression).toBe("number");
+    expect(typeof body.summary.bySyncState.synced).toBe("number");
+  });
+});
+
+describe("GET /api/components/:id/regressions (P6 drift history)", () => {
+  it("returns the axis history and validates the axis param", async () => {
+    const body = await j(await fetch(`${base}/api/components/${compAId}/regressions`));
+    expect(body.axis).toBe("current_vs_baseline");
+    expect(body.regressions.length).toBeGreaterThanOrEqual(1);
+    expect(body.regressions[0].diff_ratio).toBeCloseTo(0.5);
+
+    // An explicit valid axis with no rows → empty list, not an error.
+    const parity = await j(await fetch(`${base}/api/components/${compAId}/regressions?axis=figma_vs_code`));
+    expect(parity.regressions).toEqual([]);
+
+    // A bad axis → 400; a missing component → 404.
+    expect((await fetch(`${base}/api/components/${compAId}/regressions?axis=nope`)).status).toBe(400);
+    expect((await fetch(`${base}/api/components/999999/regressions`)).status).toBe(404);
+  });
+});
+
+describe("GET /api/diff (P6 pixel-diff overlay)", () => {
+  it("streams a real PNG diff overlay, caches it, and honors ETag/304", async () => {
+    const res = await fetch(`${base}/api/diff?from=${figmaSnapId}&to=${currentSnapId}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    expect(res.headers.get("cache-control")).toContain("immutable");
+    const etag = res.headers.get("etag");
+    expect(etag).toBeTruthy();
+    const bytes = Buffer.from(await res.arrayBuffer());
+    // PNG magic — proves it's a real generated image, not JSON/an error body.
+    expect(bytes.subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+    // The overlay was cached content-addressed under diffCacheDir.
+    const cached = readdirSync(join(tmp, ".visual-guard", "cache", "diffs"));
+    expect(cached.some((f) => f.endsWith(".png"))).toBe(true);
+
+    // A conditional re-request (served from the cache + ETag) is a 304 with no body.
+    const again = await fetch(`${base}/api/diff?from=${figmaSnapId}&to=${currentSnapId}`, {
+      headers: { "If-None-Match": etag! },
+    });
+    expect(again.status).toBe(304);
+    expect((await again.arrayBuffer()).byteLength).toBe(0);
+  });
+
+  it("400s bad params, 404s a missing snapshot, 404s an out-of-bounds source image", async () => {
+    expect((await fetch(`${base}/api/diff?from=abc&to=${figmaSnapId}`)).status).toBe(400);
+    expect((await fetch(`${base}/api/diff?from=${figmaSnapId}`)).status).toBe(400); // missing `to`
+    expect((await fetch(`${base}/api/diff?from=999999&to=${figmaSnapId}`)).status).toBe(404);
+    // `escapeSnapId` has a path that escapes the image roots → its image is unavailable for diffing.
+    const oob = await fetch(`${base}/api/diff?from=${escapeSnapId}&to=${figmaSnapId}`);
+    expect(oob.status).toBe(404);
+    expect((await j(oob)).error.code).toBe("image_unavailable");
+  });
+});
+
+describe("POST /api/snapshots/:id/approve (P6 approve as baseline)", () => {
+  it("refuses a cross-site approve (CSRF guard) and a wrong-verb GET (405)", async () => {
+    const cross = await raw(`/api/snapshots/${figmaSnapId}/approve`, {
+      method: "POST",
+      headers: { "Sec-Fetch-Site": "cross-site" },
+    });
+    expect(cross.status).toBe(403);
+    expect(JSON.parse(cross.body.toString()).error.code).toBe("forbidden");
+
+    const wrongVerb = await fetch(`${base}/api/snapshots/${figmaSnapId}/approve`);
+    expect(wrongVerb.status).toBe(405);
+  });
+
+  it("rejects approving a Figma snapshot (not a code baseline) with a same-origin request", async () => {
+    const res = await raw(`/api/snapshots/${figmaSnapId}/approve`, {
+      method: "POST",
+      headers: { "Sec-Fetch-Site": "same-origin" },
+    });
+    expect(res.status).toBe(409);
+    expect(JSON.parse(res.body.toString()).error.code).toBe("not_approvable");
+  });
+
+  // NOTE: this mutates compA (promotes its current render → baseline), so it runs AFTER the read tests
+  // above that assert compA's regression state.
+  it("promotes the current render to a committed baseline and clears the regression", async () => {
+    const detail = await j(await fetch(`${base}/api/components/${compAId}`));
+    const currentId = detail.latest.current.id;
+    const res = await raw(`/api/snapshots/${currentId}/approve`, {
+      method: "POST",
+      headers: { "Sec-Fetch-Site": "same-origin" },
+    });
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body.toString());
+    expect(body.ok).toBe(true);
+    expect(body.promoted).toBe(true);
+    expect(body.key).toBe("inst/Primary/default@1280.png");
+    // The committed PNG was written into the baseline dir.
+    expect(readFileSync(join(tmp, ".visual-baselines", "inst", "Primary", "default@1280.png")).length).toBeGreaterThan(0);
+    // The component now reads `same` (the regression cleared) on a fresh detail fetch.
+    const after = await j(await fetch(`${base}/api/components/${compAId}`));
+    expect(after.component.status).toBe("same");
+    // The promoted baseline's image must actually SERVE (the stored path is project-relative + confined),
+    // not just exist on disk — a regression guard for the absolute-path 404.
+    const newBaselineId = after.latest.code.id;
+    const img = await fetch(`${base}/api/snapshots/${newBaselineId}/image`);
+    expect(img.status).toBe(200);
+    expect(img.headers.get("content-type")).toBe("image/png");
   });
 });
 
@@ -454,6 +579,7 @@ describe("POST /api/sync — failure (500) + in-flight reset (dedicated server)"
     s = createStudioServer({
       db: sdb,
       projectRoot: tmp,
+      baselineDir: join(tmp, ".visual-baselines"),
       publicDir: join(tmp, "no-public-dir"),
       schemaVersion: SCHEMA_VERSION,
       onSync: async () => {
@@ -505,6 +631,7 @@ describe("unexpected handler error → generic internal_error (no detail leak)",
     s = createStudioServer({
       db: poison,
       projectRoot: tmp,
+      baselineDir: join(tmp, ".visual-baselines"),
       publicDir: join(tmp, "no-public-dir"),
       schemaVersion: SCHEMA_VERSION,
       onSync: async () => ({}),

@@ -12,7 +12,7 @@
  */
 
 import { el, setChildren, announce } from "./dom.js";
-import { getComponents, imageUrl, postSync, ApiError } from "./api.js";
+import { getComponents, getHealth, imageUrl, postSync, ApiError } from "./api.js";
 import {
   deriveBadge,
   isCodeRegressed,
@@ -295,4 +295,35 @@ export async function renderGallery(root, query, helpers) {
 /** Reset module caches (used when navigating fresh / after data changes). */
 export function resetGalleryCaches() {
   componentsCache = null;
+  lastHealthSnapshots = null;
+}
+
+// Snapshot count from the last health poll — a cheap change-detector for an EXTERNAL sync (a CLI
+// `/visual-sync`) so the gallery becomes a live mirror, not a stale snapshot.
+let lastHealthSnapshots = null;
+
+/**
+ * Poll `/api/health` and, if the snapshot count changed since the last poll (an external sync wrote new
+ * renders), refetch the component list and re-render in place. Skipped while an in-app sync is running
+ * (its own poller already refreshes). Cheap: one tiny request, no work when nothing changed. Best-effort
+ * — the caller swallows errors so a transient blip never disrupts the view.
+ */
+export async function maybeAutoRefresh(helpers) {
+  if (syncing) {
+    return;
+  }
+  const health = await getHealth();
+  const n = health && health.counts ? health.counts.snapshots : null;
+  if (typeof n !== "number") {
+    return;
+  }
+  if (lastHealthSnapshots === null) {
+    lastHealthSnapshots = n; // seed on first poll — never refresh on the very first observation
+    return;
+  }
+  if (n !== lastHealthSnapshots) {
+    lastHealthSnapshots = n;
+    await ensureComponents(true);
+    helpers.rerender();
+  }
 }
