@@ -25,7 +25,7 @@ export interface MatchResult {
 }
 
 /** Fold a display name to a comparison key: lowercase, drop everything but [a-z0-9]. */
-function normalize(name: string): string {
+export function normalize(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 

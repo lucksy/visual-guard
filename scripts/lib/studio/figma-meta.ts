@@ -17,6 +17,14 @@ export interface FigmaMetaImage {
   viewport?: number;
   /** The Figma version this image was captured at (provenance for the timeline). */
   figmaVersionId?: string;
+  /**
+   * v5 (F4): this variant's parsed axis labels, e.g. `{ State: "Hover", Size: "Large" }`. Durably
+   * preserves the Figma variant-property labels that the `variant@viewport` key alone discards, so the
+   * Figma↔code axis set-diff can be rehydrated after a reindex.
+   */
+  axes?: Record<string, string>;
+  /** v5 (F5): the Figma node's lastModified (ISO8601) at the time this image was captured. */
+  figmaLastModified?: string;
 }
 
 export interface FigmaMetaComponent {
@@ -25,6 +33,17 @@ export interface FigmaMetaComponent {
   name: string;
   description?: string;
   images: FigmaMetaImage[];
+  /**
+   * v5 (F1): the code component key this Figma node maps to (e.g. `buttons/primary-button`). The DURABLE
+   * half of the node↔code mapping — `reindex` reads it to re-link the rebuilt DB, so the mapping survives
+   * the DB wipe instead of being re-derived from names. Last-write-wins, so a code rename shows up as a
+   * one-line `figma_meta.json` diff rather than a silent unlink.
+   */
+  codeKey?: string;
+  /** v5 (F5): the Figma node's lastModified (ISO8601) — drives mapping-staleness detection. */
+  lastModified?: string;
+  /** v5 (F4): the component's axis → observed-values map (union across variants), for the set-diff. */
+  axes?: Record<string, string[]>;
 }
 
 export interface FigmaMetaFile {
@@ -63,6 +82,33 @@ function asNonNegativeInt(value: unknown, field: string): number {
   return value;
 }
 
+/** A flat object whose every value is a non-empty string (a variant's axis → label map). */
+function asStringMap(value: unknown, field: string): Record<string, string> {
+  if (!isObject(value)) {
+    fail(`"${field}" must be an object of string values.`);
+  }
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(value)) {
+    out[k] = asNonEmptyString(v, `${field}.${k}`);
+  }
+  return out;
+}
+
+/** An object whose every value is an array of non-empty strings (an axis → observed-values map). */
+function asStringArrayMap(value: unknown, field: string): Record<string, string[]> {
+  if (!isObject(value)) {
+    fail(`"${field}" must be an object of string arrays.`);
+  }
+  const out: Record<string, string[]> = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (!Array.isArray(v)) {
+      fail(`"${field}.${k}" must be an array of strings.`);
+    }
+    out[k] = v.map((item, index) => asNonEmptyString(item, `${field}.${k}[${index}]`));
+  }
+  return out;
+}
+
 function parseImage(raw: unknown, label: string): FigmaMetaImage {
   if (!isObject(raw)) {
     fail(`${label} must be an object with a "path".`);
@@ -76,6 +122,12 @@ function parseImage(raw: unknown, label: string): FigmaMetaImage {
   }
   if (raw.figmaVersionId !== undefined) {
     image.figmaVersionId = asNonEmptyString(raw.figmaVersionId, `${label}.figmaVersionId`);
+  }
+  if (raw.axes !== undefined) {
+    image.axes = asStringMap(raw.axes, `${label}.axes`);
+  }
+  if (raw.figmaLastModified !== undefined) {
+    image.figmaLastModified = asNonEmptyString(raw.figmaLastModified, `${label}.figmaLastModified`);
   }
   return image;
 }
@@ -94,6 +146,15 @@ function parseComponent(raw: unknown, label: string): FigmaMetaComponent {
   };
   if (raw.description !== undefined) {
     component.description = asNonEmptyString(raw.description, `${label}.description`);
+  }
+  if (raw.codeKey !== undefined) {
+    component.codeKey = asNonEmptyString(raw.codeKey, `${label}.codeKey`);
+  }
+  if (raw.lastModified !== undefined) {
+    component.lastModified = asNonEmptyString(raw.lastModified, `${label}.lastModified`);
+  }
+  if (raw.axes !== undefined) {
+    component.axes = asStringArrayMap(raw.axes, `${label}.axes`);
   }
   return component;
 }
@@ -140,6 +201,16 @@ export interface FigmaMetaEntry {
   name: string;
   description?: string;
   image: FigmaMetaImage;
+  /**
+   * v5 (F1): code component key this node maps to. Last-write-wins (a diffable rename signal).
+   * `undefined` PRESERVES any existing codeKey; `null` explicitly CLEARS it (a node that un-matched), so
+   * a stale codeKey can't survive a match→unmatch transition and wrongly re-link on the next reindex.
+   */
+  codeKey?: string | null;
+  /** v5 (F5): the node's lastModified (ISO8601). Last-write-wins (newest capture). */
+  lastModified?: string;
+  /** v5 (F4): the component's axis → observed-values map. Last-write-wins. */
+  axes?: Record<string, string[]>;
 }
 
 /**
@@ -168,15 +239,27 @@ export function upsertFigmaMetaImage(meta: FigmaMeta, entry: FigmaMetaEntry): Fi
   let component = file.components.find((c) => c.nodeId === entry.nodeId);
   if (component === undefined) {
     component = { nodeId: entry.nodeId, name: entry.name, images: [] };
-    if (entry.description !== undefined) {
-      component.description = entry.description;
-    }
     file.components.push(component);
   } else {
     component.name = entry.name;
-    if (entry.description !== undefined) {
-      component.description = entry.description;
-    }
+  }
+  // Component-level fields are set when the entry provides them, preserved otherwise. codeKey/
+  // lastModified/axes are last-write-wins (the latest sync's truth) — so a code rename re-points the
+  // node's codeKey in place, a one-line committed diff rather than a silent unlink.
+  if (entry.description !== undefined) {
+    component.description = entry.description;
+  }
+  // null = clear (a node that un-matched), undefined = preserve, a string = set/re-point.
+  if (entry.codeKey === null) {
+    delete component.codeKey;
+  } else if (entry.codeKey !== undefined) {
+    component.codeKey = entry.codeKey;
+  }
+  if (entry.lastModified !== undefined) {
+    component.lastModified = entry.lastModified;
+  }
+  if (entry.axes !== undefined) {
+    component.axes = entry.axes;
   }
 
   const existing = component.images.findIndex((img) => img.path === entry.image.path);

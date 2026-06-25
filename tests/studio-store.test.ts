@@ -2,31 +2,48 @@ import { describe, it, expect } from "vitest";
 import { openDb, type DB } from "../scripts/lib/studio/db";
 import {
   appendSnapshot,
+  applyCodeRename,
+  clearRemovedState,
+  computeDrift,
   componentRegressions,
   componentTimeline,
   componentUsages,
   componentVariants,
   countComponents,
   countSnapshots,
+  deriveLifecycle,
   getComponentById,
   getComponentByKey,
   getSnapshotById,
   getVariantById,
+  isMappingStale,
   latestLaneStatus,
   latestRegression,
   latestSnapshot,
   latestSnapshotForSource,
+  linkForFigmaNode,
   listComponents,
   listComponentsWithThumbs,
+  listRenameEvents,
   markFigmaPending,
+  markRemovedCode,
+  populationDelta,
   recomputeStatus,
   recordComparison,
+  recordFigmaCodeLink,
+  recordPopulationSnapshot,
+  recordRenameEvent,
   recordUsage,
+  rollupLifecycle,
+  setCodeLastSeenSha,
+  setFigmaLastModified,
   setFigmaLink,
+  setLifecycle,
   setSyncState,
   summaryCounts,
   upsertComponent,
   upsertVariant,
+  variantAxisDiff,
 } from "../scripts/lib/studio/store";
 
 const fresh = (): DB => openDb(":memory:");
@@ -698,6 +715,332 @@ describe("summaryCounts — health rollup", () => {
     const s = summaryCounts(db);
     expect(s.total).toBe(0);
     expect(s.presence).toEqual({ both: 0, figmaOnly: 0, codeOnly: 0, neither: 0 });
+    db.close();
+  });
+});
+
+// --- v5 drift / maintenance layer -----------------------------------------------------------------
+
+describe("lifecycle (presence/drift axis)", () => {
+  it("derives matched / figma-only / code-only / unknown from presence", () => {
+    expect(deriveLifecycle({ figma_node_id: "1:1", code_target: "t" })).toBe("matched");
+    expect(deriveLifecycle({ figma_node_id: "1:1", code_target: null })).toBe("figma-only");
+    expect(deriveLifecycle({ figma_node_id: null, code_target: "t" })).toBe("code-only");
+    expect(deriveLifecycle({ figma_node_id: null, code_target: null })).toBe("unknown");
+  });
+
+  it("rollupLifecycle persists the derived value and is filterable", () => {
+    const db = fresh();
+    const id = upsertComponent(db, { key: "k", name: "K", figmaNodeId: "1:1", codeTarget: "t" });
+    expect(getComponentById(db, id)?.lifecycle).toBe("unknown"); // schema default before any rollup
+    expect(rollupLifecycle(db, id)).toBe("matched");
+    expect(getComponentById(db, id)?.lifecycle).toBe("matched");
+    expect(listComponents(db, { lifecycle: "matched" }).map((c) => c.key)).toEqual(["k"]);
+    expect(listComponents(db, { lifecycle: "removed" })).toEqual([]);
+    db.close();
+  });
+
+  it("setLifecycle is honored by summaryCounts.byLifecycle", () => {
+    const db = fresh();
+    const a = upsertComponent(db, { key: "a", name: "A", figmaNodeId: "1:1", codeTarget: "t" });
+    const b = upsertComponent(db, { key: "b", name: "B", codeTarget: "t" });
+    rollupLifecycle(db, a);
+    rollupLifecycle(db, b);
+    setLifecycle(db, b, "removed");
+    const s = summaryCounts(db);
+    expect(s.byLifecycle.matched).toBe(1);
+    expect(s.byLifecycle.removed).toBe(1);
+    expect(s.byLifecycle.unknown).toBe(0);
+    db.close();
+  });
+});
+
+describe("figma_code_links (durable F1 mirror)", () => {
+  it("records and re-points the edge on the node's natural key", () => {
+    const db = fresh();
+    recordFigmaCodeLink(db, { figmaFileKey: "F", figmaNodeId: "1:1", componentKey: "buttons/btn" });
+    expect(linkForFigmaNode(db, "F", "1:1")?.component_key).toBe("buttons/btn");
+    expect(linkForFigmaNode(db, "F", "1:1")?.source).toBe("auto");
+    // re-link the same node to a different component replaces, never duplicates
+    recordFigmaCodeLink(db, {
+      figmaFileKey: "F",
+      figmaNodeId: "1:1",
+      componentKey: "buttons/cta",
+      source: "manual",
+    });
+    expect(linkForFigmaNode(db, "F", "1:1")?.component_key).toBe("buttons/cta");
+    expect(linkForFigmaNode(db, "F", "1:1")?.source).toBe("manual");
+    expect(
+      (db.prepare("SELECT COUNT(*) AS n FROM figma_code_links").get() as { n: number }).n,
+    ).toBe(1);
+    expect(linkForFigmaNode(db, "F", "9:9")).toBeUndefined();
+    db.close();
+  });
+});
+
+describe("figma_last_modified / code_last_seen_sha setters (F5 inputs)", () => {
+  it("round-trip on the component row", () => {
+    const db = fresh();
+    const id = upsertComponent(db, { key: "k", name: "K", figmaNodeId: "1:1", codeTarget: "t" });
+    setFigmaLastModified(db, id, "2026-06-01T00:00:00.000Z");
+    setCodeLastSeenSha(db, id, "abc123");
+    const row = getComponentById(db, id);
+    expect(row?.figma_last_modified).toBe("2026-06-01T00:00:00.000Z");
+    expect(row?.code_last_seen_sha).toBe("abc123");
+    db.close();
+  });
+});
+
+describe("population snapshots + delta (F5)", () => {
+  it("returns an empty delta until two snapshots exist, then set-diffs the two newest", () => {
+    const db = fresh();
+    upsertComponent(db, { key: "a", name: "A", figmaNodeId: "1:1", codeTarget: "t" });
+    upsertComponent(db, { key: "b", name: "B", codeTarget: "t" }); // code-only
+    recordPopulationSnapshot(db);
+    expect(populationDelta(db)).toEqual({
+      newFigma: [],
+      newCode: [],
+      removedFigma: [],
+      removedCode: [],
+    });
+
+    // a new figma-only component appears, and a code component disappears (key still present though)
+    upsertComponent(db, { key: "c", name: "C", figmaNodeId: "2:2" }); // new figma-only
+    recordPopulationSnapshot(db);
+
+    const delta = populationDelta(db);
+    expect(delta.newFigma).toEqual(["c"]);
+    expect(delta.newCode).toEqual([]);
+    expect(delta.removedFigma).toEqual([]);
+    expect(delta.removedCode).toEqual([]);
+    expect(latestPopulationFigmaCount(db)).toBe(2); // a (matched) + c (figma-only)
+    db.close();
+  });
+
+  // local helper that reads the newest snapshot's figma_count
+  function latestPopulationFigmaCount(db: DB): number {
+    return (
+      db
+        .prepare("SELECT figma_count FROM population_snapshots ORDER BY id DESC LIMIT 1")
+        .get() as { figma_count: number }
+    ).figma_count;
+  }
+});
+
+describe("rename events + applyCodeRename (F2)", () => {
+  it("records events newest-first, bounded, and keeps the row after the component is gone", () => {
+    const db = fresh();
+    const id = upsertComponent(db, { key: "old/btn", name: "Button", codeTarget: "t" });
+    recordRenameEvent(db, {
+      side: "code",
+      componentId: id,
+      fromKey: "old/btn",
+      toKey: "new/btn",
+      fromName: "Button",
+      toName: "Button",
+      anchor: "code-instance",
+      confidence: 1,
+      resolution: "applied",
+    });
+    const [ev] = listRenameEvents(db);
+    expect(listRenameEvents(db)).toHaveLength(1);
+    expect(ev?.from_key).toBe("old/btn");
+    expect(ev?.to_key).toBe("new/btn");
+    expect(ev?.anchor).toBe("code-instance");
+    // ON DELETE SET NULL: the audit row outlives a hard-deleted component
+    db.prepare("DELETE FROM components WHERE id = ?").run(id);
+    const [afterDelete] = listRenameEvents(db);
+    expect(afterDelete?.component_id).toBeNull();
+    db.close();
+  });
+
+  it("rejects a bad anchor / resolution via the CHECK", () => {
+    const db = fresh();
+    expect(() =>
+      recordRenameEvent(db, {
+        side: "code",
+        fromName: "a",
+        toName: "b",
+        // @ts-expect-error — deliberately invalid anchor to prove the CHECK fires
+        anchor: "guess",
+        confidence: 0.5,
+        resolution: "surfaced",
+      }),
+    ).toThrow(/CHECK/i);
+    db.close();
+  });
+
+  it("applyCodeRename re-points the key preserving id + children, and collides safely", () => {
+    const db = fresh();
+    const id = upsertComponent(db, { key: "old/btn", name: "Button", codeTarget: "t" });
+    appendSnapshot(db, { componentId: id, source: "code", imagePath: "b.png", imageHash: "h" });
+
+    expect(applyCodeRename(db, "old/btn", "new/btn")).toBe(true);
+    const moved = getComponentByKey(db, "new/btn");
+    expect(moved?.id).toBe(id); // same id — children survive
+    expect(countSnapshots(db)).toBe(1);
+    expect(getComponentByKey(db, "old/btn")).toBeUndefined();
+
+    // collision: target already exists → no-op false (surface, never merge)
+    upsertComponent(db, { key: "other", name: "Other", codeTarget: "t2" });
+    expect(applyCodeRename(db, "new/btn", "other")).toBe(false);
+    expect(getComponentByKey(db, "new/btn")?.id).toBe(id); // unchanged
+    // absent source → false
+    expect(applyCodeRename(db, "nope", "fresh")).toBe(false);
+    db.close();
+  });
+});
+
+describe("markRemovedCode / clearRemovedState (F3)", () => {
+  it("soft-marks orphaned code components, never figma-only, idempotently — and resurrects", () => {
+    const db = fresh();
+    const a = upsertComponent(db, { key: "a", name: "A", codeTarget: "t" });
+    const b = upsertComponent(db, { key: "b", name: "B", codeTarget: "t" });
+    const f = upsertComponent(db, { key: "f", name: "F", figmaNodeId: "1:1" }); // figma-only
+    [a, b, f].forEach((id) => rollupLifecycle(db, id));
+
+    // a full sync touched only "a"; "b" orphaned, "f" (figma-only) must be left alone
+    expect(markRemovedCode(db, ["a"])).toBe(1);
+    expect(getComponentByKey(db, "b")?.lifecycle).toBe("removed");
+    expect(getComponentByKey(db, "a")?.lifecycle).toBe("code-only");
+    expect(getComponentByKey(db, "f")?.lifecycle).toBe("figma-only"); // never removed
+    // idempotent: a second pass marks nothing new
+    expect(markRemovedCode(db, ["a"])).toBe(0);
+
+    // "b" returns next sync → clearRemovedState resurrects it to its presence state
+    clearRemovedState(db, b);
+    expect(getComponentByKey(db, "b")?.lifecycle).toBe("code-only");
+    // clearRemovedState is a no-op on a non-removed component
+    clearRemovedState(db, a);
+    expect(getComponentByKey(db, "a")?.lifecycle).toBe("code-only");
+    db.close();
+  });
+
+  it("an empty keep set removes every code component (the caller guards full-sync scope)", () => {
+    const db = fresh();
+    upsertComponent(db, { key: "a", name: "A", codeTarget: "t" });
+    upsertComponent(db, { key: "b", name: "B", codeTarget: "t" });
+    expect(markRemovedCode(db, [])).toBe(2);
+    db.close();
+  });
+});
+
+describe("variantAxisDiff (F4)", () => {
+  it("diffs figma vs code variant axes from props_json (synthetic code → unknown)", () => {
+    const db = fresh();
+    const id = upsertComponent(db, { key: "k", name: "K", figmaNodeId: "1:1", codeTarget: "t" });
+    upsertVariant(db, { componentId: id, source: "figma", name: "State=Hover@0", propsJson: '{"State":"Hover"}' });
+    upsertVariant(db, { componentId: id, source: "code", name: "hover@1280", propsJson: '{"Variant":"hover"}' });
+    const diff = variantAxisDiff(db, id);
+    expect(diff.level).toBe("unknown"); // code synthetic-only → honesty guard
+    expect(diff.figmaAxes).toEqual(["State"]);
+    db.close();
+  });
+
+  it("tolerates NULL / garbage props_json without throwing (→ {})", () => {
+    const db = fresh();
+    const id = upsertComponent(db, { key: "k", name: "K" });
+    upsertVariant(db, { componentId: id, source: "figma", name: "a@0" }); // null props_json
+    upsertVariant(db, { componentId: id, source: "code", name: "b@0", propsJson: "not json" });
+    expect(() => variantAxisDiff(db, id)).not.toThrow();
+    expect(variantAxisDiff(db, id).level).toBe("unknown");
+    db.close();
+  });
+});
+
+describe("isMappingStale + computeDrift (F5)", () => {
+  it("flags a matched mapping stale when the design lastModified is after the code capture", () => {
+    const db = fresh();
+    const id = upsertComponent(db, {
+      key: "b/btn",
+      name: "Button",
+      figmaFileKey: "F",
+      figmaNodeId: "1:1",
+      codeTarget: "Button",
+    });
+    appendSnapshot(db, { componentId: id, source: "code", imagePath: "b.png", imageHash: "c" });
+    appendSnapshot(db, {
+      componentId: id,
+      source: "figma",
+      imagePath: "f.png",
+      imageHash: "f",
+      figmaLastModified: "2999-01-01T00:00:00.000Z", // design modified far after code capture
+    });
+    expect(isMappingStale(db, id)).toBe(true);
+    db.close();
+  });
+
+  it("does NOT flag stale when figma (second-precision) and code (ms-precision) share the same second", () => {
+    const db = fresh();
+    const id = upsertComponent(db, { key: "b/btn", name: "Button", figmaNodeId: "1:1", codeTarget: "Button" });
+    appendSnapshot(db, { componentId: id, source: "code", imagePath: "b.png", imageHash: "c" });
+    const code = latestSnapshot(db, id, "code")!;
+    // A real Figma lastModified is often whole-second ("...45Z"); code captured_at is ms ("...45.123Z").
+    // Lexically "...45Z" > "...45.123Z" ('Z' > '.'), so a raw string compare would FALSELY read stale.
+    const sameSecond = code.captured_at.replace(/\.\d+Z$/, "Z");
+    appendSnapshot(db, {
+      componentId: id,
+      source: "figma",
+      imagePath: "f.png",
+      imageHash: "f",
+      figmaLastModified: sameSecond,
+    });
+    expect(isMappingStale(db, id)).toBe(false); // numeric compare: 45.000s <= 45.123s → fresh
+    db.close();
+  });
+
+  it("is not stale for an older design, an equal time, or a one-sided component", () => {
+    const db = fresh();
+    const matched = upsertComponent(db, { key: "b/btn", name: "Button", figmaNodeId: "1:1", codeTarget: "Button" });
+    appendSnapshot(db, { componentId: matched, source: "code", imagePath: "b.png", imageHash: "c" });
+    appendSnapshot(db, {
+      componentId: matched,
+      source: "figma",
+      imagePath: "f.png",
+      imageHash: "f",
+      figmaLastModified: "2000-01-01T00:00:00.000Z", // older than the code capture
+    });
+    expect(isMappingStale(db, matched)).toBe(false);
+
+    const figmaOnly = upsertComponent(db, { key: "figma/F/2:2", name: "X", figmaNodeId: "2:2" });
+    appendSnapshot(db, { componentId: figmaOnly, source: "figma", imagePath: "g.png", imageHash: "g" });
+    expect(isMappingStale(db, figmaOnly)).toBe(false); // one-sided → never stale
+    db.close();
+  });
+
+  it("computeDrift aggregates removed/stale/renamed/presence (never reads components.status)", () => {
+    const db = fresh();
+    const m = upsertComponent(db, { key: "b/btn", name: "Button", figmaNodeId: "1:1", codeTarget: "Button" });
+    appendSnapshot(db, { componentId: m, source: "code", imagePath: "b.png", imageHash: "c" });
+    appendSnapshot(db, {
+      componentId: m,
+      source: "figma",
+      imagePath: "f.png",
+      imageHash: "f",
+      figmaLastModified: "2999-01-01T00:00:00.000Z",
+    });
+    rollupLifecycle(db, m);
+    const removed = upsertComponent(db, { key: "b/old", name: "Old", codeTarget: "Old" });
+    setLifecycle(db, removed, "removed");
+    recordRenameEvent(db, {
+      side: "code",
+      fromName: "A",
+      toName: "B",
+      anchor: "code-instance",
+      confidence: 1,
+      resolution: "applied",
+    });
+    // mark statuses to prove computeDrift ignores them
+    db.prepare("UPDATE components SET status='regression'").run();
+
+    const drift = computeDrift(db);
+    expect(drift.removed).toEqual(["b/old"]);
+    expect(drift.stale).toEqual(["b/btn"]);
+    expect(drift.renamed).toBe(1);
+    expect(drift.matched).toBe(1);
+    expect(drift.codeOnly).toBe(1); // the removed code-only row
+    // computeDrift must not have mutated the code regression axis
+    expect(getComponentByKey(db, "b/btn")?.status).toBe("regression");
     db.close();
   });
 });

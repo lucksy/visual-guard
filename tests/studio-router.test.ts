@@ -28,6 +28,7 @@ describe("matchRoute — API table", () => {
     expect(matchRoute("GET", "/api/snapshots/7")).toEqual({ kind: "snapshot", id: 7 });
     expect(matchRoute("GET", "/api/snapshots/7/image")).toEqual({ kind: "snapshotImage", id: 7 });
     expect(matchRoute("POST", "/api/sync")).toEqual({ kind: "sync" });
+    expect(matchRoute("GET", "/api/drift")).toEqual({ kind: "drift" }); // F5
   });
 
   it("is method-aware: a known path with the wrong verb is 405, not a static read", () => {
@@ -37,6 +38,7 @@ describe("matchRoute — API table", () => {
       allow: "GET",
     });
     expect(matchRoute("GET", "/api/sync")).toEqual({ kind: "methodNotAllowed", allow: "POST" });
+    expect(matchRoute("POST", "/api/drift")).toEqual({ kind: "methodNotAllowed", allow: "GET" });
   });
 
   it("rejects non-numeric / non-positive ids as 404 (never reaches a DB query)", () => {

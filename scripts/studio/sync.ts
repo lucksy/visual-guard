@@ -10,17 +10,26 @@ import { diffImages } from "../lib/diff";
 import { openDb, type DB } from "../lib/studio/db";
 import {
   appendSnapshot,
+  applyCodeRename,
+  getComponentByKey,
   latestLaneStatus,
+  listComponents,
   markFigmaPending,
+  markRemovedCode,
   pruneStoryUsages,
   recomputeStatus,
   recordComparison,
+  recordPopulationSnapshot,
+  recordRenameEvent,
   recordUsage,
+  rollupLifecycle,
   setSyncState,
   upsertComponent,
   upsertVariant,
   type RegressionStatus,
 } from "../lib/studio/store";
+import { diffCodeMapping, type CodeKeyRef } from "../lib/studio/rename";
+import { axesToJson, codeAxesFromState } from "../lib/studio/variant-axes";
 import {
   blobPath,
   blobsDir,
@@ -90,6 +99,12 @@ export interface SyncCodeOptions {
   /** Output root for the blob cache; defaults to ".visual-guard". */
   outRoot?: string;
   cwd?: string;
+  /**
+   * True when this run captured the WHOLE project (no `--target` subset). Only a full run sees the
+   * complete fresh population, so the rename pre-pass (F2) and the removal pass (F3) run only then — a
+   * partial run would mistake every untouched component for a rename/removal. Defaults to false (safe).
+   */
+  fullSync?: boolean;
 }
 
 export interface SyncCodeSummary {
@@ -98,6 +113,10 @@ export interface SyncCodeSummary {
   baselineSnapshots: number;
   comparisons: number;
   byStatus: { same: number; changed: number; regression: number; new: number; error: number };
+  /** v5 (F2): code-side renames auto-applied this run (advisory; full sync only). */
+  renames: number;
+  /** v5 (F3): code components soft-marked `removed` this run (advisory; full sync only). */
+  removed: number;
 }
 
 /**
@@ -118,6 +137,8 @@ export async function syncCodeFromRun(options: SyncCodeOptions): Promise<SyncCod
   const renderUrls = readRenderUrls(dirname(currentAbs));
 
   const touched = new Set<number>();
+  // The keys touched this run (post-rename) — the keep set for the F3 removal pass.
+  const touchedKeys = new Set<string>();
   // The variant lanes each component (re)rendered this cycle — scopes the status rollup to live lanes.
   const renderedLanes = new Map<number, Set<number | null>>();
   // The story states each component rendered this cycle — scopes the "Used in" usages the same way, so a
@@ -129,7 +150,62 @@ export async function syncCodeFromRun(options: SyncCodeOptions): Promise<SyncCod
     baselineSnapshots: 0,
     comparisons: 0,
     byStatus: { same: 0, changed: 0, regression: 0, new: 0, error: 0 },
+    renames: 0,
+    removed: 0,
   };
+
+  // F2: code-rename pre-pass (FULL sync only). Detect renames BEFORE the per-render upserts create the new
+  // keys, so an unambiguous rename re-points the OLD row onto the new key (keeping its id → snapshots,
+  // variants, and the figma link survive) instead of orphaning it and re-creating a fresh row.
+  if (options.fullSync) {
+    const freshRefs: CodeKeyRef[] = [];
+    const seenFresh = new Set<string>();
+    for (const key of walkPngFiles(currentAbs)) {
+      if (!isSafeKey(key)) continue;
+      const parsed = parseCodeBaselineKey(key);
+      if (parsed === null) continue;
+      const ck = codeComponentKey(parsed.instance, parsed.name);
+      if (!seenFresh.has(ck)) {
+        seenFresh.add(ck);
+        freshRefs.push({ key: ck, instance: parsed.instance, name: parsed.name });
+      }
+    }
+    const priorRefs: CodeKeyRef[] = listComponents(db)
+      .filter((c) => c.code_target !== null && c.code_instance !== null)
+      .map((c) => ({ key: c.key, instance: c.code_instance ?? "", name: c.code_target ?? "" }));
+    const diff = diffCodeMapping(priorRefs, freshRefs);
+    for (const r of diff.renames) {
+      const moved = applyCodeRename(db, r.fromKey, r.toKey);
+      recordRenameEvent(db, {
+        side: "code",
+        componentId: getComponentByKey(db, moved ? r.toKey : r.fromKey)?.id ?? null,
+        fromKey: r.fromKey,
+        toKey: r.toKey,
+        fromName: r.fromName,
+        toName: r.toName,
+        anchor: "code-instance",
+        confidence: r.confidence,
+        // `applied` when the re-point succeeded; if the new key somehow already existed (a real
+        // collision), record it as merely `surfaced` — never silently merge two components.
+        resolution: moved ? "applied" : "surfaced",
+      });
+      if (moved) summary.renames += 1;
+    }
+    for (const r of diff.fuzzyCandidates) {
+      // Advisory cross-instance "moved" candidate — surfaced for review, NEVER auto-applied.
+      recordRenameEvent(db, {
+        side: "code",
+        componentId: getComponentByKey(db, r.fromKey)?.id ?? null,
+        fromKey: r.fromKey,
+        toKey: r.toKey,
+        fromName: r.fromName,
+        toName: r.toName,
+        anchor: "fuzzy",
+        confidence: r.confidence,
+        resolution: "surfaced",
+      });
+    }
+  }
 
   for (const key of walkPngFiles(currentAbs)) {
     if (!isSafeKey(key)) {
@@ -140,18 +216,23 @@ export async function syncCodeFromRun(options: SyncCodeOptions): Promise<SyncCod
       continue;
     }
 
+    const componentKey = codeComponentKey(parsed.instance, parsed.name);
     const componentId = upsertComponent(db, {
-      key: codeComponentKey(parsed.instance, parsed.name),
+      key: componentKey,
       name: parsed.name,
       codeInstance: parsed.instance,
       codeTarget: parsed.name,
     });
     touched.add(componentId);
+    touchedKeys.add(componentKey);
     const variantId = upsertVariant(db, {
       componentId,
       source: "code",
       name: `${parsed.state}@${parsed.viewport}`,
       renderUrl: renderUrls[key] ?? null,
+      // F4: the code side's axes for this story state (synthetic {Variant: state} without a config map),
+      // for the advisory Figma↔code axis set-diff.
+      propsJson: axesToJson(codeAxesFromState(parsed.state)),
     });
     let lanes = renderedLanes.get(componentId);
     if (lanes === undefined) {
@@ -259,11 +340,30 @@ export async function syncCodeFromRun(options: SyncCodeOptions): Promise<SyncCod
     // Drop story usages for states no longer rendered (e.g. a renamed/removed story), keeping the panel
     // consistent with the live render — the usages analogue of recomputeStatus's renderedLanes scoping.
     pruneStoryUsages(db, id, [...(renderedStates.get(id) ?? [])]);
+    // F3: a touched component is present this run — re-derive its lifecycle from presence, which also
+    // resurrects one that had been soft-marked `removed` (it came back).
+    rollupLifecycle(db, id);
     setSyncState(db, id, "synced");
+  }
+  // F3: orphan/removal pass — FULL sync only, AND only when at least one render landed. A code component
+  // that exists in the DB but was NOT rendered this run has disappeared; soft-mark it `removed`
+  // (reversible; the rollup above resurrects it if it returns). figma-only rows are never touched. A
+  // partial `--target` run skips this (its fresh set is incomplete). The `touchedKeys.size > 0` guard is
+  // load-bearing: a full sync that captured ZERO renders (e.g. a transient dev-server outage, or every
+  // auto-generated story erroring under the tolerant managed-Ladle path → empty current/) is
+  // indistinguishable from "the whole library vanished" — without this guard markRemovedCode([]) would
+  // soft-mark EVERY component `removed` in one tick. Runs AFTER the per-component rollup (so a rename's
+  // rebound row is in touchedKeys) and BEFORE markFigmaPending.
+  if (options.fullSync && touchedKeys.size > 0) {
+    summary.removed = markRemovedCode(db, [...touchedKeys]);
   }
   // A figma-linked component with no captured design is figma-pending (resumable) — SPEC §9.5. This
   // runs after the code sync so a code-only project (no figma links) stays fully `synced`.
   markFigmaPending(db);
+  // F5: record one population point at the tail so the NEXT sync can diff "N new since last sync".
+  if (options.fullSync) {
+    recordPopulationSnapshot(db);
+  }
   summary.components = touched.size;
   return summary;
 }
@@ -450,6 +550,10 @@ async function runSyncOnce(
       currentDir: capture.currentDir,
       baselineDir,
       outRoot: args.outRoot,
+      // Rename (F2) + removal (F3) passes need the WHOLE fresh population; a `--target` subset must not run
+      // them (it would falsely flag every untouched component). `plan.stamp` is exactly "this was a full
+      // run" (false for a subset), so reuse it as the full-sync gate.
+      fullSync: plan.stamp,
     });
     // Prune at the sync tail (idempotent; bounds history + blob-cache growth; never touches baselines).
     const pruned = pruneStudio(db, config.studio, { outRoot: args.outRoot });

@@ -160,6 +160,135 @@ describe("openDb / migrate", () => {
   });
 });
 
+describe("migrate v4 → v5 (the advisory drift/maintenance layer)", () => {
+  const componentColumns = (db: Database.Database): string[] =>
+    (db.pragma("table_info(components)") as { name: string }[]).map((c) => c.name);
+  const snapshotColumns = (db: Database.Database): string[] =>
+    (db.pragma("table_info(snapshots)") as { name: string }[]).map((c) => c.name);
+  const tableNames = (db: Database.Database): string[] =>
+    (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map(
+      (r) => r.name,
+    );
+  const indexNames = (db: Database.Database): string[] =>
+    (
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")
+        .all() as { name: string }[]
+    ).map((r) => r.name);
+  const DRIFT_COLUMNS = [
+    "lifecycle",
+    "code_props_json",
+    "figma_axes_json",
+    "figma_last_modified",
+    "code_last_seen_sha",
+  ];
+
+  /** Roll a fresh v5 DB back to the v4 shape so migrate() has real v4→v5 work to do. */
+  const downgradeToV4 = (db: Database.Database): void => {
+    db.exec("DROP INDEX IF EXISTS idx_components_lifecycle"); // index references lifecycle → drop first
+    for (const col of DRIFT_COLUMNS) {
+      db.exec(`ALTER TABLE components DROP COLUMN ${col}`);
+    }
+    db.exec("ALTER TABLE snapshots DROP COLUMN figma_last_modified");
+    db.exec("DROP TABLE IF EXISTS figma_code_links");
+    db.exec("DROP TABLE IF EXISTS population_snapshots");
+    db.exec("DROP TABLE IF EXISTS rename_events");
+    db.pragma("user_version = 4");
+  };
+
+  it("creates the full v5 shape on a fresh DB (drift columns + tables + indexes)", () => {
+    const db = openDb(":memory:");
+    expect(schemaVersion(db)).toBe(5);
+    expect(componentColumns(db)).toEqual(expect.arrayContaining(DRIFT_COLUMNS));
+    expect(snapshotColumns(db)).toContain("figma_last_modified");
+    expect(tableNames(db)).toEqual(
+      expect.arrayContaining(["figma_code_links", "population_snapshots", "rename_events"]),
+    );
+    expect(indexNames(db)).toEqual(
+      expect.arrayContaining([
+        "idx_components_lifecycle",
+        "idx_population_captured",
+        "idx_rename_events_recent",
+      ]),
+    );
+    db.close();
+  });
+
+  it("migrates a v4 DB up to v5 additively — preserves component ids + FK children, no rebuild", () => {
+    const db = openDb(":memory:");
+    // Seed a component with a child snapshot BEFORE the downgrade. A purely-additive migration must keep
+    // both (the cascade-wiping table rebuild we deliberately avoided would have destroyed the snapshot).
+    const seeded = db
+      .prepare("INSERT INTO components (key, name) VALUES ('buttons/btn', 'Button') RETURNING id")
+      .get() as { id: number };
+    db.prepare(
+      `INSERT INTO snapshots (component_id, source, image_path, image_hash, version_seq)
+       VALUES (?, 'code', 'b.png', 'hash', 1)`,
+    ).run(seeded.id);
+
+    downgradeToV4(db);
+    expect(schemaVersion(db)).toBe(4);
+    expect(componentColumns(db)).not.toContain("lifecycle");
+
+    migrate(db);
+
+    expect(schemaVersion(db)).toBe(5);
+    expect(componentColumns(db)).toEqual(expect.arrayContaining(DRIFT_COLUMNS));
+    expect(tableNames(db)).toEqual(
+      expect.arrayContaining(["figma_code_links", "population_snapshots", "rename_events"]),
+    );
+    // ids + FK children survive untouched.
+    expect(
+      (db.prepare("SELECT key FROM components WHERE id = ?").get(seeded.id) as { key: string }).key,
+    ).toBe("buttons/btn");
+    expect(
+      (
+        db.prepare("SELECT COUNT(*) AS n FROM snapshots WHERE component_id = ?").get(seeded.id) as {
+          n: number;
+        }
+      ).n,
+    ).toBe(1);
+    // lifecycle defaults to 'unknown' and the widened set accepts the new 'removed'/'renamed' states.
+    expect(
+      (db.prepare("SELECT lifecycle FROM components WHERE id = ?").get(seeded.id) as { lifecycle: string })
+        .lifecycle,
+    ).toBe("unknown");
+    expect(() =>
+      db.prepare("UPDATE components SET lifecycle = 'removed' WHERE id = ?").run(seeded.id),
+    ).not.toThrow();
+    expect(() =>
+      db.prepare("UPDATE components SET lifecycle = 'bogus' WHERE id = ?").run(seeded.id),
+    ).toThrow(/CHECK/i);
+    // Re-migrating must not trip any ADD COLUMN / CREATE (columnExists + IF NOT EXISTS guards).
+    expect(() => migrate(db)).not.toThrow();
+    db.close();
+  });
+
+  it("a migrated v4→v5 DB is structurally identical to a fresh v5 DB", () => {
+    const fresh = openDb(":memory:");
+    const migrated = openDb(":memory:");
+    downgradeToV4(migrated);
+    migrate(migrated);
+
+    const dump = (db: Database.Database) => ({
+      components: (db.pragma("table_info(components)") as {
+        name: string;
+        type: string;
+        notnull: number;
+        dflt_value: unknown;
+      }[]).map((c) => `${c.name}:${c.type}:${c.notnull}:${c.dflt_value}`),
+      snapshots: snapshotColumns(db),
+      tables: tableNames(db).sort(),
+      indexes: indexNames(db).sort(),
+    });
+    // table_info does not surface CHECK constraints, so the lifecycle CHECK (present on both paths)
+    // needs no special-casing — column order/type/notnull/default and the table+index sets all converge.
+    expect(dump(migrated)).toEqual(dump(fresh));
+    fresh.close();
+    migrated.close();
+  });
+});
+
 describe("openDb — WAL on a real file DB", () => {
   let tmp = "";
   afterEach(() => {

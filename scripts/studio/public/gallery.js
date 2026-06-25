@@ -12,13 +12,14 @@
  */
 
 import { el, setChildren, announce } from "./dom.js";
-import { getComponents, getHealth, imageUrl, postSync, ApiError } from "./api.js";
+import { getComponents, getDrift, getHealth, imageUrl, postSync, ApiError } from "./api.js";
 import {
   deriveBadge,
   isCodeRegressed,
   countByBadge,
   filterComponents,
   sortComponents,
+  summarizeDrift,
   cardAriaLabel,
   freshness,
 } from "./view-model.js";
@@ -254,6 +255,8 @@ export async function renderGallery(root, query, helpers) {
   }
 
   const counts = countByBadge(components);
+  // F5: the advisory drift strip (best-effort; absent on older servers or an empty DB → no strip).
+  const driftChips = summarizeDrift(await getDrift().catch(() => null));
   const grid = el("div", { class: query.density === "compact" ? "grid compact" : "grid", id: "main" });
 
   // Re-fill the grid in place for a given search string — used by the live search field so typing never
@@ -284,6 +287,14 @@ export async function renderGallery(root, query, helpers) {
         { class: "toolbar-wrap" },
         toolbar(query, counts, helpers, refreshGrid),
         chipRow(counts, query, helpers),
+        driftChips.length
+          ? el(
+              "div",
+              { class: "drift-strip" },
+              el("span", { class: "drift-strip-label" }, "Drift (advisory):"),
+              ...driftChips.map((c) => el("span", { class: `drift-chip drift-${c.key}` }, c.label)),
+            )
+          : null,
         el("div", { style: { padding: "0 var(--sp-5) var(--sp-3)" } }, syncBtn),
       ),
       el("main", {}, grid),

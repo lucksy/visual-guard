@@ -9,6 +9,7 @@ import {
   componentTimeline,
   componentUsages,
   componentVariants,
+  computeDrift,
   countComponents,
   countSnapshots,
   getComponentById,
@@ -16,7 +17,9 @@ import {
   latestRegression,
   latestSnapshotForSource,
   listComponentsWithThumbs,
+  populationDelta,
   summaryCounts,
+  variantAxisDiff,
   type ComponentStatus,
   type RegressionAxis,
   type SnapshotSource,
@@ -178,6 +181,9 @@ function handleComponentDetail(res: ServerResponse, db: DB, id: number): void {
       code: latestRegression(db, id, "current_vs_baseline") ?? null,
       parity: latestRegression(db, id, "figma_vs_code") ?? null,
     },
+    // v5 (F4): advisory Figma↔code variant-axis set-diff. Informational only — it never reads or writes
+    // component.status/parity_status, so surfacing it can't move the CI gate.
+    axisDiff: variantAxisDiff(db, id),
   });
 }
 
@@ -443,7 +449,12 @@ function makeHandler(opts: StudioServerOptions): (req: IncomingMessage, res: Ser
         });
         return;
       case "summary":
-        sendJson(res, 200, { summary: summaryCounts(db) });
+        // v5 (F5): the "new since last sync" delta rides alongside the health rollup.
+        sendJson(res, 200, { summary: summaryCounts(db), delta: populationDelta(db) });
+        return;
+      case "drift":
+        // v5 (F5): the aggregate advisory drift report. Reads no `components.status` → can't move CI.
+        sendJson(res, 200, { drift: computeDrift(db) });
         return;
       case "diffImage":
         await handleDiffImage(req, res, opts);

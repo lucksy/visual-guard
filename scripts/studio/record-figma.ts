@@ -9,6 +9,9 @@ import {
   appendSnapshot,
   listComponents,
   markFigmaPending,
+  recordFigmaCodeLink,
+  recordRenameEvent,
+  rollupLifecycle,
   setFigmaLink,
   upsertComponent,
   upsertVariant,
@@ -24,6 +27,8 @@ import {
 import { parseFigmaMetadata, type FigmaComponent } from "../lib/studio/figma-nodes";
 import { parseFigmaMeta, upsertFigmaMetaImage, type FigmaMeta } from "../lib/studio/figma-meta";
 import { matchComponents, type CodeRef, type FigmaRef } from "../lib/studio/match";
+import { axesToJson, parseVariantAxes } from "../lib/studio/variant-axes";
+import { withFileLock, writeFileAtomic } from "../lib/studio/file-lock";
 
 /**
  * Component Studio Figma recorder (P2, SPEC §9.3 / §9.5). MCP tools are agent-callable only, so the
@@ -120,6 +125,8 @@ export interface RecordFigmaOptions {
   viewport?: number;
   figmaVersionId?: string;
   description?: string;
+  /** v5 (F5): the Figma node's lastModified (ISO8601) from get_metadata — drives staleness detection. */
+  lastModified?: string;
   cwd?: string;
 }
 
@@ -143,6 +150,14 @@ export function recordFigma(opts: RecordFigmaOptions): RecordFigmaResult {
   const hash = sha256(opts.bytes);
   const dims = readPngDimensions(opts.bytes);
 
+  // F1: the durable node↔code mapping. `componentKey` is the matched CODE key for a matched node, or the
+  // `figma/<fileKey>/<nodeId>` fallback for a figma-only node. Persist `codeKey` into figma_meta.json ONLY
+  // for the matched case, so a reindex can re-link the rebuilt DB; a figma-only node carries no codeKey.
+  const figmaOnlyKey = figmaComponentKey(opts.fileKey, opts.nodeId);
+  const codeKey = opts.componentKey !== figmaOnlyKey ? opts.componentKey : undefined;
+
+  const metaAbs = resolve(cwd, figmaMetaPath(opts.baselineDir));
+
   // Commit the Figma baseline PNG (the diffable, team-shared source of truth).
   const committedRel = figmaImagePath(opts.baselineDir, opts.fileKey, opts.nodeId, opts.variant, opts.viewport);
   const committedAbs = resolve(cwd, committedRel);
@@ -155,11 +170,24 @@ export function recordFigma(opts: RecordFigmaOptions): RecordFigmaResult {
     description: opts.description ?? null,
     figmaFileKey: opts.fileKey,
     figmaNodeId: opts.nodeId,
+    figmaLastModified: opts.lastModified ?? null,
   });
+  // Mirror the node↔code edge into the durable link table (a bonus of the figma_meta.json codeKey).
+  if (codeKey !== undefined) {
+    recordFigmaCodeLink(opts.db, {
+      figmaFileKey: opts.fileKey,
+      figmaNodeId: opts.nodeId,
+      componentKey: codeKey,
+    });
+  }
+  // F4: persist the parsed Figma variant-axis labels (e.g. "State=Hover" → {State:"Hover"}) that the
+  // `variant@viewport` lane key alone discards, so the advisory axis set-diff can use them.
+  const figmaAxes = parseVariantAxes(opts.variant ?? "default");
   const variantId = upsertVariant(opts.db, {
     componentId,
     source: "figma",
     name: `${opts.variant ?? "default"}@${opts.viewport ?? 0}`,
+    propsJson: axesToJson(figmaAxes),
   });
   const result = appendSnapshot(opts.db, {
     componentId,
@@ -171,27 +199,68 @@ export function recordFigma(opts: RecordFigmaOptions): RecordFigmaResult {
     height: dims?.height ?? null,
     viewport: opts.viewport ?? null,
     figmaVersionId: opts.figmaVersionId ?? null,
+    figmaLastModified: opts.lastModified ?? null,
     approved: true,
   });
   // (Intentionally no recomputeStatus here: a Figma capture must not touch the code regression rollup,
   // and figma_vs_code conformance is a P5 axis. The code status is owned by the code sync.)
+  // F1/F3: derive lifecycle from presence now, so a figma-only node lands at `figma-only` (and a matched
+  // node confirms `matched`) on a LIVE /visual-sync — not only after a reindex. (The single rollup point
+  // for the figma record path; the code sync rolls up its own touched set.)
+  rollupLifecycle(opts.db, componentId);
 
-  // Keep the committed figma_meta.json index in sync so a reindex can rebuild this baseline.
-  const metaAbs = resolve(cwd, figmaMetaPath(opts.baselineDir));
-  const merged = upsertFigmaMetaImage(readMeta(metaAbs), {
-    fileKey: opts.fileKey,
-    nodeId: opts.nodeId,
-    name: opts.name,
-    ...(opts.description !== undefined ? { description: opts.description } : {}),
-    image: {
-      path: toPosix(committedRel),
-      ...(opts.variant !== undefined ? { variant: opts.variant } : {}),
-      ...(opts.viewport !== undefined ? { viewport: opts.viewport } : {}),
-      ...(opts.figmaVersionId !== undefined ? { figmaVersionId: opts.figmaVersionId } : {}),
-    },
+  // Keep the committed figma_meta.json index in sync so a reindex can rebuild this baseline. ALL of the
+  // meta access — the rename-name read, the per-node merge, and the write — happens inside ONE
+  // cross-process lock (figma_meta.json is shared, and /visual-sync fans out concurrent recorder
+  // SUBPROCESSES), with an atomic temp+rename write. This is what stops two concurrent recorders from
+  // clobbering each other's just-added entry (last-writer-wins would silently drop a committed baseline,
+  // since reindex rebuilds the Figma side from this meta alone). The rename event is collected here and
+  // emitted to the DB AFTER releasing, so the lock only ever holds pure-filesystem work.
+  let figmaRenameFrom: string | undefined;
+  withFileLock(metaAbs, () => {
+    const meta = readMeta(metaAbs);
+    // F2: figma-side rename — the SAME node id (the stable anchor) now carries a different display name
+    // than the committed meta recorded. The merge below adopts the new name (so a re-record in the same
+    // run won't re-fire). A brand-new node (no prior name) is not a rename.
+    const priorFigmaName = meta.files
+      .find((f) => f.fileKey === opts.fileKey)
+      ?.components.find((c) => c.nodeId === opts.nodeId)?.name;
+    if (priorFigmaName !== undefined && priorFigmaName !== opts.name) {
+      figmaRenameFrom = priorFigmaName;
+    }
+    const merged = upsertFigmaMetaImage(meta, {
+      fileKey: opts.fileKey,
+      nodeId: opts.nodeId,
+      name: opts.name,
+      ...(opts.description !== undefined ? { description: opts.description } : {}),
+      // F1: matched → persist the codeKey; figma-only → explicitly CLEAR it (null), so a node that was
+      // previously matched but is now unmatched can't keep a stale codeKey that wrongly re-links on reindex.
+      codeKey: codeKey ?? null,
+      ...(opts.lastModified !== undefined ? { lastModified: opts.lastModified } : {}),
+      image: {
+        path: toPosix(committedRel),
+        ...(opts.variant !== undefined ? { variant: opts.variant } : {}),
+        ...(opts.viewport !== undefined ? { viewport: opts.viewport } : {}),
+        ...(opts.figmaVersionId !== undefined ? { figmaVersionId: opts.figmaVersionId } : {}),
+        ...(Object.keys(figmaAxes).length > 0 ? { axes: figmaAxes } : {}),
+        ...(opts.lastModified !== undefined ? { figmaLastModified: opts.lastModified } : {}),
+      },
+    });
+    writeFileAtomic(metaAbs, `${JSON.stringify(merged, null, 2)}\n`);
   });
-  mkdirSync(dirname(metaAbs), { recursive: true });
-  writeFileSync(metaAbs, `${JSON.stringify(merged, null, 2)}\n`);
+  if (figmaRenameFrom !== undefined) {
+    recordRenameEvent(opts.db, {
+      side: "figma",
+      componentId,
+      figmaFileKey: opts.fileKey,
+      figmaNodeId: opts.nodeId,
+      fromName: figmaRenameFrom,
+      toName: opts.name,
+      anchor: "figma-node-id",
+      confidence: 1,
+      resolution: "applied",
+    });
+  }
 
   return { ...result, componentKey: opts.componentKey, path: toPosix(committedRel) };
 }
@@ -290,6 +359,7 @@ function main(argv: string[]): void {
         viewport: parseViewport(flag(rest, "--viewport")),
         figmaVersionId: flag(rest, "--figma-version"),
         description: flag(rest, "--description"),
+        lastModified: flag(rest, "--last-modified"),
       });
       console.log(JSON.stringify({ command: "record", ...out }));
     } finally {

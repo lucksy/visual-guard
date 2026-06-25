@@ -8,6 +8,7 @@ import {
   componentTimeline,
   countSnapshots,
   getComponentByKey,
+  listRenameEvents,
   upsertComponent,
 } from "../scripts/lib/studio/store";
 import { figmaImagePath } from "../scripts/lib/studio/keys";
@@ -77,6 +78,96 @@ describe("recordFigma — commit + dedupe-append a figma snapshot", () => {
     const changed = await base(db, await png(200, 100, 50));
     expect(changed.inserted).toBe(true);
     expect(changed.versionSeq).toBe(2);
+    db.close();
+  });
+
+  it("F1: a MATCHED code key persists codeKey into figma_meta.json + the link table", async () => {
+    const db = openDb(":memory:");
+    await base(db, await png(10, 20, 30)); // componentKey "inst/Button" is a real code key
+    const meta = JSON.parse(readFileSync(join(tmp, BASE, "figma_meta.json"), "utf8"));
+    expect(meta.files[0].components[0].codeKey).toBe("inst/Button");
+    const link = db
+      .prepare("SELECT component_key FROM figma_code_links WHERE figma_node_id = '1:23'")
+      .get() as { component_key: string } | undefined;
+    expect(link?.component_key).toBe("inst/Button");
+    db.close();
+  });
+
+  it("F1: a FIGMA-ONLY node (figma/<file>/<node> key) writes NO codeKey and no link", async () => {
+    const db = openDb(":memory:");
+    await recordFigma({
+      db,
+      componentKey: "figma/AbC123/1:23", // the figma-only fallback key
+      fileKey: "AbC123",
+      nodeId: "1:23",
+      name: "Button",
+      bytes: await png(10, 20, 30),
+      baselineDir: BASE,
+      cwd: tmp,
+    });
+    const meta = JSON.parse(readFileSync(join(tmp, BASE, "figma_meta.json"), "utf8"));
+    expect(meta.files[0].components[0].codeKey).toBeUndefined();
+    expect(
+      (db.prepare("SELECT COUNT(*) AS n FROM figma_code_links").get() as { n: number }).n,
+    ).toBe(0);
+    db.close();
+  });
+
+  it("F6: a live figma record rolls up lifecycle (figma-only, not left 'unknown')", async () => {
+    const db = openDb(":memory:");
+    await recordFigma({
+      db,
+      componentKey: "figma/AbC123/1:23", // figma-only node
+      fileKey: "AbC123",
+      nodeId: "1:23",
+      name: "Button",
+      bytes: await png(1, 2, 3),
+      baselineDir: BASE,
+      cwd: tmp,
+    });
+    expect(getComponentByKey(db, "figma/AbC123/1:23")?.lifecycle).toBe("figma-only");
+    db.close();
+  });
+
+  it("F1: a node that un-matches CLEARS its codeKey in the committed meta (no stale re-link)", async () => {
+    const db = openDb(":memory:");
+    const common = { db, fileKey: "AbC123", nodeId: "1:23", name: "Button", baselineDir: BASE, cwd: tmp };
+    // first sync: matched to a code component → codeKey persisted
+    await recordFigma({ ...common, componentKey: "inst/Button", bytes: await png(1, 2, 3) });
+    let meta = JSON.parse(readFileSync(join(tmp, BASE, "figma_meta.json"), "utf8"));
+    expect(meta.files[0].components[0].codeKey).toBe("inst/Button");
+    // next sync: the same node no longer matches → recorded under the figma-only key → codeKey cleared
+    await recordFigma({ ...common, componentKey: "figma/AbC123/1:23", bytes: await png(4, 5, 6) });
+    meta = JSON.parse(readFileSync(join(tmp, BASE, "figma_meta.json"), "utf8"));
+    expect(meta.files[0].components[0].codeKey).toBeUndefined();
+    db.close();
+  });
+
+  it("F2: a renamed figma node (same node id, new name) records a figma rename event", async () => {
+    const db = openDb(":memory:");
+    const rec = (name: string, bytes: Buffer) =>
+      recordFigma({
+        db,
+        componentKey: "inst/Button",
+        fileKey: "AbC123",
+        nodeId: "1:23",
+        name,
+        bytes,
+        baselineDir: BASE,
+        cwd: tmp,
+      });
+    await rec("Button", await png(1, 2, 3));
+    expect(listRenameEvents(db)).toHaveLength(0); // first record: no prior name → not a rename
+    await rec("Primary Button", await png(9, 9, 9)); // same node id, new display name
+    const [ev] = listRenameEvents(db);
+    expect(ev?.side).toBe("figma");
+    expect(ev?.from_name).toBe("Button");
+    expect(ev?.to_name).toBe("Primary Button");
+    expect(ev?.anchor).toBe("figma-node-id");
+    expect(ev?.figma_node_id).toBe("1:23");
+    // the committed meta adopts the new name, so a re-record in a later run won't re-fire
+    const meta = JSON.parse(readFileSync(join(tmp, BASE, "figma_meta.json"), "utf8"));
+    expect(meta.files[0].components[0].name).toBe("Primary Button");
     db.close();
   });
 });

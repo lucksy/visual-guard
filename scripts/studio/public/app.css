@@ -227,6 +227,30 @@ button {
   border-color: var(--border-strong);
   font-weight: 600;
 }
+
+/* F5: advisory drift strip — informational only (never a gate), so it reads quiet, not alarming. */
+.drift-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-5) var(--sp-3);
+}
+.drift-strip-label {
+  color: var(--text-faint);
+  font-size: var(--fs-sm);
+}
+.drift-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+}
 .chip .count {
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;

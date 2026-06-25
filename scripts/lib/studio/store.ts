@@ -1,4 +1,5 @@
 import type { DB } from "./db";
+import { diffVariantAxes, type VariantAxisDiff } from "./variant-axes";
 
 /**
  * Component Studio store (SPEC §7): all reads/writes against an **injected** `better-sqlite3` handle,
@@ -18,6 +19,20 @@ export type RegressionAxis = "current_vs_baseline" | "figma_vs_code";
 export type RegressionStatus = "same" | "changed" | "regression" | "new" | "error";
 export type SyncState = "synced" | "figma-pending" | "code-pending" | "error";
 
+/**
+ * Advisory presence/drift axis (v5). Orthogonal to {@link SyncState} (resumability) and
+ * {@link ComponentStatus} (the CI-relevant code-regression axis): `lifecycle` records whether a
+ * component is present on both sides, one side, was just removed, or was just renamed. Derived ONCE at
+ * the sync/reindex rollup ({@link deriveLifecycle}); removal/rename are set explicitly. Never gates CI.
+ */
+export type ComponentLifecycle =
+  | "matched"
+  | "figma-only"
+  | "code-only"
+  | "removed"
+  | "renamed"
+  | "unknown";
+
 export interface ComponentRow {
   id: number;
   key: string;
@@ -33,6 +48,16 @@ export interface ComponentRow {
   sync_state: string;
   last_attempt_at: string | null;
   updated_at: string;
+  /** v5 drift axis (advisory): presence/removed/renamed. */
+  lifecycle: ComponentLifecycle;
+  /** v5 (F4): JSON of the code side's prop/variant axes. Live-sync-only — NULL after a reindex. */
+  code_props_json: string | null;
+  /** v5 (F4): JSON of the Figma side's variant-axis labels. Durable via figma_meta.json. */
+  figma_axes_json: string | null;
+  /** v5 (F5): the Figma node's lastModified (ISO8601) the code side was last reconciled against. */
+  figma_last_modified: string | null;
+  /** v5 (F5): git sha the code side was last observed at. Live-sync-only — NULL after a reindex. */
+  code_last_seen_sha: string | null;
 }
 
 export interface VariantRow {
@@ -62,6 +87,8 @@ export interface SnapshotRow {
   figma_version_id: string | null;
   git_sha: string | null;
   approved: number;
+  /** v5 (F5): the Figma node's lastModified at capture (NULL for code/current snapshots). */
+  figma_last_modified: string | null;
 }
 
 const NOW = `strftime('%Y-%m-%dT%H:%M:%fZ','now')`;
@@ -77,20 +104,33 @@ export interface UpsertComponentInput {
   codeInstance?: string | null;
   codeTarget?: string | null;
   storyId?: string | null;
+  /** v5 (F4): the code side's prop/variant axes as JSON. COALESCE-merged like the other nullable fields. */
+  codePropsJson?: string | null;
+  /** v5 (F4): the Figma side's variant-axis labels as JSON. COALESCE-merged. */
+  figmaAxesJson?: string | null;
+  /** v5 (F5): the Figma node's lastModified (ISO8601). COALESCE-merged. */
+  figmaLastModified?: string | null;
+  /** v5 (F5): git sha the code side was last observed at. COALESCE-merged. */
+  codeLastSeenSha?: string | null;
 }
 
 /**
  * Insert a component, or merge into the existing row with the same `key`. Linkage fields use COALESCE
  * (excluded → existing) so upserting the code side never wipes a previously-recorded Figma side and
- * vice versa — the basis for P2 matching. `name` is always taken from the latest write. Returns the id.
+ * vice versa — the basis for P2 matching. `name` is always taken from the latest write. The v5 drift
+ * fields (props/axes/lastModified/sha) COALESCE-merge the same way; `lifecycle` is DELIBERATELY excluded
+ * — it is derived once at the rollup ({@link setLifecycle}), never written by a per-side upsert, so a
+ * figma-side and a code-side upsert can't clobber each other's lifecycle verdict. Returns the id.
  */
 export function upsertComponent(db: DB, input: UpsertComponentInput): number {
   const row = db
     .prepare(
       `INSERT INTO components
-         (key, name, description, figma_file_key, figma_node_id, code_instance, code_target, story_id)
+         (key, name, description, figma_file_key, figma_node_id, code_instance, code_target, story_id,
+          code_props_json, figma_axes_json, figma_last_modified, code_last_seen_sha)
        VALUES
-         (@key, @name, @description, @figmaFileKey, @figmaNodeId, @codeInstance, @codeTarget, @storyId)
+         (@key, @name, @description, @figmaFileKey, @figmaNodeId, @codeInstance, @codeTarget, @storyId,
+          @codePropsJson, @figmaAxesJson, @figmaLastModified, @codeLastSeenSha)
        ON CONFLICT(key) DO UPDATE SET
          name = excluded.name,
          description = COALESCE(excluded.description, components.description),
@@ -99,6 +139,10 @@ export function upsertComponent(db: DB, input: UpsertComponentInput): number {
          code_instance = COALESCE(excluded.code_instance, components.code_instance),
          code_target = COALESCE(excluded.code_target, components.code_target),
          story_id = COALESCE(excluded.story_id, components.story_id),
+         code_props_json = COALESCE(excluded.code_props_json, components.code_props_json),
+         figma_axes_json = COALESCE(excluded.figma_axes_json, components.figma_axes_json),
+         figma_last_modified = COALESCE(excluded.figma_last_modified, components.figma_last_modified),
+         code_last_seen_sha = COALESCE(excluded.code_last_seen_sha, components.code_last_seen_sha),
          updated_at = ${NOW}
        RETURNING id`,
     )
@@ -111,6 +155,10 @@ export function upsertComponent(db: DB, input: UpsertComponentInput): number {
       codeInstance: input.codeInstance ?? null,
       codeTarget: input.codeTarget ?? null,
       storyId: input.storyId ?? null,
+      codePropsJson: input.codePropsJson ?? null,
+      figmaAxesJson: input.figmaAxesJson ?? null,
+      figmaLastModified: input.figmaLastModified ?? null,
+      codeLastSeenSha: input.codeLastSeenSha ?? null,
     }) as { id: number };
   return row.id;
 }
@@ -135,6 +183,8 @@ export interface ListFilter {
   hasFigma?: boolean;
   /** Require (true) / forbid (false) a code linkage. Omit to ignore. */
   hasCode?: boolean;
+  /** v5 drift axis: `matched` | `figma-only` | `code-only` | `removed` | `renamed` | `unknown`. */
+  lifecycle?: ComponentLifecycle;
 }
 
 /**
@@ -181,6 +231,10 @@ function componentFilterSql(
   if (filter.hasCode !== undefined) {
     clauses.push(`${prefix}code_target IS ${filter.hasCode ? "NOT NULL" : "NULL"}`);
   }
+  if (filter.lifecycle !== undefined) {
+    clauses.push(`${prefix}lifecycle = @lifecycle`);
+    params.lifecycle = filter.lifecycle;
+  }
   const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
   return { where, params, hasParams: clauses.length > 0 };
 }
@@ -204,6 +258,8 @@ export interface StudioSummary {
   byStatus: Record<ComponentStatus, number>;
   /** Resumable sync-state buckets. */
   bySyncState: Record<SyncState, number>;
+  /** v5 drift-axis buckets (advisory) — powers the gallery's removed/renamed/figma-only counts. */
+  byLifecycle: Record<ComponentLifecycle, number>;
   /** Presence buckets (Figma/code linkage) — the DS owner's at-a-glance parity coverage. */
   presence: { both: number; figmaOnly: number; codeOnly: number; neither: number };
 }
@@ -243,6 +299,21 @@ export function summaryCounts(db: DB): StudioSummary {
       bySyncState[row.sync_state] = row.n;
     }
   }
+  const byLifecycle: Record<ComponentLifecycle, number> = {
+    matched: 0,
+    "figma-only": 0,
+    "code-only": 0,
+    removed: 0,
+    renamed: 0,
+    unknown: 0,
+  };
+  for (const row of db
+    .prepare(`SELECT lifecycle, COUNT(*) AS n FROM components GROUP BY lifecycle`)
+    .all() as { lifecycle: ComponentLifecycle; n: number }[]) {
+    if (row.lifecycle in byLifecycle) {
+      byLifecycle[row.lifecycle] = row.n;
+    }
+  }
   const presence = db
     .prepare(
       `SELECT
@@ -257,6 +328,7 @@ export function summaryCounts(db: DB): StudioSummary {
     total: countComponents(db),
     byStatus,
     bySyncState,
+    byLifecycle,
     presence: {
       both: presence.both ?? 0,
       figmaOnly: presence.figmaOnly ?? 0,
@@ -447,6 +519,8 @@ export interface AppendSnapshotInput {
   figmaVersionId?: string | null;
   gitSha?: string | null;
   approved?: boolean;
+  /** v5 (F5): the Figma node's lastModified at capture (figma snapshots only). */
+  figmaLastModified?: string | null;
 }
 
 export interface AppendSnapshotResult {
@@ -505,10 +579,10 @@ export function appendSnapshot(
   const insert = db.prepare(
     `INSERT INTO snapshots
        (component_id, variant_id, source, image_path, image_hash, width, height, viewport,
-        version_seq, figma_version_id, git_sha, approved)
+        version_seq, figma_version_id, git_sha, approved, figma_last_modified)
      VALUES
        (@componentId, @variantId, @source, @imagePath, @imageHash, @width, @height, @viewport,
-        @versionSeq, @figmaVersionId, @gitSha, @approved)`,
+        @versionSeq, @figmaVersionId, @gitSha, @approved, @figmaLastModified)`,
   );
 
   const attempt = db.transaction((attemptNo: number): AppendSnapshotResult => {
@@ -531,6 +605,7 @@ export function appendSnapshot(
       figmaVersionId: input.figmaVersionId ?? null,
       gitSha: input.gitSha ?? null,
       approved: input.approved ? 1 : 0,
+      figmaLastModified: input.figmaLastModified ?? null,
     });
     return { id: Number(info.lastInsertRowid), versionSeq, inserted: true };
   });
@@ -875,4 +950,446 @@ export function latestLaneStatus(
     )
     .get({ componentId, variantId }) as { status: RegressionStatus } | undefined;
   return row?.status;
+}
+
+// --- Drift / maintenance layer (v5; ALL advisory — never moves components.status / the CI gate) -------
+
+/**
+ * Derive the presence-based {@link ComponentLifecycle} from a row's Figma/code linkage. This is the ONLY
+ * place lifecycle is computed from presence; `removed` is set explicitly by {@link markRemovedCode} and
+ * is intentionally NOT produced here (so a rollup over a returned component resurrects it to its real
+ * presence state). Pure.
+ */
+export function deriveLifecycle(row: {
+  figma_node_id: string | null;
+  code_target: string | null;
+}): ComponentLifecycle {
+  const hasFigma = row.figma_node_id !== null;
+  const hasCode = row.code_target !== null;
+  if (hasFigma && hasCode) return "matched";
+  if (hasFigma) return "figma-only";
+  if (hasCode) return "code-only";
+  return "unknown";
+}
+
+/** Set a component's advisory {@link ComponentLifecycle}. */
+export function setLifecycle(db: DB, componentId: number, lifecycle: ComponentLifecycle): void {
+  db.prepare(`UPDATE components SET lifecycle = @lifecycle, updated_at = ${NOW} WHERE id = @id`).run({
+    lifecycle,
+    id: componentId,
+  });
+}
+
+/**
+ * Recompute and persist a component's lifecycle from its current presence ({@link deriveLifecycle}). The
+ * single centralized rollup point — called for each TOUCHED component during sync/reindex so no per-side
+ * upsert ever writes lifecycle. Resurrects a previously-`removed` component that has reappeared. Returns
+ * the new lifecycle (or `unknown` if the component is gone).
+ */
+export function rollupLifecycle(db: DB, componentId: number): ComponentLifecycle {
+  const row = getComponentById(db, componentId);
+  if (row === undefined) return "unknown";
+  const lifecycle = deriveLifecycle(row);
+  setLifecycle(db, componentId, lifecycle);
+  return lifecycle;
+}
+
+/** Stamp the Figma node lastModified the code side was last reconciled against (F5 staleness input). */
+export function setFigmaLastModified(db: DB, componentId: number, iso: string | null): void {
+  db.prepare(
+    `UPDATE components SET figma_last_modified = @iso, updated_at = ${NOW} WHERE id = @id`,
+  ).run({ iso, id: componentId });
+}
+
+/** Stamp the git sha the code side was last observed at (F5; live-sync-only). */
+export function setCodeLastSeenSha(db: DB, componentId: number, sha: string | null): void {
+  db.prepare(
+    `UPDATE components SET code_last_seen_sha = @sha, updated_at = ${NOW} WHERE id = @id`,
+  ).run({ sha, id: componentId });
+}
+
+// --- F1: durable figma-node <-> code-component link mirror ----------------------------------------
+
+export interface FigmaCodeLinkRow {
+  id: number;
+  figma_file_key: string;
+  figma_node_id: string;
+  component_key: string;
+  source: "override" | "auto" | "manual";
+  linked_at: string;
+}
+
+export interface RecordFigmaCodeLinkInput {
+  figmaFileKey: string;
+  figmaNodeId: string;
+  componentKey: string;
+  /** How the link was established (default `auto`, i.e. name-matched). */
+  source?: "override" | "auto" | "manual";
+}
+
+/**
+ * Record (or re-point) the explicit edge from a Figma node to a code component key. Upserts on the
+ * node's natural key `(figma_file_key, figma_node_id)`, so re-linking a node to a different component
+ * replaces the edge rather than duplicating it. A durable mirror of the mapping that primarily lives in
+ * `figma_meta.json`'s `codeKey` (F1).
+ */
+export function recordFigmaCodeLink(db: DB, input: RecordFigmaCodeLinkInput): void {
+  db.prepare(
+    `INSERT INTO figma_code_links (figma_file_key, figma_node_id, component_key, source)
+     VALUES (@figmaFileKey, @figmaNodeId, @componentKey, @source)
+     ON CONFLICT(figma_file_key, figma_node_id) DO UPDATE SET
+       component_key = excluded.component_key,
+       source = excluded.source,
+       linked_at = ${NOW}`,
+  ).run({
+    figmaFileKey: input.figmaFileKey,
+    figmaNodeId: input.figmaNodeId,
+    componentKey: input.componentKey,
+    source: input.source ?? "auto",
+  });
+}
+
+/** The code component a Figma node is linked to, or undefined when the node has no recorded edge. */
+export function linkForFigmaNode(
+  db: DB,
+  fileKey: string,
+  nodeId: string,
+): FigmaCodeLinkRow | undefined {
+  return db
+    .prepare(`SELECT * FROM figma_code_links WHERE figma_file_key = ? AND figma_node_id = ?`)
+    .get(fileKey, nodeId) as FigmaCodeLinkRow | undefined;
+}
+
+// --- F5: per-sync population snapshots + "new since last sync" delta -------------------------------
+
+export interface PopulationSnapshotRow {
+  id: number;
+  captured_at: string;
+  total: number;
+  figma_count: number;
+  code_count: number;
+  both_count: number;
+  /** JSON array of component keys present on the Figma side at capture. */
+  figma_keys: string;
+  /** JSON array of component keys present on the code side at capture. */
+  code_keys: string;
+}
+
+/**
+ * Record the current component population (the key sets present on each side) as one append-only
+ * snapshot, so a later sync can set-diff the two newest rows into "N new since last sync". Returns the
+ * new snapshot id. History — does not survive a reindex (which records one fresh baseline point).
+ */
+export function recordPopulationSnapshot(db: DB): number {
+  const figmaKeys = (
+    db
+      .prepare(`SELECT key FROM components WHERE figma_node_id IS NOT NULL ORDER BY key`)
+      .all() as { key: string }[]
+  ).map((r) => r.key);
+  const codeKeys = (
+    db
+      .prepare(`SELECT key FROM components WHERE code_target IS NOT NULL ORDER BY key`)
+      .all() as { key: string }[]
+  ).map((r) => r.key);
+  const both = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM components WHERE figma_node_id IS NOT NULL AND code_target IS NOT NULL`,
+      )
+      .get() as { n: number }
+  ).n;
+  const info = db
+    .prepare(
+      `INSERT INTO population_snapshots (total, figma_count, code_count, both_count, figma_keys, code_keys)
+       VALUES (@total, @figma, @code, @both, @figmaKeys, @codeKeys)`,
+    )
+    .run({
+      total: countComponents(db),
+      figma: figmaKeys.length,
+      code: codeKeys.length,
+      both,
+      figmaKeys: JSON.stringify(figmaKeys),
+      codeKeys: JSON.stringify(codeKeys),
+    });
+  return Number(info.lastInsertRowid);
+}
+
+/** The newest population snapshot, or undefined when none recorded. */
+export function latestPopulationSnapshot(db: DB): PopulationSnapshotRow | undefined {
+  return db
+    .prepare(`SELECT * FROM population_snapshots ORDER BY captured_at DESC, id DESC LIMIT 1`)
+    .get() as PopulationSnapshotRow | undefined;
+}
+
+/** The second-newest population snapshot (the baseline for a delta), or undefined when <2 exist. */
+export function previousPopulationSnapshot(db: DB): PopulationSnapshotRow | undefined {
+  return db
+    .prepare(`SELECT * FROM population_snapshots ORDER BY captured_at DESC, id DESC LIMIT 1 OFFSET 1`)
+    .get() as PopulationSnapshotRow | undefined;
+}
+
+export interface PopulationDelta {
+  /** Component keys newly present on the Figma side since the previous snapshot. */
+  newFigma: string[];
+  /** Component keys newly present on the code side since the previous snapshot. */
+  newCode: string[];
+  /** Component keys no longer present on the Figma side since the previous snapshot. */
+  removedFigma: string[];
+  /** Component keys no longer present on the code side since the previous snapshot. */
+  removedCode: string[];
+}
+
+const EMPTY_DELTA: PopulationDelta = { newFigma: [], newCode: [], removedFigma: [], removedCode: [] };
+
+function parseKeySet(json: string): Set<string> {
+  try {
+    const parsed = JSON.parse(json);
+    return new Set(Array.isArray(parsed) ? (parsed as string[]) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * The "since last sync" delta: set-diff the two newest population snapshots. Returns all-empty when
+ * fewer than two snapshots exist (no prior point to compare against — the honest "no delta yet").
+ */
+export function populationDelta(db: DB): PopulationDelta {
+  const cur = latestPopulationSnapshot(db);
+  const prev = previousPopulationSnapshot(db);
+  if (cur === undefined || prev === undefined) return { ...EMPTY_DELTA };
+  const curF = parseKeySet(cur.figma_keys);
+  const prevF = parseKeySet(prev.figma_keys);
+  const curC = parseKeySet(cur.code_keys);
+  const prevC = parseKeySet(prev.code_keys);
+  const diff = (a: Set<string>, b: Set<string>): string[] => [...a].filter((x) => !b.has(x)).sort();
+  return {
+    newFigma: diff(curF, prevF),
+    newCode: diff(curC, prevC),
+    removedFigma: diff(prevF, curF),
+    removedCode: diff(prevC, curC),
+  };
+}
+
+// --- F2: rename / move events ---------------------------------------------------------------------
+
+export type RenameSide = "figma" | "code";
+export type RenameAnchor = "figma-node-id" | "code-instance" | "fuzzy";
+export type RenameResolution = "applied" | "surfaced";
+
+export interface RenameEventInput {
+  side: RenameSide;
+  componentId?: number | null;
+  figmaFileKey?: string | null;
+  figmaNodeId?: string | null;
+  fromKey?: string | null;
+  toKey?: string | null;
+  fromName: string;
+  toName: string;
+  anchor: RenameAnchor;
+  /** 1.0 for an anchored (node-id / code-instance) rename; <1.0 for an advisory fuzzy candidate. */
+  confidence: number;
+  resolution: RenameResolution;
+}
+
+export interface RenameRow {
+  id: number;
+  side: RenameSide;
+  component_id: number | null;
+  figma_file_key: string | null;
+  figma_node_id: string | null;
+  from_key: string | null;
+  to_key: string | null;
+  from_name: string;
+  to_name: string;
+  anchor: RenameAnchor;
+  confidence: number;
+  resolution: RenameResolution;
+  computed_at: string;
+}
+
+/** Append a rename/move event to the audit trail. Returns its id. */
+export function recordRenameEvent(db: DB, input: RenameEventInput): number {
+  const info = db
+    .prepare(
+      `INSERT INTO rename_events
+         (side, component_id, figma_file_key, figma_node_id, from_key, to_key, from_name, to_name,
+          anchor, confidence, resolution)
+       VALUES
+         (@side, @componentId, @figmaFileKey, @figmaNodeId, @fromKey, @toKey, @fromName, @toName,
+          @anchor, @confidence, @resolution)`,
+    )
+    .run({
+      side: input.side,
+      componentId: input.componentId ?? null,
+      figmaFileKey: input.figmaFileKey ?? null,
+      figmaNodeId: input.figmaNodeId ?? null,
+      fromKey: input.fromKey ?? null,
+      toKey: input.toKey ?? null,
+      fromName: input.fromName,
+      toName: input.toName,
+      anchor: input.anchor,
+      confidence: input.confidence,
+      resolution: input.resolution,
+    });
+  return Number(info.lastInsertRowid);
+}
+
+/** Rename events newest-first, **bounded** to `limit` rows (default 100, hard-capped at 500). */
+export function listRenameEvents(db: DB, limit = 100): RenameRow[] {
+  const capped = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 500) : 100;
+  return db
+    .prepare(`SELECT * FROM rename_events ORDER BY computed_at DESC, id DESC LIMIT @limit`)
+    .all({ limit: capped }) as RenameRow[];
+}
+
+/**
+ * Re-point a component's stable `key` from `fromKey` to `toKey`, preserving its `id` so every snapshot,
+ * variant, and regression (all keyed by `component_id`) survives the rename intact. No-op returning
+ * `false` when `fromKey` is absent or `toKey` is already taken (a real collision — the caller should
+ * SURFACE that rather than silently merge two components). Returns `true` when the key was re-pointed.
+ */
+export function applyCodeRename(db: DB, fromKey: string, toKey: string): boolean {
+  if (fromKey === toKey) return false;
+  const from = getComponentByKey(db, fromKey);
+  if (from === undefined) return false;
+  if (getComponentByKey(db, toKey) !== undefined) return false; // target exists — surface, don't merge
+  db.prepare(`UPDATE components SET key = @toKey, updated_at = ${NOW} WHERE id = @id`).run({
+    toKey,
+    id: from.id,
+  });
+  return true;
+}
+
+// --- F3: orphan / removal soft-marking ------------------------------------------------------------
+
+/**
+ * Soft-mark every CODE component (code_target IS NOT NULL) whose key is NOT in `keepKeys` as
+ * `lifecycle = 'removed'` — the reversible "this code component disappeared" state. Figma-only rows (no
+ * code) are never touched; already-`removed` rows are skipped (idempotent). The keep set is staged in a
+ * TEMP table so `keepKeys` is unbounded (no 999-variable `IN()` limit). Returns how many rows flipped.
+ * The caller restricts this to a FULL sync (never a `--target` subset), so an untouched component in a
+ * partial run is never mistaken for removed.
+ */
+export function markRemovedCode(db: DB, keepKeys: readonly string[]): number {
+  const run = db.transaction((keys: readonly string[]): number => {
+    db.exec(`CREATE TEMP TABLE IF NOT EXISTS _keep_keys (key TEXT PRIMARY KEY)`);
+    db.exec(`DELETE FROM _keep_keys`);
+    const ins = db.prepare(`INSERT OR IGNORE INTO _keep_keys (key) VALUES (?)`);
+    for (const k of keys) ins.run(k);
+    const info = db
+      .prepare(
+        `UPDATE components SET lifecycle = 'removed', updated_at = ${NOW}
+          WHERE code_target IS NOT NULL AND lifecycle != 'removed'
+            AND key NOT IN (SELECT key FROM _keep_keys)`,
+      )
+      .run();
+    return info.changes;
+  });
+  return run(keepKeys);
+}
+
+/**
+ * Resurrect a returned component: if it is currently `removed`, re-derive its lifecycle from presence
+ * ({@link deriveLifecycle}). No-op when the component is absent or not `removed`.
+ */
+export function clearRemovedState(db: DB, componentId: number): void {
+  const row = getComponentById(db, componentId);
+  if (row === undefined || row.lifecycle !== "removed") return;
+  setLifecycle(db, componentId, deriveLifecycle(row));
+}
+
+// --- F4: variant-axis set-diff --------------------------------------------------------------------
+
+function parseAxesJson(json: string | null): Record<string, string> {
+  if (json === null || json.length === 0) return {};
+  try {
+    const parsed = JSON.parse(json);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, string>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Advisory Figma↔code variant-axis diff for a component: parse each variant's `props_json` axis map and
+ * set-diff the axis names ({@link diffVariantAxes}). Tolerates NULL/garbage `props_json` (→ `{}`), never
+ * throws. Reads `parity_status`/variants only — never touches `components.status` (the CI axis).
+ */
+export function variantAxisDiff(db: DB, componentId: number): VariantAxisDiff {
+  const figma = componentVariants(db, componentId, "figma").map((v) => parseAxesJson(v.props_json));
+  const code = componentVariants(db, componentId, "code").map((v) => parseAxesJson(v.props_json));
+  return diffVariantAxes(figma, code);
+}
+
+// --- F5: staleness + aggregate drift report -------------------------------------------------------
+
+/**
+ * Is a matched component's mapping STALE — i.e. the Figma design moved ahead of the code side? True when
+ * the latest Figma snapshot's `figma_last_modified` (the design's own mtime; falling back to OUR figma
+ * capture time when absent) is strictly AFTER the latest code snapshot's `captured_at`. Only matched
+ * components can be stale: a figma-only/code-only/unlinked component returns false (nothing to be stale
+ * between), and equal timestamps are NOT stale. Reads timestamps only — never `components.status`.
+ */
+export function isMappingStale(db: DB, componentId: number): boolean {
+  const row = getComponentById(db, componentId);
+  if (row === undefined || row.figma_node_id === null || row.code_target === null) return false;
+  const figma = latestSnapshotForSource(db, componentId, "figma");
+  const code =
+    latestSnapshotForSource(db, componentId, "code") ??
+    latestSnapshotForSource(db, componentId, "current");
+  if (figma === undefined || code === undefined) return false;
+  // Compare INSTANTS, not strings: `code.captured_at` is always millisecond-precision strftime
+  // (`...45.123Z`) but a real Figma `lastModified` is often second-precision (`...45Z`), and `Z` > `.`
+  // lexically — so a raw string `>` would falsely flag stale within the same second. Date.parse
+  // normalizes both. An unparseable timestamp must NOT fabricate staleness → treat as fresh.
+  const figmaMs = Date.parse(figma.figma_last_modified ?? figma.captured_at);
+  const codeMs = Date.parse(code.captured_at);
+  if (Number.isNaN(figmaMs) || Number.isNaN(codeMs)) return false;
+  return figmaMs > codeMs; // strictly after → stale; equal/earlier → fresh
+}
+
+export interface DriftReport {
+  /** Components new/removed on each side since the previous population snapshot. */
+  delta: PopulationDelta;
+  /** Keys of code components soft-marked `removed` (F3). */
+  removed: string[];
+  /** Keys of matched components whose mapping is stale (design ahead of code). */
+  stale: string[];
+  /** Total rename/move events on record (F2). */
+  renamed: number;
+  /** Presence rollups (the at-a-glance parity coverage). */
+  figmaOnly: number;
+  codeOnly: number;
+  matched: number;
+}
+
+/**
+ * Aggregate the advisory drift signals into one report (the `/visual-drift` surface): population delta,
+ * removed components, stale mappings, rename count, and presence rollups. ADVISORY ONLY — it reads
+ * `lifecycle`/presence/timestamps and NEVER `components.status` (the CI-relevant code-regression axis),
+ * so it can never move the gate. Pure read.
+ */
+export function computeDrift(db: DB): DriftReport {
+  const components = listComponents(db);
+  const removed = components
+    .filter((c) => c.lifecycle === "removed")
+    .map((c) => c.key)
+    .sort();
+  const stale = components
+    .filter((c) => isMappingStale(db, c.id))
+    .map((c) => c.key)
+    .sort();
+  const presence = summaryCounts(db).presence;
+  return {
+    delta: populationDelta(db),
+    removed,
+    stale,
+    renamed: listRenameEvents(db, 500).length,
+    figmaOnly: presence.figmaOnly,
+    codeOnly: presence.codeOnly,
+    matched: presence.both,
+  };
 }

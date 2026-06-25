@@ -165,6 +165,7 @@ export function contentTypeFor(filePath: string): string {
 export type Route =
   | { kind: "health" }
   | { kind: "summary" }
+  | { kind: "drift" }
   | { kind: "diffImage" }
   | { kind: "components" }
   | { kind: "component"; id: number }
@@ -207,6 +208,9 @@ export function matchRoute(method: string, pathname: string): Route {
   }
   if (pathname === "/api/summary") {
     return verb === "GET" ? { kind: "summary" } : { kind: "methodNotAllowed", allow: "GET" };
+  }
+  if (pathname === "/api/drift") {
+    return verb === "GET" ? { kind: "drift" } : { kind: "methodNotAllowed", allow: "GET" };
   }
   if (pathname === "/api/diff") {
     // The from/to snapshot ids live in the query string (parsed + validated by the handler).

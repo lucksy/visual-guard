@@ -7,10 +7,12 @@ import sharp from "sharp";
 import { openDb, type DB } from "../scripts/lib/studio/db";
 import {
   appendSnapshot,
+  computeDrift,
   getComponentByKey,
   recomputeStatus,
   recordComparison,
   setFigmaLink,
+  setLifecycle,
   upsertComponent,
   upsertVariant,
 } from "../scripts/lib/studio/store";
@@ -224,5 +226,31 @@ describe("runConformance records figma_vs_code without touching the code axis", 
     expect(summary.skipped).toBe(1); // the figma-only Tip
     expect(summary.byLevel.aligned).toBe(1); // the identical Card
     expect(getComponentByKey(db, "layout/card")?.parity_status).toBe("same");
+  });
+});
+
+describe("v5 drift signals are advisory — computeDrift never moves the code-regression axis", () => {
+  let db: DB;
+  beforeEach(() => {
+    db = openDb(":memory:");
+  });
+  afterEach(() => db.close());
+
+  it("recording removed/stale + calling computeDrift leaves components.status untouched", () => {
+    // A clean code component (status set independently of any drift signal).
+    const id = upsertComponent(db, { key: "btn/primary", name: "Button", codeInstance: "sb", codeTarget: "Button" });
+    db.prepare("UPDATE components SET status='same' WHERE id=?").run(id);
+    // Pile on every advisory drift signal.
+    const gone = upsertComponent(db, { key: "btn/old", name: "Old", codeInstance: "sb", codeTarget: "Old" });
+    setLifecycle(db, gone, "removed");
+    appendSnapshot(db, { componentId: id, source: "code", imagePath: "c.png", imageHash: "c" });
+
+    const before = getComponentByKey(db, "btn/primary")?.status;
+    const drift = computeDrift(db);
+    const after = getComponentByKey(db, "btn/primary")?.status;
+
+    expect(drift.removed).toContain("btn/old");
+    expect(after).toBe(before); // computeDrift is a pure read of lifecycle/presence/timestamps
+    expect(after).toBe("same"); // the CI-relevant code axis is unmoved
   });
 });

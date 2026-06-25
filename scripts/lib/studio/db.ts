@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 export type DB = Database.Database;
 
 /** The schema version this build knows how to produce (mirrors `PRAGMA user_version`). */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 // schema.sql sits beside this module both in source and when shipped in the plugin, so resolve it
 // relative to the module URL (works under tsx, vitest, and the bridged plugin runtime alike).
@@ -75,8 +75,9 @@ export function migrate(db: DB): void {
   const schema = readFileSync(SCHEMA_PATH, "utf8");
   const apply = db.transaction(() => {
     if (from === 0) {
-      // Fresh DB: schema.sql already contains the current (v4) shape — every index + column, including
-      // the v3 render_url and the v4 conformance-breakdown columns — so this single exec covers them all.
+      // Fresh DB: schema.sql already contains the current (v5) shape — every index + column, including
+      // the v3 render_url, the v4 conformance-breakdown columns, and the v5 drift columns/tables — so
+      // this single exec covers them all.
       db.exec(schema);
     } else {
       // Older DB: run EVERY incremental step from `from` up to current — cumulative (NOT one step keyed
@@ -105,6 +106,86 @@ export function migrate(db: DB): void {
         if (!columnExists(db, "regressions", "palette_delta")) {
           db.exec(`ALTER TABLE regressions ADD COLUMN palette_delta REAL;`);
         }
+      }
+      if (from < 5) {
+        // v4 → v5: the advisory DRIFT/MAINTENANCE layer. PURELY ADDITIVE — no table rebuild. Removal and
+        // rename live in the NEW `lifecycle` column (a fresh ADD COLUMN whose CHECK we fully control), so
+        // we never have to widen the `sync_state` CHECK — which would require dropping `components` and,
+        // with foreign_keys ON (set by openDb on every connection, and un-toggleable inside this
+        // transaction), would cascade-delete every variant/snapshot/regression. Every ADD COLUMN is
+        // columnExists-guarded and every CREATE is IF NOT EXISTS, so a partially-migrated/hand-rebuilt DB
+        // never trips. The lifecycle CHECK rides the ADD COLUMN here exactly as it does in schema.sql, so a
+        // migrated DB and a fresh DB end up structurally identical.
+        if (!columnExists(db, "components", "lifecycle")) {
+          db.exec(
+            `ALTER TABLE components ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'unknown'
+               CHECK (lifecycle IN ('matched','figma-only','code-only','removed','renamed','unknown'));`,
+          );
+        }
+        if (!columnExists(db, "components", "code_props_json")) {
+          db.exec(`ALTER TABLE components ADD COLUMN code_props_json TEXT;`);
+        }
+        if (!columnExists(db, "components", "figma_axes_json")) {
+          db.exec(`ALTER TABLE components ADD COLUMN figma_axes_json TEXT;`);
+        }
+        if (!columnExists(db, "components", "figma_last_modified")) {
+          db.exec(`ALTER TABLE components ADD COLUMN figma_last_modified TEXT;`);
+        }
+        if (!columnExists(db, "components", "code_last_seen_sha")) {
+          db.exec(`ALTER TABLE components ADD COLUMN code_last_seen_sha TEXT;`);
+        }
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_components_lifecycle ON components(lifecycle);`);
+        if (!columnExists(db, "snapshots", "figma_last_modified")) {
+          db.exec(`ALTER TABLE snapshots ADD COLUMN figma_last_modified TEXT;`);
+        }
+        db.exec(
+          `CREATE TABLE IF NOT EXISTS figma_code_links (
+             id INTEGER PRIMARY KEY,
+             figma_file_key TEXT NOT NULL,
+             figma_node_id TEXT NOT NULL,
+             component_key TEXT NOT NULL,
+             source TEXT NOT NULL DEFAULT 'auto' CHECK (source IN ('override','auto','manual')),
+             linked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+             UNIQUE (figma_file_key, figma_node_id)
+           );`,
+        );
+        db.exec(
+          `CREATE TABLE IF NOT EXISTS population_snapshots (
+             id INTEGER PRIMARY KEY,
+             captured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+             total INTEGER NOT NULL,
+             figma_count INTEGER NOT NULL,
+             code_count INTEGER NOT NULL,
+             both_count INTEGER NOT NULL,
+             figma_keys TEXT NOT NULL,
+             code_keys TEXT NOT NULL
+           );`,
+        );
+        db.exec(
+          `CREATE INDEX IF NOT EXISTS idx_population_captured
+             ON population_snapshots(captured_at DESC, id DESC);`,
+        );
+        db.exec(
+          `CREATE TABLE IF NOT EXISTS rename_events (
+             id INTEGER PRIMARY KEY,
+             side TEXT NOT NULL CHECK (side IN ('figma','code')),
+             component_id INTEGER REFERENCES components(id) ON DELETE SET NULL,
+             figma_file_key TEXT,
+             figma_node_id TEXT,
+             from_key TEXT,
+             to_key TEXT,
+             from_name TEXT NOT NULL,
+             to_name TEXT NOT NULL,
+             anchor TEXT NOT NULL CHECK (anchor IN ('figma-node-id','code-instance','fuzzy')),
+             confidence REAL NOT NULL,
+             resolution TEXT NOT NULL CHECK (resolution IN ('applied','surfaced')),
+             computed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+           );`,
+        );
+        db.exec(
+          `CREATE INDEX IF NOT EXISTS idx_rename_events_recent
+             ON rename_events(computed_at DESC, id DESC);`,
+        );
       }
     }
     db.pragma(`user_version = ${SCHEMA_VERSION}`);

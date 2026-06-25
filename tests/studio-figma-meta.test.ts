@@ -153,3 +153,117 @@ describe("upsertFigmaMetaImage", () => {
     expect(JSON.stringify(empty)).toBe(before);
   });
 });
+
+describe("v5 durable drift fields (codeKey / lastModified / axes)", () => {
+  it("parses and round-trips the optional component + image drift fields", () => {
+    const meta = parseFigmaMeta({
+      files: [
+        {
+          fileKey: "K",
+          components: [
+            {
+              nodeId: "1:2",
+              name: "Button",
+              codeKey: "buttons/button",
+              lastModified: "2026-06-01T00:00:00.000Z",
+              axes: { State: ["Default", "Hover"], Size: ["Sm", "Lg"] },
+              images: [
+                {
+                  path: "a.png",
+                  variant: "State=Hover",
+                  axes: { State: "Hover" },
+                  figmaLastModified: "2026-06-01T00:00:00.000Z",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    const comp = meta.files[0]?.components[0];
+    expect(comp?.codeKey).toBe("buttons/button");
+    expect(comp?.lastModified).toBe("2026-06-01T00:00:00.000Z");
+    expect(comp?.axes).toEqual({ State: ["Default", "Hover"], Size: ["Sm", "Lg"] });
+    expect(comp?.images[0]?.axes).toEqual({ State: "Hover" });
+    expect(comp?.images[0]?.figmaLastModified).toBe("2026-06-01T00:00:00.000Z");
+  });
+
+  it("rejects malformed drift fields with field-named errors", () => {
+    const base = (over: Record<string, unknown>) => ({
+      files: [{ fileKey: "K", components: [{ nodeId: "1:2", name: "X", images: [{ path: "p" }], ...over }] }],
+    });
+    expect(() => parseFigmaMeta(base({ codeKey: 7 }))).toThrow(/codeKey/);
+    expect(() => parseFigmaMeta(base({ axes: { State: "Hover" } }))).toThrow(/axes\.State/);
+    expect(() => parseFigmaMeta(base({ axes: { State: [1] } }))).toThrow(/axes\.State\[0\]/);
+    expect(() =>
+      parseFigmaMeta({
+        files: [
+          {
+            fileKey: "K",
+            components: [{ nodeId: "1:2", name: "X", images: [{ path: "p", axes: { S: 1 } }] }],
+          },
+        ],
+      }),
+    ).toThrow(/axes\.S/);
+  });
+
+  it("keeps pre-v5 metas byte-identical (all new fields absent → unchanged)", () => {
+    const v4 = { version: 1, files: [{ fileKey: "K", components: [{ nodeId: "1:2", name: "X", images: [{ path: "p" }] }] }] };
+    expect(parseFigmaMeta(v4)).toEqual(v4);
+  });
+
+  it("upsert sets codeKey/lastModified/axes when provided and preserves them across a sibling upsert", () => {
+    const empty = { version: 1, files: [] };
+    let meta = upsertFigmaMetaImage(empty, {
+      fileKey: "K",
+      nodeId: "1:2",
+      name: "Button",
+      codeKey: "buttons/button",
+      lastModified: "2026-06-01T00:00:00.000Z",
+      axes: { State: ["Default", "Hover"] },
+      image: { path: "a.png", axes: { State: "Hover" } },
+    });
+    expect(meta.files[0]?.components[0]?.codeKey).toBe("buttons/button");
+
+    // a later image-only upsert (no codeKey) must PRESERVE the component-level codeKey/axes
+    meta = upsertFigmaMetaImage(meta, {
+      fileKey: "K",
+      nodeId: "1:2",
+      name: "Button",
+      image: { path: "b.png" },
+    });
+    const comp = meta.files[0]?.components[0];
+    expect(comp?.codeKey).toBe("buttons/button"); // preserved
+    expect(comp?.axes).toEqual({ State: ["Default", "Hover"] }); // preserved
+    expect(comp?.images.map((i) => i.path)).toEqual(["a.png", "b.png"]);
+
+    // a code rename re-points codeKey in place (last-write-wins) — a diffable signal
+    meta = upsertFigmaMetaImage(meta, {
+      fileKey: "K",
+      nodeId: "1:2",
+      name: "Button",
+      codeKey: "buttons/cta",
+      image: { path: "a.png", axes: { State: "Hover" } },
+    });
+    expect(meta.files[0]?.components[0]?.codeKey).toBe("buttons/cta");
+  });
+
+  it("codeKey: null CLEARS a stale mapping (a node that un-matched), while undefined preserves it", () => {
+    const empty = { version: 1, files: [] };
+    let meta = upsertFigmaMetaImage(empty, {
+      fileKey: "K",
+      nodeId: "1:2",
+      name: "Button",
+      codeKey: "inst/Button",
+      image: { path: "a.png" },
+    });
+    expect(meta.files[0]?.components[0]?.codeKey).toBe("inst/Button");
+    // un-match → null clears it (so reindex can't wrongly re-link the old code component)
+    meta = upsertFigmaMetaImage(meta, { fileKey: "K", nodeId: "1:2", name: "Button", codeKey: null, image: { path: "a.png" } });
+    expect(meta.files[0]?.components[0]?.codeKey).toBeUndefined();
+    // re-match → set; then an image-only (undefined) upsert preserves it
+    meta = upsertFigmaMetaImage(meta, { fileKey: "K", nodeId: "1:2", name: "Button", codeKey: "inst/Btn2", image: { path: "b.png" } });
+    meta = upsertFigmaMetaImage(meta, { fileKey: "K", nodeId: "1:2", name: "Button", image: { path: "a.png" } });
+    expect(meta.files[0]?.components[0]?.codeKey).toBe("inst/Btn2");
+  });
+});

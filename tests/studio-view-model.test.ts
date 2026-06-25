@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   cardAriaLabel,
   countByBadge,
+  deriveAxisDiffBadge,
   deriveBadge,
   describeParityDrift,
   figmaDeepLink,
@@ -14,6 +15,7 @@ import {
   sortComponents,
   sparklinePath,
   storyLink,
+  summarizeDrift,
   timelineTicks,
   variantUnion,
 } from "../scripts/studio/public/view-model.js";
@@ -285,5 +287,47 @@ describe("describeParityDrift", () => {
     expect(describeParityDrift(0.3, 0.01)).toMatch(/size drifts/);
     expect(describeParityDrift(0.01, 0.3)).toMatch(/color drifts/);
     expect(describeParityDrift(0.3, 0.3)).toMatch(/size and color/);
+  });
+});
+
+describe("summarizeDrift (F5)", () => {
+  it("returns [] when there is no drift to show (strip hides)", () => {
+    expect(summarizeDrift(null)).toEqual([]);
+    expect(
+      summarizeDrift({ delta: { newFigma: [], newCode: [] }, removed: [], stale: [], renamed: 0 }),
+    ).toEqual([]);
+  });
+  it("emits only the non-zero signals, emoji-free", () => {
+    const chips = summarizeDrift({
+      delta: { newFigma: ["a"], newCode: ["b", "c"] },
+      removed: ["x"],
+      stale: ["y", "z"],
+      renamed: 4,
+    });
+    expect(chips.map((c) => c.key)).toEqual(["new", "removed", "stale", "renamed"]);
+    expect(chips.find((c) => c.key === "new")?.label).toBe("3 new since last sync");
+    expect(chips.find((c) => c.key === "stale")?.label).toBe("2 stale");
+    for (const c of chips) expect(/^[\x20-\x7E]+$/.test(c.label)).toBe(true);
+  });
+});
+
+describe("deriveAxisDiffBadge (F4)", () => {
+  it("returns null for unknown (the honesty guard) and for missing input", () => {
+    expect(deriveAxisDiffBadge(null)).toBeNull();
+    expect(deriveAxisDiffBadge({ level: "unknown" })).toBeNull();
+  });
+  it("maps aligned/minor/divergent to plain, emoji-free badges", () => {
+    expect(deriveAxisDiffBadge({ level: "aligned" })).toEqual({
+      key: "axes-aligned",
+      label: "Axes aligned",
+      tone: "green",
+    });
+    expect(deriveAxisDiffBadge({ level: "minor" })?.tone).toBe("amber");
+    expect(deriveAxisDiffBadge({ level: "divergent" })?.tone).toBe("red");
+    // emoji-free invariant
+    for (const level of ["aligned", "minor", "divergent"] as const) {
+      const badge = deriveAxisDiffBadge({ level });
+      expect(badge && /^[\x20-\x7E]+$/.test(badge.label)).toBe(true);
+    }
   });
 });

@@ -10,7 +10,9 @@ import {
   componentUsages,
   componentVariants,
   getComponentByKey,
+  listRenameEvents,
   setFigmaLink,
+  upsertComponent,
 } from "../scripts/lib/studio/store";
 import { syncCodeFromRun, parseArgs, clampWatchIntervalMs } from "../scripts/studio/sync";
 
@@ -228,6 +230,173 @@ describe("syncCodeFromRun — code capture → compare → persist", () => {
     rmSync(join(tmp, RUN, "inst", "Button", "hover@1280.png"), { force: true }); // hover story removed
     await sync(db); // only default renders now → the stale hover lane no longer pins status
     expect(getComponentByKey(db, "inst/Button")?.status).toBe("same");
+    db.close();
+  });
+});
+
+// --- F2: code-rename detection (full sync only) ---------------------------
+
+describe("syncCodeFromRun — F2 code rename", () => {
+  let tmp = "";
+  const put = (rel: string, bytes: Buffer): void => {
+    const abs = join(tmp, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, bytes);
+  };
+  const R1 = ".visual-guard/runs/r1/current";
+  const R2 = ".visual-guard/runs/r2/current";
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-rename-"));
+  });
+  afterEach(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  });
+  const run = (db: DB, dir: string, fullSync: boolean) =>
+    syncCodeFromRun({ db, config, currentDir: dir, baselineDir: BASE, outRoot: ".visual-guard", cwd: tmp, fullSync });
+
+  it("re-points a renamed component onto the new key, preserving its id, and records the event", async () => {
+    const db = openDb(":memory:");
+    const black = await png(0, 0, 0);
+    put(`${R1}/inst/Button/default@1280.png`, black);
+    await run(db, R1, true);
+    const beforeId = getComponentByKey(db, "inst/Button")?.id;
+    expect(beforeId).toBeDefined();
+
+    // run 2: same instance, the component is now "PrimaryButton" (Button gone) → an applied rename
+    put(`${R2}/inst/PrimaryButton/default@1280.png`, black);
+    const summary = await run(db, R2, true);
+
+    expect(summary.renames).toBe(1);
+    expect(getComponentByKey(db, "inst/Button")).toBeUndefined(); // re-pointed, not orphaned
+    const after = getComponentByKey(db, "inst/PrimaryButton");
+    expect(after?.id).toBe(beforeId); // SAME id → timeline/variants survived
+    const [ev] = listRenameEvents(db);
+    expect(ev?.side).toBe("code");
+    expect(ev?.from_key).toBe("inst/Button");
+    expect(ev?.to_key).toBe("inst/PrimaryButton");
+    expect(ev?.anchor).toBe("code-instance");
+    expect(ev?.resolution).toBe("applied");
+    db.close();
+  });
+
+  it("does NOT run the rename pass on a partial (non-full) sync", async () => {
+    const db = openDb(":memory:");
+    const black = await png(0, 0, 0);
+    put(`${R1}/inst/Button/default@1280.png`, black);
+    await run(db, R1, true);
+
+    // a partial sync that captured ONLY PrimaryButton must not treat the untouched Button as renamed
+    put(`${R2}/inst/PrimaryButton/default@1280.png`, black);
+    const summary = await run(db, R2, false);
+
+    expect(summary.renames).toBe(0);
+    expect(getComponentByKey(db, "inst/Button")).toBeDefined(); // left alone
+    expect(getComponentByKey(db, "inst/PrimaryButton")).toBeDefined(); // just added
+    expect(listRenameEvents(db)).toHaveLength(0);
+    db.close();
+  });
+});
+
+// --- F3: orphan / removal soft-marking (full sync only) -------------------
+
+describe("syncCodeFromRun — F3 orphan removal", () => {
+  let tmp = "";
+  const put = (rel: string, bytes: Buffer): void => {
+    const abs = join(tmp, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, bytes);
+  };
+  const R1 = ".visual-guard/runs/r1/current";
+  const R2 = ".visual-guard/runs/r2/current";
+  const R3 = ".visual-guard/runs/r3/current";
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "vg-removal-"));
+  });
+  afterEach(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+  });
+  const run = (db: DB, dir: string, fullSync: boolean) =>
+    syncCodeFromRun({ db, config, currentDir: dir, baselineDir: BASE, outRoot: ".visual-guard", cwd: tmp, fullSync });
+
+  it("soft-marks an orphaned code component on a full re-sync, leaves the survivor, and resurrects it on return", async () => {
+    const db = openDb(":memory:");
+    const black = await png(0, 0, 0);
+    put(`${R1}/inst/Button/default@1280.png`, black);
+    put(`${R1}/inst/Card/default@1280.png`, black);
+    await run(db, R1, true);
+    expect(getComponentByKey(db, "inst/Card")?.lifecycle).toBe("code-only");
+
+    // run 2 (full): only Button rendered → Card orphaned → removed
+    put(`${R2}/inst/Button/default@1280.png`, black);
+    const s2 = await run(db, R2, true);
+    expect(s2.removed).toBe(1);
+    expect(getComponentByKey(db, "inst/Card")?.lifecycle).toBe("removed");
+    expect(getComponentByKey(db, "inst/Button")?.lifecycle).toBe("code-only"); // survivor untouched
+    // idempotent: a second identical full sync marks nothing new
+    const s2b = await run(db, R2, true);
+    expect(s2b.removed).toBe(0);
+
+    // run 3 (full): Card returns → resurrected to code-only
+    put(`${R3}/inst/Button/default@1280.png`, black);
+    put(`${R3}/inst/Card/default@1280.png`, black);
+    await run(db, R3, true);
+    expect(getComponentByKey(db, "inst/Card")?.lifecycle).toBe("code-only");
+    db.close();
+  });
+
+  it("never removes a figma-only component (no code linkage)", async () => {
+    const db = openDb(":memory:");
+    upsertComponent(db, { key: "figma/F/1:1", name: "Tooltip", figmaFileKey: "F", figmaNodeId: "1:1" });
+    put(`${R1}/inst/Button/default@1280.png`, await png(0, 0, 0));
+    const s = await run(db, R1, true); // full sync, figma-only not rendered
+    expect(s.removed).toBe(0);
+    expect(getComponentByKey(db, "figma/F/1:1")?.lifecycle).not.toBe("removed");
+    db.close();
+  });
+
+  it("a partial (non-full) sync never removes untouched components", async () => {
+    const db = openDb(":memory:");
+    const black = await png(0, 0, 0);
+    put(`${R1}/inst/Button/default@1280.png`, black);
+    put(`${R1}/inst/Card/default@1280.png`, black);
+    await run(db, R1, true);
+
+    put(`${R2}/inst/Button/default@1280.png`, black); // partial: only Button
+    const s = await run(db, R2, false);
+    expect(s.removed).toBe(0);
+    expect(getComponentByKey(db, "inst/Card")?.lifecycle).toBe("code-only"); // NOT removed
+    db.close();
+  });
+
+  it("a rename is classified as a rename, NOT a removal (F2/F3 cooperation)", async () => {
+    const db = openDb(":memory:");
+    const black = await png(0, 0, 0);
+    put(`${R1}/inst/Button/default@1280.png`, black);
+    await run(db, R1, true);
+
+    put(`${R2}/inst/PrimaryButton/default@1280.png`, black); // Button → PrimaryButton (full)
+    const s = await run(db, R2, true);
+    expect(s.renames).toBe(1);
+    expect(s.removed).toBe(0); // the rebound row is in the keep set, not removed
+    expect(getComponentByKey(db, "inst/PrimaryButton")?.lifecycle).toBe("code-only");
+    db.close();
+  });
+
+  it("a FULL sync that captured ZERO renders does NOT wipe the library to 'removed'", async () => {
+    const db = openDb(":memory:");
+    const black = await png(0, 0, 0);
+    put(`${R1}/inst/Button/default@1280.png`, black);
+    put(`${R1}/inst/Card/default@1280.png`, black);
+    await run(db, R1, true);
+
+    // A full sync over an EMPTY run dir (a broken harness: every story errored under the tolerant managed
+    // path → empty current/). Without the touchedKeys>0 guard, markRemovedCode([]) would mark EVERYTHING.
+    mkdirSync(join(tmp, ".visual-guard/runs/empty/current"), { recursive: true });
+    const s = await run(db, ".visual-guard/runs/empty/current", true);
+
+    expect(s.removed).toBe(0);
+    expect(getComponentByKey(db, "inst/Button")?.lifecycle).toBe("code-only");
+    expect(getComponentByKey(db, "inst/Card")?.lifecycle).toBe("code-only");
     db.close();
   });
 });

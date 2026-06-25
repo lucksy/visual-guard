@@ -9,6 +9,7 @@ import {
   componentUsages,
   componentVariants,
   getComponentByKey,
+  linkForFigmaNode,
   listComponents,
 } from "../scripts/lib/studio/store";
 import { reindexInto, statusReport } from "../scripts/studio";
@@ -268,6 +269,66 @@ describe("studio reindex — rebuild the index from committed baselines", () => 
     expect(snaps).toHaveLength(1);
     expect(snaps[0]?.width).toBeNull();
     expect(snaps[0]?.height).toBeNull();
+    db.close();
+  });
+
+  // --- F1: codeKey survives the destroy-and-rebuild and re-links the mapping ---
+
+  it("without codeKey, the figma node stays a SEPARATE figma-only row (the historical behavior)", async () => {
+    // Default fixture meta carries no codeKey, so figma Button is its own row → 3 components.
+    const db = await reindexFresh();
+    expect(listComponents(db).map((c) => c.key)).toEqual([
+      "figma/AbC123/1:23",
+      "localhost-6006/Button",
+      "localhost-6006/Card",
+    ]);
+    const button = getComponentByKey(db, "localhost-6006/Button");
+    expect(button?.figma_node_id).toBeNull(); // code row, no figma linkage
+    expect(button?.lifecycle).toBe("code-only");
+    expect(getComponentByKey(db, "figma/AbC123/1:23")?.lifecycle).toBe("figma-only");
+    db.close();
+  });
+
+  it("with codeKey in the committed meta, reindex re-links figma onto the code row → ONE matched row", async () => {
+    // Re-point the committed meta's figma node at the code Button via codeKey (what F1 persists).
+    writeFileSync(
+      join(tmp, BASE, "figma_meta.json"),
+      JSON.stringify({
+        version: 1,
+        files: [
+          {
+            fileKey: "AbC123",
+            label: "Core",
+            components: [
+              {
+                nodeId: "1:23",
+                name: "Button",
+                codeKey: "localhost-6006/Button",
+                images: [{ path: `${BASE}/.figma/AbC123/1-23/default@0.png` }],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const db = openDb(":memory:");
+    await reindexInto({ db, baselineDir: BASE, cwd: tmp });
+
+    // The figma snapshot merged onto the code row — no separate figma-only key, 2 components not 3.
+    expect(getComponentByKey(db, "figma/AbC123/1:23")).toBeUndefined();
+    expect(listComponents(db).map((c) => c.key)).toEqual([
+      "localhost-6006/Button",
+      "localhost-6006/Card",
+    ]);
+    const button = getComponentByKey(db, "localhost-6006/Button");
+    expect(button?.code_target).toBe("Button"); // code linkage…
+    expect(button?.figma_node_id).toBe("1:23"); // …AND figma linkage on ONE row
+    expect(button?.lifecycle).toBe("matched");
+    // both a code (default@1280, hover@1280) and a figma timeline on the same component
+    expect(componentTimeline(db, button!.id, "figma")).toHaveLength(1);
+    expect(componentTimeline(db, button!.id, "code")).toHaveLength(2);
+    // durable link mirror recorded
+    expect(linkForFigmaNode(db, "AbC123", "1:23")?.component_key).toBe("localhost-6006/Button");
     db.close();
   });
 });

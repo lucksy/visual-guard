@@ -25,13 +25,27 @@ export interface FigmaComponent {
   kind: "component" | "component-set";
   /** Child COMPONENTs for a set; empty for a standalone component. */
   variants: FigmaVariant[];
+  /**
+   * v5 (F5): the node's lastModified timestamp (ISO8601), when `get_metadata` reports it. Drives
+   * mapping-staleness detection + the figma capture skip ({@link figmaNodeUnchanged}). Omitted when the
+   * payload carries no such attribute (older MCP, or a node type that doesn't report it).
+   */
+  lastModified?: string;
 }
 
 interface RawNode {
   id: string;
   tag: string;
   name: string;
+  lastModified?: string;
   children: RawNode[];
+}
+
+/** Permissively pick a node's lastModified attribute across plausible spellings (MCP naming drift). */
+function pickLastModified(attrs: Record<string, string>): string | undefined {
+  const value =
+    attrs.lastModified ?? attrs["last-modified"] ?? attrs.lastmodified ?? attrs.updatedAt ?? attrs.updated;
+  return value !== undefined && value.length > 0 ? value : undefined;
 }
 
 // Permissive: attributes may be double- OR single-quoted, or valueless (e.g. `disabled`), so a tag
@@ -96,6 +110,7 @@ function buildForest(xml: string): RawNode[] {
       id: attrs.id ?? "",
       tag,
       name: decodeEntities(attrs.name ?? ""),
+      lastModified: pickLastModified(attrs),
       children: [],
     };
     const parent = stack[stack.length - 1];
@@ -129,13 +144,25 @@ function collect(nodes: RawNode[], out: FigmaComponent[]): void {
         const variants = node.children
           .filter((child) => isComponentTag(child.tag) && child.id.length > 0)
           .map((child) => ({ nodeId: child.id, name: child.name }));
-        out.push({ nodeId: node.id, name: node.name, kind: "component-set", variants });
+        out.push({
+          nodeId: node.id,
+          name: node.name,
+          kind: "component-set",
+          variants,
+          ...(node.lastModified !== undefined ? { lastModified: node.lastModified } : {}),
+        });
       }
       continue; // a set's children are its variants — never standalone components
     }
     if (isComponentTag(node.tag)) {
       if (node.id.length > 0) {
-        out.push({ nodeId: node.id, name: node.name, kind: "component", variants: [] });
+        out.push({
+          nodeId: node.id,
+          name: node.name,
+          kind: "component",
+          variants: [],
+          ...(node.lastModified !== undefined ? { lastModified: node.lastModified } : {}),
+        });
       }
       continue; // do not descend into a component looking for more components
     }

@@ -8,13 +8,20 @@ import { isSafeKey, walkPngFiles } from "./compare";
 import { openDb, type DB } from "./lib/studio/db";
 import {
   appendSnapshot,
+  computeDrift,
   countSnapshots,
+  isMappingStale,
   latestSnapshotForSource,
   listComponents,
+  listRenameEvents,
+  populationDelta,
   recordComparison,
+  recordFigmaCodeLink,
+  recordPopulationSnapshot,
   recordUsage,
   recomputeParity,
   recomputeStatus,
+  rollupLifecycle,
   upsertComponent,
   upsertVariant,
 } from "./lib/studio/store";
@@ -30,6 +37,7 @@ import {
   DEFAULT_OUT_ROOT,
 } from "./lib/studio/keys";
 import { parseFigmaMeta } from "./lib/studio/figma-meta";
+import { axesToJson, codeAxesFromState, parseVariantAxes } from "./lib/studio/variant-axes";
 import { pruneStudio } from "./lib/studio/prune";
 
 /**
@@ -146,6 +154,9 @@ export async function reindexInto(options: ReindexOptions): Promise<ReindexSumma
       componentId,
       source: "code",
       name: `${parsed.state}@${parsed.viewport}`,
+      // F4: code axes are live-sync-only (a PNG can't reveal story args), so reindex repopulates the
+      // synthetic {Variant: state} from the committed baseline key — honest, never claims real prop axes.
+      propsJson: axesToJson(codeAxesFromState(parsed.state)),
     });
     // Reconstruct the "Used in" usage from the same parsed key sync records (kind=story, used_in=state),
     // so a delete-then-reindex reproduces the usages dimension too — the DB stays a faithful rebuildable
@@ -191,13 +202,27 @@ export async function reindexInto(options: ReindexOptions): Promise<ReindexSumma
             continue;
           }
           if (componentId === null) {
+            // F1: re-link onto the code component if the committed meta carries a `codeKey` (so the
+            // node↔code mapping survives this destroy-and-rebuild). The COALESCE upsert merges the
+            // figma linkage onto the existing code row → ONE matched row; absent a codeKey it falls back
+            // to the figma-only key → a separate figma-only row (the historical behavior).
+            const linkedKey =
+              component.codeKey ?? figmaComponentKey(file.fileKey, component.nodeId);
             componentId = upsertComponent(db, {
-              key: figmaComponentKey(file.fileKey, component.nodeId),
+              key: linkedKey,
               name: component.name,
               description: component.description ?? null,
               figmaFileKey: file.fileKey,
               figmaNodeId: component.nodeId,
+              figmaLastModified: component.lastModified ?? null,
             });
+            if (component.codeKey !== undefined) {
+              recordFigmaCodeLink(db, {
+                figmaFileKey: file.fileKey,
+                figmaNodeId: component.nodeId,
+                componentKey: component.codeKey,
+              });
+            }
           }
           const info = await imageInfo(imgAbs);
           // Fold viewport into the variant lane (mirroring the code side's `<state>@<viewport>`), so
@@ -207,6 +232,9 @@ export async function reindexInto(options: ReindexOptions): Promise<ReindexSumma
             componentId,
             source: "figma",
             name: `${image.variant ?? "default"}@${image.viewport ?? 0}`,
+            // F4: rehydrate the Figma variant-axis labels from the committed meta (durable across reindex):
+            // the explicit `image.axes` if present, else re-parsed from the variant label.
+            propsJson: axesToJson(image.axes ?? parseVariantAxes(image.variant ?? "default")),
           });
           const result = appendSnapshot(db, {
             componentId,
@@ -218,6 +246,7 @@ export async function reindexInto(options: ReindexOptions): Promise<ReindexSumma
             height: info.height,
             viewport: image.viewport ?? null,
             figmaVersionId: image.figmaVersionId ?? null,
+            figmaLastModified: image.figmaLastModified ?? component.lastModified ?? null,
             approved: true,
           });
           if (result.inserted) {
@@ -228,11 +257,16 @@ export async function reindexInto(options: ReindexOptions): Promise<ReindexSumma
     }
   }
 
-  // --- Roll up status for every component now that snapshots exist ---
+  // --- Roll up status + lifecycle for every component now that snapshots exist ---
+  // lifecycle is derived ONCE here (the single rollup point), from presence — matched/figma-only/
+  // code-only. A reindex starts from an empty DB so nothing is ever 'removed' here.
   const components = listComponents(db);
   for (const component of components) {
     recomputeStatus(db, component.id);
+    rollupLifecycle(db, component.id);
   }
+  // F5: record one population baseline point so a later sync can diff "N new since last sync" against it.
+  recordPopulationSnapshot(db);
 
   return { components: components.length, codeSnapshots, figmaSnapshots, skipped };
 }
@@ -245,6 +279,10 @@ export interface StatusReport {
   figmaSnapshots: number;
   /** True when DB snapshot counts match the committed PNG counts (a healthy, current index). */
   inSync: boolean;
+  /** v5 (F3): components soft-marked `removed` (advisory drift signal; does NOT affect `inSync`). */
+  removedComponents: number;
+  /** v5 (F5): matched components whose mapping is stale — design ahead of code (advisory). */
+  staleComponents: number;
 }
 
 /** Integrity check: DB row counts vs the committed baselines (code on disk, figma per the meta). */
@@ -280,6 +318,10 @@ export function statusReport(options: { db: DB; baselineDir: string; cwd?: strin
     figmaBaselineFiles,
     figmaSnapshots,
     inSync: codeBaselineFiles === codeSnapshots && figmaBaselineFiles === figmaSnapshots,
+    // Advisory only — a soft-marked removal / stale mapping is informational and must never flip `inSync`
+    // (which is the DB-vs-committed-PNG integrity check, not a drift verdict).
+    removedComponents: listComponents(options.db, { lifecycle: "removed" }).length,
+    staleComponents: listComponents(options.db).filter((c) => isMappingStale(options.db, c.id)).length,
   };
 }
 
@@ -377,7 +419,7 @@ export async function runConformance(options: { db: DB; cwd?: string }): Promise
 // --- CLI ------------------------------------------------------------------
 
 export interface StudioCliArgs {
-  command: "reindex" | "status" | "prune" | "conformance";
+  command: "reindex" | "status" | "prune" | "conformance" | "renames" | "drift";
   config: string;
   baselineDir?: string;
   outRoot: string;
@@ -389,10 +431,12 @@ export function parseArgs(argv: string[]): StudioCliArgs {
     command !== "reindex" &&
     command !== "status" &&
     command !== "prune" &&
-    command !== "conformance"
+    command !== "conformance" &&
+    command !== "renames" &&
+    command !== "drift"
   ) {
     fail(
-      `expected a command: "reindex", "status", "prune", or "conformance" (got ${JSON.stringify(command ?? "")}).`,
+      `expected a command: "reindex", "status", "prune", "conformance", "renames", or "drift" (got ${JSON.stringify(command ?? "")}).`,
     );
   }
   let config = "config/visual.config.json";
@@ -476,6 +520,38 @@ async function main(argv: string[]): Promise<void> {
     return;
   }
 
+  if (args.command === "renames") {
+    if (!existsSync(dbPath)) {
+      fail(`no studio index at ${dbPath} — run "studio.ts reindex" or "/visual-sync" first.`);
+    }
+    const db = openDb(dbPath);
+    try {
+      // Advisory rename/move audit trail (figma-node-id / code-instance anchored, plus surfaced fuzzy
+      // candidates). Newest-first; never gates anything.
+      const renames = listRenameEvents(db);
+      console.log(JSON.stringify({ command: "renames", dbPath, count: renames.length, renames }));
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
+  if (args.command === "drift") {
+    if (!existsSync(dbPath)) {
+      fail(`no studio index at ${dbPath} — run "studio.ts reindex" or "/visual-sync" first.`);
+    }
+    const db = openDb(dbPath);
+    try {
+      // The aggregate advisory drift report: new/removed since last sync, removed + stale + renamed
+      // components, presence rollups. Reads no `components.status`; never gates CI.
+      const drift = computeDrift(db);
+      console.log(JSON.stringify({ command: "drift", dbPath, ...drift }));
+    } finally {
+      db.close();
+    }
+    return;
+  }
+
   // status
   if (!existsSync(dbPath)) {
     fail(`no studio index at ${dbPath} — run "studio.ts reindex" first.`);
@@ -483,7 +559,9 @@ async function main(argv: string[]): Promise<void> {
   const db = openDb(dbPath);
   try {
     const report = statusReport({ db, baselineDir });
-    console.log(JSON.stringify({ command: "status", dbPath, baselineDir, ...report }));
+    // F5: also surface the "new since last sync" delta (empty until two population snapshots exist).
+    const delta = populationDelta(db);
+    console.log(JSON.stringify({ command: "status", dbPath, baselineDir, ...report, delta }));
   } finally {
     db.close();
   }

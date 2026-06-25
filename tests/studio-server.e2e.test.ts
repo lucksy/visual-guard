@@ -297,6 +297,9 @@ describe("GET /api/components/:id (+ history, variants)", () => {
     expect(body.comparisons.code.diff_ratio).toBeCloseTo(0.5);
     expect(body.comparisons.code.status).toBe("regression");
     expect(body.comparisons.parity).toBeNull(); // no figma_vs_code comparison was recorded
+    // v5 (F4): the advisory variant-axis diff is surfaced, and reading it never moves the code axis.
+    expect(["aligned", "minor", "divergent", "unknown"]).toContain(body.axisDiff.level);
+    expect(body.component.status).toBe("regression"); // unchanged by the advisory axisDiff read
   });
 
   it("history can be scoped by source", async () => {
@@ -381,6 +384,24 @@ describe("GET /api/summary (P6 health rollup)", () => {
     expect(body.summary.presence.both).toBeGreaterThanOrEqual(1);
     expect(typeof body.summary.byStatus.regression).toBe("number");
     expect(typeof body.summary.bySyncState.synced).toBe("number");
+    // F5: the "new since last sync" delta rides alongside the rollup.
+    expect(body.delta).toMatchObject({ newFigma: [], newCode: [], removedFigma: [], removedCode: [] });
+    expect(typeof body.summary.byLifecycle.matched).toBe("number");
+  });
+});
+
+describe("GET /api/drift (F5 advisory drift report)", () => {
+  it("returns the aggregate drift report and is method-aware", async () => {
+    const res = await fetch(`${base}/api/drift`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    const body = await j(res);
+    expect(Array.isArray(body.drift.removed)).toBe(true);
+    expect(Array.isArray(body.drift.stale)).toBe(true);
+    expect(typeof body.drift.matched).toBe("number");
+    expect(body.drift.delta).toMatchObject({ newFigma: [], newCode: [] });
+    // POST is 405 (read-only endpoint)
+    expect((await fetch(`${base}/api/drift`, { method: "POST" })).status).toBe(405);
   });
 });
 

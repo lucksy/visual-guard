@@ -22,6 +22,7 @@ import {
 } from "./api.js";
 import {
   deriveBadge,
+  deriveAxisDiffBadge,
   isCodeRegressed,
   variantUnion,
   timelineTicks,
@@ -580,6 +581,8 @@ function render(root, state) {
   const rerender = () => render(root, state);
   const dr = formatDiffRatio(state.diffRatio);
   const diffPct = dr ? ` · pixel diff ${dr}` : "";
+  // v5 (F4): advisory variant-axis badge — null (hidden) for the synthetic-only / no-figma-axes case.
+  const axisBadge = deriveAxisDiffBadge(state.axisDiff);
 
   const head = el(
     "div",
@@ -587,6 +590,14 @@ function render(root, state) {
     el("a", { class: "btn", href: "#/" }, "‹ Back"),
     el("h1", { id: "main", tabindex: "-1" }, state.component.name),
     badge(state.component),
+    axisBadge
+      ? el(
+          "span",
+          { class: `badge tone-${axisBadge.tone}`, title: "Figma↔code variant-axis parity (advisory)" },
+          el("span", { class: "dot" }),
+          axisBadge.label,
+        )
+      : null,
     isCodeRegressed(state.component) ? el("span", { class: "regression-flag" }, `regression${diffPct}`) : null,
     el("div", { class: "spacer" }),
   );
@@ -663,6 +674,8 @@ export async function renderDetail(root, id, options) {
     historyById,
     regressions,
     comparisons,
+    // v5 (F4): the advisory variant-axis diff for the detail badge (informational; not a CI signal).
+    axisDiff: detail.axisDiff || null,
     // The live render + committed baseline (separate from the timeline lane, which is baseline lineage).
     liveCurrent,
     liveBaseline,

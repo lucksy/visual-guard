@@ -13,6 +13,38 @@ export interface Badge {
   tone: BadgeTone;
 }
 
+/** v5 (F4): advisory variant-axis diff (mirrors store.ts/variant-axes `VariantAxisDiff`). */
+export type AxisDiffLevel = "aligned" | "minor" | "divergent" | "unknown";
+export interface AxisDiffLike {
+  level: AxisDiffLevel;
+  figmaAxes?: string[];
+  codeAxes?: string[];
+  missing?: string[];
+  extra?: string[];
+}
+export interface AxisBadge {
+  key: "axes-aligned" | "axes-minor" | "axes-divergent";
+  label: string;
+  tone: "green" | "amber" | "red";
+}
+
+/** v5 (F5): the advisory drift report (mirrors store.ts `DriftReport`) the gallery strip summarizes. */
+export interface DriftLike {
+  delta?: {
+    newFigma?: string[];
+    newCode?: string[];
+    removedFigma?: string[];
+    removedCode?: string[];
+  };
+  removed?: string[];
+  stale?: string[];
+  renamed?: number;
+}
+export interface DriftChip {
+  key: string;
+  label: string;
+}
+
 /** The subset of a `components` row the view-model reads (mirrors store.ts `ComponentRow`). */
 export interface ComponentLike {
   name: string;
@@ -96,6 +128,8 @@ export function describeParityDrift(
   dimensionDelta: number | null | undefined,
   paletteDelta: number | null | undefined,
 ): string | null;
+export function deriveAxisDiffBadge(axisDiff: AxisDiffLike | null | undefined): AxisBadge | null;
+export function summarizeDrift(drift: DriftLike | null | undefined): DriftChip[];
 export function sortComponents(
   components: ComponentLike[],
   mode?: "urgency" | "name" | "recent",

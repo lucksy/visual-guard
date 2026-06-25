@@ -55,6 +55,21 @@ describe("parseFigmaMetadata", () => {
     expect(parseFigmaMetadata(xml)[0]?.name).toBe("A & B 'x' <y>");
   });
 
+  it("parses a node's lastModified when present, and omits it when absent (F5)", () => {
+    const withTs = `<symbol id="4:1" name="Badge" lastModified="2026-06-01T00:00:00.000Z" />`;
+    expect(parseFigmaMetadata(withTs)[0]).toEqual({
+      nodeId: "4:1",
+      name: "Badge",
+      kind: "component",
+      variants: [],
+      lastModified: "2026-06-01T00:00:00.000Z",
+    });
+    // accepts the last-modified spelling too, and leaves the key absent when there is none
+    const setTs = `<component-set id="5:1" name="Tag" last-modified="2026-05-01T00:00:00.000Z"><component id="5:2" name="x=y" /></component-set>`;
+    expect(parseFigmaMetadata(setTs)[0]?.lastModified).toBe("2026-05-01T00:00:00.000Z");
+    expect("lastModified" in (parseFigmaMetadata(`<symbol id="6:1" name="Z" />`)[0] ?? {})).toBe(false);
+  });
+
   it("returns [] for empty or component-free input (never throws)", () => {
     expect(parseFigmaMetadata("")).toEqual([]);
     expect(parseFigmaMetadata("<frame id='1:1' name='X' />")).toEqual([]);

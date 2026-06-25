@@ -52,9 +52,14 @@ export function getRegressions(id, axis) {
   return getJson(`/api/components/${id}/regressions${q}`).then((b) => b.regressions);
 }
 
-/** GET /api/summary → { total, byStatus, bySyncState, presence } — the cheap rollup for the header. */
+/** GET /api/summary → { total, byStatus, bySyncState, byLifecycle, presence } — the cheap header rollup. */
 export function getSummary() {
   return getJson("/api/summary").then((b) => b.summary);
+}
+
+/** GET /api/drift → the advisory drift report (new/removed/stale/renamed/presence) for the header strip. */
+export function getDrift() {
+  return getJson("/api/drift").then((b) => b.drift);
 }
 
 /** The same-origin image URL for a snapshot (immutable; safe in <img src>). */

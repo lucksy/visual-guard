@@ -323,6 +323,41 @@ export function sparklinePath(values, width, height) {
 }
 
 /**
+ * Summarize an advisory drift report (F5) into a few short, emoji-free chips for the gallery header
+ * strip — only the NON-zero signals (new-since-last-sync, removed, stale, renamed). Returns [] when there
+ * is nothing to show (so the strip hides). Pure + unit-tested.
+ */
+export function summarizeDrift(drift) {
+  if (!drift) return [];
+  const chips = [];
+  const delta = drift.delta || {};
+  const newCount = (delta.newFigma || []).length + (delta.newCode || []).length;
+  if (newCount > 0) chips.push({ key: "new", label: `${newCount} new since last sync` });
+  if ((drift.removed || []).length > 0) chips.push({ key: "removed", label: `${drift.removed.length} removed` });
+  if ((drift.stale || []).length > 0) chips.push({ key: "stale", label: `${drift.stale.length} stale` });
+  if (drift.renamed > 0) chips.push({ key: "renamed", label: `${drift.renamed} renamed` });
+  return chips;
+}
+
+/**
+ * Map an advisory variant-axis diff (F4) to a small detail-view badge, or null when there is nothing
+ * meaningful to show (`unknown` — no Figma axes, or a synthetic-only code side, the honesty guard). Plain
+ * words, never color alone. Advisory: it reflects nothing about the CI-relevant code regression axis.
+ */
+export function deriveAxisDiffBadge(axisDiff) {
+  if (!axisDiff || axisDiff.level === "unknown") {
+    return null;
+  }
+  if (axisDiff.level === "aligned") {
+    return { key: "axes-aligned", label: "Axes aligned", tone: "green" };
+  }
+  if (axisDiff.level === "minor") {
+    return { key: "axes-minor", label: "Axes differ (minor)", tone: "amber" };
+  }
+  return { key: "axes-divergent", label: "Axes diverge", tone: "red" };
+}
+
+/**
  * Describe the advisory figma↔code conformance breakdown (dimension vs palette delta) in plain words for
  * the Overlay caption — so a "Changed" parity badge says WHICH axis drifted. Both deltas are 0..1;
  * null/absent (a code-axis comparison, or a pre-v4 row) yields null. Pure + unit-tested.
